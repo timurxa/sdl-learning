@@ -1,0 +1,4 @@
+interface:
+  display_name: "Clay Nim Bindings"
+  short_description: "Use Clay declarative bindings from Nim"
+  default_prompt: "Use $clay-nim-bindings when writing or reviewing this project’s Clay Nim code."
