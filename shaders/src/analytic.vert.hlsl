@@ -8,9 +8,9 @@ struct VertexInput {
 	float2 corner  : TEXCOORD0;
 
 	// instance
-	float2 origin  : TEXCOORD1;
-	float2 size    : TEXCOORD2;
-	float4 color   : TEXCOORD3;
+	uint2 origin   : TEXCOORD1;
+	uint2 size     : TEXCOORD2;
+	uint4 color    : TEXCOORD3;
 };
 
 struct VertexOutput {
@@ -21,13 +21,13 @@ struct VertexOutput {
 VertexOutput main(VertexInput input) {
 	VertexOutput output;
 
-	float2 pixel_position = input.origin + input.corner * input.size;
+	float2 pixel_position = float2(input.origin) + input.corner * float2(input.size);
 	float2 ndc_position = float2(
 		pixel_position.x * (2.0 * inverse_viewport_size.x) - 1.0,
 		1.0 - pixel_position.y * (2.0 * inverse_viewport_size.y)
 	);
 	
 	output.position = float4(ndc_position, 0.0, 1.0);
-	output.color = input.color;
+	output.color = float4(input.color) / 255.0;
 	return output;
 }

@@ -7,9 +7,9 @@ type
   QuadVertex = object
     corners: array[2, float32]
   SpriteInstance = object
-    origin: array[2, float32]
-    size: array[2, float32]
-    color: array[4, float32]
+    origin: array[2, uint16]
+    size: array[2, uint16]
+    color: array[4, uint8]
   FrameData = object
     viewport_size: array[2, float32]
     inverse_viewport_size: array[2, float32]
@@ -29,6 +29,8 @@ const
   ]
   shader_source_dir = project_dir / "shaders" / "src"
   shader_output_dir = project_dir / "shaders" / "compiled"
+
+doAssert sizeof(SpriteInstance) == 12
 
 static:
   discard staticExec("mkdir -p " & quoteShell(shader_output_dir))
@@ -135,19 +137,19 @@ proc sdl_app_init(appstate: ptr pointer; argc: cint; argv: ptr ptr char): SdlApp
     SdlGpuVertexAttribute(
       location: 1,
       buffer_slot: 1,
-      format: sdl_gpu_vertex_element_format_float2,
+      format: sdl_gpu_vertex_element_format_ushort2,
       offset: uint32(offsetOf(SpriteInstance, origin)),
     ),
     SdlGpuVertexAttribute(
       location: 2,
       buffer_slot: 1,
-      format: sdl_gpu_vertex_element_format_float2,
+      format: sdl_gpu_vertex_element_format_ushort2,
       offset: uint32(offsetOf(SpriteInstance, size)),
     ),
     SdlGpuVertexAttribute(
       location: 3,
       buffer_slot: 1,
-      format: sdl_gpu_vertex_element_format_float4,
+      format: sdl_gpu_vertex_element_format_ubyte4,
       offset: uint32(offsetOf(SpriteInstance, color)),
     ),
   ]
@@ -420,13 +422,13 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
     let x1 = ceil(box.x + box.width)
     let y1 = ceil(box.y + box.height)
     instance_data.add(SpriteInstance(
-      origin: [float32(x0), float32(y0)],
-      size: [float32(x1 - x0), float32(y1 - y0)],
+      origin: [uint16(x0), uint16(y0)],
+      size: [uint16(x1 - x0), uint16(y1 - y0)],
       color: [
-        float32(color.r) / 255'f32,
-        float32(color.g) / 255'f32,
-        float32(color.b) / 255'f32,
-        float32(color.a) / 255'f32,
+        uint8(color.r),
+        uint8(color.g),
+        uint8(color.b),
+        uint8(color.a),
       ],
     ))
 
