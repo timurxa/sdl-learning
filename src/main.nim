@@ -10,6 +10,8 @@ type
     origin: array[2, uint16]
     size: array[2, uint16]
     color: array[4, uint8]
+  ClipRect = object
+    x, w, y, h: float32
   FrameData = object
     viewport_size: array[2, float32]
     inverse_viewport_size: array[2, float32]
@@ -60,6 +62,7 @@ var
   instance_buffer_capacity: uint32
   quad_vertex_buffer_initialized: bool
   instance_data: seq[SpriteInstance]
+  clip_stack: seq[ClipRect]
 
   palette = Palette(background: rgb(0, 0, 0))
 
@@ -167,7 +170,6 @@ proc sdl_app_init(appstate: ptr pointer; argc: cint; argv: ptr ptr char): SdlApp
       alpha_blend_op: sdl_gpu_blend_op_add,
   
       enable_blend: true,
-      # false means SDL writes all RGBA channels.
     ),
   )
   
@@ -298,139 +300,89 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
         sizing:
           width = grow()
           height = grow()
-        padding = padding_all(24)
-        child_gap = 16
-        layout_direction = clay_top_to_bottom
+        child_alignment:
+          x = clay_align_x_center
+          y = clay_align_y_center
       background_color = rgba(24, 28, 36, 255)
 
-      element("top_bar"):
+      element("clip_viewport"):
         layout:
           sizing:
-            width = grow()
-            height = fixed(64)
+            width = fixed(50)
+            height = fixed(50)
         background_color = rgba(52, 64, 86, 255)
+        clip:
+          horizontal = true
+          vertical = true
 
-      element("content"):
-        layout:
-          sizing:
-            width = grow()
-            height = grow()
-          child_gap = 16
-          layout_direction = clay_left_to_right
-
-        element("sidebar"):
+        element("oversized_rectangle"):
           layout:
             sizing:
-              width = fixed(180)
-              height = grow()
-            padding = padding_all(12)
-            child_gap = 10
-            layout_direction = clay_top_to_bottom
-          background_color = rgba(38, 46, 62, 255)
-
-          element("sidebar_item_1"):
-            layout:
-              sizing:
-                width = grow()
-                height = fixed(40)
-            background_color = rgba(72, 91, 124, 255)
-
-          element("sidebar_item_2"):
-            layout:
-              sizing:
-                width = grow()
-                height = fixed(40)
-            background_color = rgba(55, 67, 91, 255)
-
-          element("sidebar_item_3"):
-            layout:
-              sizing:
-                width = grow()
-                height = fixed(40)
-            background_color = rgba(55, 67, 91, 255)
-
-        element("main_panel"):
-          layout:
-            sizing:
-              width = grow()
-              height = grow()
-            padding = padding_all(16)
-            child_gap = 16
-            layout_direction = clay_top_to_bottom
-          background_color = rgba(44, 52, 70, 255)
-
-          element("hero"):
-            layout:
-              sizing:
-                width = grow()
-                height = fixed(120)
-            background_color = rgba(75, 94, 130, 255)
-
-          element("card_row"):
-            layout:
-              sizing:
-                width = grow()
-                height = fixed(140)
-              child_gap = 12
-              layout_direction = clay_left_to_right
-
-            element("card_1"):
-              layout:
-                sizing:
-                  width = grow()
-                  height = grow()
-              background_color = rgba(64, 78, 105, 255)
-
-            element("card_2"):
-              layout:
-                sizing:
-                  width = grow()
-                  height = grow()
-              background_color = rgba(58, 73, 99, 255)
-
-            element("card_3"):
-              layout:
-                sizing:
-                  width = grow()
-                  height = grow()
-              background_color = rgba(68, 82, 108, 255)
-
-          element("lower_panel"):
-            layout:
-              sizing:
-                width = grow()
-                height = grow()
-            background_color = rgba(35, 43, 58, 255)
-
-      element("footer"):
-        layout:
-          sizing:
-            width = grow()
-            height = fixed(48)
-        background_color = rgba(52, 64, 86, 255)
+              width = fixed(520)
+              height = fixed(280)
+        background_color = rgba(235, 112, 64, 255)
 
   instance_data.setLen(0)
+  clip_stack.setLen(0)
+  clip_stack.add ClipRect(
+    x: 0'f32,
+    y: 0'f32,
+    w: float32(width),
+    h: float32(height),
+  )
+
   for command in commands:
-    if command.command_type != clay_render_command_type_rectangle:
-      continue
-    if instance_data.len >= int(instance_buffer_capacity):
-      return app_failure
-    let box = command.bounding_box
-    let color = command.render_data.rectangle.background_color
-    let x0 = floor(box.x)
-    let y0 = floor(box.y)
-    let x1 = ceil(box.x + box.width)
-    let y1 = ceil(box.y + box.height)
-    instance_data.add(SpriteInstance(
-      origin: [uint16(x0), uint16(y0)],
-      size: [uint16(x1 - x0), uint16(y1 - y0)],
-      color: [
-        uint8(color.r),
-        uint8(color.g),
-        uint8(color.b),
-        uint8(color.a),
-      ],
-    ))
+    case command.command_type:
+    of clay_render_command_type_none: discard
+    of clay_render_command_type_rectangle:
+      if instance_data.len >= int(instance_buffer_capacity):
+        return app_failure
+      let box = command.bounding_box
+      let color = command.render_data.rectangle.background_color
+      let clip_rect = clip_stack[^1]
+      let x0 = floor(max(float32(box.x), clip_rect.x))
+      let y0 = floor(max(float32(box.y), clip_rect.y))
+      let x1 = ceil(min(float32(box.x + box.width), clip_rect.x + clip_rect.w))
+      let y1 = ceil(min(float32(box.y + box.height), clip_rect.y + clip_rect.h))
+      if x1 <= x0 or y1 <= y0: continue
+      instance_data.add(SpriteInstance(
+        origin: [uint16(x0), uint16(y0)],
+        size: [uint16(x1 - x0), uint16(y1 - y0)],
+        color: [
+          uint8(color.r),
+          uint8(color.g),
+          uint8(color.b),
+          uint8(color.a),
+        ],
+      ))
+    of clay_render_command_type_border: discard
+    of clay_render_command_type_text: discard
+    of clay_render_command_type_image: discard
+    of clay_render_command_type_scissor_start:
+      let horizontal = command.render_data.clip.horizontal
+      let vertical = command.render_data.clip.vertical
+      var new_clip = clip_stack[^1]
+      if horizontal:
+        let right = min(
+          new_clip.x + new_clip.w,
+          float32(command.bounding_box.x + command.bounding_box.width),
+        )
+        new_clip.x = max(new_clip.x, float32(command.bounding_box.x))
+        new_clip.w = max(right - new_clip.x, 0)
+      if vertical:
+        let bottom = min(
+          new_clip.y + new_clip.h,
+          float32(command.bounding_box.y + command.bounding_box.height),
+        )
+        new_clip.y = max(new_clip.y, float32(command.bounding_box.y))
+        new_clip.h = max(bottom - new_clip.y, 0)
+      clip_stack.add new_clip
+    of clay_render_command_type_scissor_end:
+      clip_stack.setLen(clip_stack.len - 1)
+    of clay_render_command_type_overlay_color_start: discard
+    of clay_render_command_type_overlay_color_end: discard
+    of clay_render_command_type_custom: discard
+    else: return app_failure
 
   let mapped_transfer_buffer = map_gpu_transfer_buffer(
     gpu_device,
