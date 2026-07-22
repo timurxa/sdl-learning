@@ -1,5 +1,4 @@
 import std/colors
-import std/math
 import std/os
 import clay, sdl
 
@@ -10,7 +9,7 @@ type
     origin: array[2, uint16]
     size: array[2, uint16]
     color: array[4, uint8]
-  ClipRect = object
+  Rect = object
     x, w, y, h: float32
   FrameData = object
     viewport_size: array[2, float32]
@@ -62,11 +61,55 @@ var
   instance_buffer_capacity: uint32
   quad_vertex_buffer_initialized: bool
   instance_data: seq[SpriteInstance]
-  clip_stack: seq[ClipRect]
+  clip_stack: seq[Rect]
 
   palette = Palette(background: rgb(0, 0, 0))
 
   clay_arena: ClayArena
+
+converter clay_bb_to_rect(clay_bb: ClayBoundingBox): Rect =
+  result.x = float32(clay_bb.x)
+  result.y = float32(clay_bb.y)
+  result.w = float32(clay_bb.width)
+  result.h = float32(clay_bb.height)
+
+proc clip(rect: var Rect; mask: Rect): Rect =
+  let right = min(
+    rect.x + rect.w,
+    mask.x + mask.w,
+  )
+  rect.x = max(rect.x, mask.x)
+  rect.w = max(right - rect.x, 0)
+
+  let bottom = min(
+    rect.y + rect.h,
+    mask.y + mask.h,
+  )
+  rect.y = max(rect.y, mask.y)
+  rect.h = max(bottom - rect.y, 0)
+
+  rect
+
+proc is_empty(rect: Rect): bool = rect.w <= 0 or rect.h <= 0
+
+proc append_clipped_rect(box: Rect; clip_rect: Rect; color: ClayColor): bool =
+  var clipped_box = box
+  discard clipped_box.clip(clip_rect)
+  if clipped_box.is_empty():
+    return true
+  if instance_data.len >= int(instance_buffer_capacity):
+    return false
+  instance_data.add(SpriteInstance(
+    origin: [uint16(clipped_box.x), uint16(clipped_box.y)],
+    size: [uint16(clipped_box.w), uint16(clipped_box.h)],
+    color: [
+      uint8(color.r),
+      uint8(color.g),
+      uint8(color.b),
+      uint8(color.a),
+    ],
+  ))
+  true
 
 proc sdl_app_init(appstate: ptr pointer; argc: cint; argv: ptr ptr char): SdlAppResult {.cdecl.} =
   discard appstate
@@ -300,31 +343,383 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
         sizing:
           width = grow()
           height = grow()
-        child_alignment:
-          x = clay_align_x_center
-          y = clay_align_y_center
-      background_color = rgba(24, 28, 36, 255)
+        padding = padding_all(18)
+        child_gap = 14
+        layout_direction = clay_top_to_bottom
+      background_color = rgba(19, 24, 34, 255)
+      corner_radius = corner_radius(16)
+      border:
+        color = rgba(75, 92, 124, 255)
+        width = border_outside(2)
 
-      element("clip_viewport"):
+      element("header"):
         layout:
           sizing:
-            width = fixed(50)
-            height = fixed(50)
-        background_color = rgba(52, 64, 86, 255)
-        clip:
-          horizontal = true
-          vertical = true
+            width = grow()
+            height = fixed(58)
+          padding = padding_all(12)
+          child_gap = 12
+          layout_direction = clay_left_to_right
+        background_color = rgba(31, 42, 59, 255)
+        corner_radius = corner_radius(10)
+        border:
+          color = rgba(84, 108, 148, 255)
+          width = border_outside(1)
 
-        element("oversized_rectangle"):
+        element("brand_mark"):
           layout:
             sizing:
-              width = fixed(520)
-              height = fixed(280)
-        background_color = rgba(235, 112, 64, 255)
+              width = fixed(34)
+              height = grow()
+            child_alignment:
+              x = clay_align_x_center
+              y = clay_align_y_center
+          background_color = rgba(82, 190, 177, 255)
+          corner_radius = corner_radius(8)
+          border:
+            color = rgba(151, 241, 218, 255)
+            width = border_outside(2)
+
+        element("header_title"):
+          layout:
+            sizing:
+              width = grow()
+              height = grow()
+            layout_direction = clay_top_to_bottom
+            child_gap = 5
+            child_alignment:
+              y = clay_align_y_center
+          background_color = rgba(43, 57, 79, 255)
+          border:
+            color = rgba(70, 91, 125, 255)
+            width = clay_border_width(0, 0, 0, 1, 0)
+          element("title_line"):
+            layout:
+              sizing:
+                width = fixed(180)
+                height = fixed(8)
+            background_color = rgba(225, 235, 250, 255)
+            corner_radius = corner_radius(4)
+          element("subtitle_line"):
+            layout:
+              sizing:
+                width = fixed(112)
+                height = fixed(5)
+            background_color = rgba(126, 151, 188, 255)
+            corner_radius = corner_radius(3)
+
+        element("header_status"):
+          layout:
+            sizing:
+              width = fixed(108)
+              height = grow()
+            padding = padding_all(8)
+            child_gap = 6
+            layout_direction = clay_left_to_right
+            child_alignment:
+              y = clay_align_y_center
+          background_color = rgba(25, 35, 50, 255)
+          corner_radius = corner_radius(8)
+          border:
+            color = rgba(67, 93, 129, 255)
+            width = border_outside(1)
+          element("status_dot"):
+            layout:
+              sizing:
+                width = fixed(10)
+                height = fixed(10)
+            background_color = rgba(92, 224, 157, 255)
+            corner_radius = corner_radius(5)
+          element("status_bar"):
+            layout:
+              sizing:
+                width = grow()
+                height = fixed(6)
+            background_color = rgba(93, 132, 169, 255)
+            corner_radius = corner_radius(3)
+
+      element("body"):
+        layout:
+          sizing:
+            width = grow()
+            height = grow()
+          child_gap = 14
+          layout_direction = clay_left_to_right
+
+        element("sidebar"):
+          layout:
+            sizing:
+              width = fixed(154)
+              height = grow()
+            padding = padding_all(12)
+            child_gap = 10
+            layout_direction = clay_top_to_bottom
+          background_color = rgba(28, 37, 52, 255)
+          corner_radius = corner_radius(10)
+          border:
+            color = rgba(77, 99, 133, 255)
+            width = border_outside(1)
+          clip:
+            horizontal = true
+            vertical = true
+
+          element("nav_heading"):
+            layout:
+              sizing:
+                width = fixed(110)
+                height = fixed(8)
+            background_color = rgba(119, 148, 188, 255)
+            corner_radius = corner_radius(4)
+          for index in 0 ..< 8:
+            element(clay_id_with_index("nav_item", uint32(index))):
+              layout:
+                sizing:
+                  width = fixed(178)
+                  height = fixed(32)
+                padding = padding_all(8)
+                child_gap = 7
+                layout_direction = clay_left_to_right
+              background_color = if index == 0:
+                rgba(62, 105, 135, 255)
+              else:
+                rgba(34, 47, 66, 255)
+              corner_radius = corner_radius(6)
+              border:
+                color = if index == 0:
+                  rgba(107, 226, 198, 255)
+                else:
+                  rgba(58, 77, 105, 255)
+                width = border_outside(1)
+              element(clay_id_with_index("nav_glyph", uint32(index))):
+                layout:
+                  sizing:
+                    width = fixed(8)
+                    height = fixed(8)
+                background_color = if index == 0:
+                  rgba(142, 245, 214, 255)
+                else:
+                  rgba(109, 132, 164, 255)
+                corner_radius = corner_radius(4)
+              element(clay_id_with_index("nav_label", uint32(index))):
+                layout:
+                  sizing:
+                    width = fixed(92)
+                    height = fixed(5)
+                background_color = rgba(103, 128, 161, 255)
+                corner_radius = corner_radius(3)
+
+        element("main_content"):
+          layout:
+            sizing:
+              width = grow()
+              height = grow()
+            child_gap = 14
+            layout_direction = clay_top_to_bottom
+
+          element("metrics"):
+            layout:
+              sizing:
+                width = grow()
+                height = fixed(82)
+              child_gap = 12
+              layout_direction = clay_left_to_right
+            for index, metric_color in [
+                (rgba(50, 76, 106, 255), rgba(93, 195, 238, 255)),
+                (rgba(49, 76, 75, 255), rgba(93, 224, 176, 255)),
+                (rgba(75, 60, 91, 255), rgba(205, 143, 246, 255))]:
+              element(clay_id_with_index("metric", uint32(index))):
+                layout:
+                  sizing:
+                    width = grow()
+                    height = grow()
+                  padding = padding_all(12)
+                  child_gap = 8
+                  layout_direction = clay_top_to_bottom
+                background_color = metric_color[0]
+                corner_radius = corner_radius(9)
+                border:
+                  color = metric_color[1]
+                  width = border_outside(1)
+                element(clay_id_with_index("metric_value", uint32(index))):
+                  layout:
+                    sizing:
+                      width = fixed(74 + index * 18)
+                      height = fixed(12)
+                  background_color = metric_color[1]
+                  corner_radius = corner_radius(5)
+                element(clay_id_with_index("metric_delta", uint32(index))):
+                  layout:
+                    sizing:
+                      width = fixed(46 + index * 12)
+                      height = fixed(5)
+                  background_color = rgba(155, 176, 204, 255)
+                  corner_radius = corner_radius(3)
+
+          element("content_grid"):
+            layout:
+              sizing:
+                width = grow()
+                height = grow()
+              child_gap = 14
+              layout_direction = clay_left_to_right
+
+            element("chart_panel"):
+              layout:
+                sizing:
+                  width = percent(0.57)
+                  height = grow()
+                padding = padding_all(12)
+                child_gap = 10
+                layout_direction = clay_top_to_bottom
+              background_color = rgba(29, 40, 56, 255)
+              corner_radius = corner_radius(10)
+              border:
+                color = rgba(76, 104, 143, 255)
+                width = border_outside(1)
+
+              element("chart_header"):
+                layout:
+                  sizing:
+                    width = grow()
+                    height = fixed(18)
+                  layout_direction = clay_left_to_right
+                  child_alignment:
+                    y = clay_align_y_center
+                element("chart_title"):
+                  layout:
+                    sizing:
+                      width = fixed(118)
+                      height = fixed(7)
+                  background_color = rgba(219, 231, 248, 255)
+                  corner_radius = corner_radius(4)
+                element("chart_action"):
+                  layout:
+                    sizing:
+                      width = fixed(42)
+                      height = fixed(7)
+                  background_color = rgba(87, 122, 166, 255)
+                  corner_radius = corner_radius(4)
+
+              element("chart_clip"):
+                layout:
+                  sizing:
+                    width = grow()
+                    height = grow()
+                  padding = padding_all(8)
+                  layout_direction = clay_left_to_right
+                background_color = rgba(20, 29, 42, 255)
+                corner_radius = corner_radius(7)
+                clip:
+                  horizontal = true
+                  vertical = true
+                element("chart_canvas"):
+                  layout:
+                    sizing:
+                      width = fixed(620)
+                      height = fixed(214)
+                    child_gap = 8
+                    layout_direction = clay_left_to_right
+                    child_alignment:
+                      y = clay_align_y_bottom
+                  background_color = rgba(24, 35, 50, 255)
+                  corner_radius = corner_radius(6)
+                  border:
+                    color = rgba(75, 122, 151, 255)
+                    width = border_outside(2)
+                  for index in 0 ..< 14:
+                    element(clay_id_with_index("bar", uint32(index))):
+                      layout:
+                        sizing:
+                          width = fixed(24)
+                          height = fixed(42 + ((index * 17) mod 122))
+                      background_color = if index mod 3 == 0:
+                        rgba(91, 208, 190, 255)
+                      else:
+                        rgba(63, 124, 174, 255)
+                      corner_radius = corner_radius(4)
+
+            element("activity_panel"):
+              layout:
+                sizing:
+                  width = grow()
+                  height = grow()
+                padding = padding_all(12)
+                child_gap = 10
+                layout_direction = clay_top_to_bottom
+              background_color = rgba(29, 40, 56, 255)
+              corner_radius = corner_radius(10)
+              border:
+                color = rgba(76, 104, 143, 255)
+                width = border_outside(1)
+              clip:
+                horizontal = true
+                vertical = true
+
+              element("activity_heading"):
+                layout:
+                  sizing:
+                    width = fixed(136)
+                    height = fixed(8)
+                background_color = rgba(219, 231, 248, 255)
+                corner_radius = corner_radius(4)
+              for index in 0 ..< 11:
+                element(clay_id_with_index("activity_row", uint32(index))):
+                  layout:
+                    sizing:
+                      width = fixed(360)
+                      height = fixed(34)
+                    padding = padding_all(8)
+                    child_gap = 8
+                    layout_direction = clay_left_to_right
+                  background_color = if index mod 2 == 0:
+                    rgba(37, 52, 72, 255)
+                  else:
+                    rgba(32, 45, 63, 255)
+                  border:
+                    color = rgba(61, 83, 112, 255)
+                    width = clay_border_width(0, 0, 0, 1, 0)
+                  element(clay_id_with_index("activity_dot", uint32(index))):
+                    layout:
+                      sizing:
+                        width = fixed(7)
+                        height = fixed(7)
+                    background_color = if index mod 4 == 0:
+                      rgba(244, 188, 92, 255)
+                    else:
+                      rgba(106, 192, 232, 255)
+                    corner_radius = corner_radius(4)
+                  element(clay_id_with_index("activity_line", uint32(index))):
+                    layout:
+                      sizing:
+                        width = fixed(170 + index * 8)
+                        height = fixed(5)
+                    background_color = rgba(114, 143, 178, 255)
+                    corner_radius = corner_radius(3)
+
+      element("footer"):
+        layout:
+          sizing:
+              width = grow()
+              height = fixed(28)
+          padding = padding_all(8)
+          child_alignment:
+            y = clay_align_y_center
+        background_color = rgba(27, 37, 52, 255)
+        corner_radius = corner_radius(7)
+        border:
+          color = rgba(66, 86, 116, 255)
+          width = border_outside(1)
+        element("footer_indicator"):
+          layout:
+            sizing:
+              width = fixed(220)
+              height = fixed(5)
+          background_color = rgba(91, 208, 190, 255)
+          corner_radius = corner_radius(3)
 
   instance_data.setLen(0)
   clip_stack.setLen(0)
-  clip_stack.add ClipRect(
+  clip_stack.add Rect(
     x: 0'f32,
     y: 0'f32,
     w: float32(width),
@@ -335,27 +730,43 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
     case command.command_type:
     of clay_render_command_type_none: discard
     of clay_render_command_type_rectangle:
-      if instance_data.len >= int(instance_buffer_capacity):
-        return app_failure
-      let box = command.bounding_box
-      let color = command.render_data.rectangle.background_color
       let clip_rect = clip_stack[^1]
-      let x0 = floor(max(float32(box.x), clip_rect.x))
-      let y0 = floor(max(float32(box.y), clip_rect.y))
-      let x1 = ceil(min(float32(box.x + box.width), clip_rect.x + clip_rect.w))
-      let y1 = ceil(min(float32(box.y + box.height), clip_rect.y + clip_rect.h))
-      if x1 <= x0 or y1 <= y0: continue
-      instance_data.add(SpriteInstance(
-        origin: [uint16(x0), uint16(y0)],
-        size: [uint16(x1 - x0), uint16(y1 - y0)],
-        color: [
-          uint8(color.r),
-          uint8(color.g),
-          uint8(color.b),
-          uint8(color.a),
-        ],
-      ))
-    of clay_render_command_type_border: discard
+      let color = command.render_data.rectangle.background_color
+      if not append_clipped_rect(command.bounding_box, clip_rect, color):
+        return app_failure
+    of clay_render_command_type_border:
+      let box: Rect = command.bounding_box
+      let color = command.render_data.border.color
+      let border_widths = command.render_data.border.width
+      let clip_rect = clip_stack[^1]
+
+      var top = Rect(
+        x: box.x,
+        y: box.y,
+        w: box.w,
+        h: float32(border_widths.top),
+      )
+      var right = Rect(
+        x: box.x + box.w - float32(border_widths.right),
+        y: box.y + float32(border_widths.top),
+        w: float32(border_widths.right),
+        h: max(box.h - float32(border_widths.top) - float32(border_widths.bottom), 0),
+      )
+      var left = Rect(
+        x: box.x,
+        y: box.y + top.h,
+        w: float32(border_widths.left),
+        h: max(box.h - float32(border_widths.top) - float32(border_widths.bottom), 0),
+      )
+      var bottom = Rect(
+        x: box.x,
+        y: box.y + box.h - float32(border_widths.bottom),
+        w: box.w,
+        h: float32(border_widths.bottom),
+      )
+      for segment in [top, right, left, bottom]:
+        if not append_clipped_rect(segment, clip_rect, color):
+          return app_failure
     of clay_render_command_type_text: discard
     of clay_render_command_type_image: discard
     of clay_render_command_type_scissor_start:
