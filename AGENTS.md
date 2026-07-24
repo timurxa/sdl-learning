@@ -1,10 +1,10 @@
 # AGENTS.md instructions
 
-Build the program with:
+Use these compiler flags when building the program:
 
 ```sh
-nim c -o:out/main -r src/main.nim
+nim c -r
 ```
 
 - Always use snake_case for identifiers where camelCase would otherwise be used. Use PascalCase for type names.
-- Check the Nim standard library before implementing a custom proc for something.
+- Always read and check the Nim standard library before implementing functionality, to avoid recreating functionality that already exists there.

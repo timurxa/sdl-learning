@@ -30,6 +30,9 @@ const
   ]
   shader_source_dir = project_dir / "shaders" / "src"
   shader_output_dir = project_dir / "shaders" / "compiled"
+  nav_labels = ["Overview", "Activity", "Analytics", "Deployments", "Alerts", "Settings", "Team", "Archive"]
+  metric_labels = ["REQUESTS", "SUCCESS RATE", "LATENCY"]
+  metric_values = ["24.8K", "98.7%", "142 MS"]
 
 doAssert sizeof(SpriteInstance) == 12
 
@@ -73,7 +76,7 @@ converter clay_bb_to_rect(clay_bb: ClayBoundingBox): Rect =
   result.w = float32(clay_bb.width)
   result.h = float32(clay_bb.height)
 
-proc clip(rect: var Rect; mask: Rect): Rect =
+proc clip_rect(rect: var Rect; mask: Rect) =
   let right = min(
     rect.x + rect.w,
     mask.x + mask.w,
@@ -88,28 +91,9 @@ proc clip(rect: var Rect; mask: Rect): Rect =
   rect.y = max(rect.y, mask.y)
   rect.h = max(bottom - rect.y, 0)
 
-  rect
+  discard
 
 proc is_empty(rect: Rect): bool = rect.w <= 0 or rect.h <= 0
-
-proc append_clipped_rect(box: Rect; clip_rect: Rect; color: ClayColor): bool =
-  var clipped_box = box
-  discard clipped_box.clip(clip_rect)
-  if clipped_box.is_empty():
-    return true
-  if instance_data.len >= int(instance_buffer_capacity):
-    return false
-  instance_data.add(SpriteInstance(
-    origin: [uint16(clipped_box.x), uint16(clipped_box.y)],
-    size: [uint16(clipped_box.w), uint16(clipped_box.h)],
-    color: [
-      uint8(color.r),
-      uint8(color.g),
-      uint8(color.b),
-      uint8(color.a),
-    ],
-  ))
-  true
 
 proc sdl_app_init(appstate: ptr pointer; argc: cint; argv: ptr ptr char): SdlAppResult {.cdecl.} =
   discard appstate
@@ -314,13 +298,16 @@ proc sdl_app_event(appstate: pointer; event: ptr SdlEvent): SdlAppResult {.cdecl
 proc measure_text(text: ClayStringSlice; config: ptr ClayTextElementConfig;
     user_data: pointer): ClayDimensions {.cdecl.} =
   discard user_data
-  clay_dimensions(cfloat(text.length * int32(config[].font_size) div 2),
-    cfloat(config[].font_size))
+  let font_size = cfloat(config[].font_size)
+  let line_height =
+    if config[].line_height > 0: cfloat(config[].line_height) else: font_size
+  clay_dimensions(cfloat(text.length) * font_size / 2.0 / 2.0, line_height / 2.0)
 
 proc handle_error(error_data: ClayErrorData) {.cdecl.} =
   echo "Clay error: ", error_data.error_type
 
 proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
+  # echo "sdl_app_iterate"
   discard appstate
 
   let command_buffer = acquire_gpu_command_buffer(gpu_device)
@@ -393,6 +380,12 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
           border:
             color = rgba(70, 91, 125, 255)
             width = clay_border_width(0, 0, 0, 1, 0)
+          text("NIM // OBSERVER"):
+            font_size = 15
+            text_color = rgba(225, 235, 250, 255)
+          text("LIVE SYSTEMS DASHBOARD abcdefghijklmnopqrstuvxyzabcdefghijklmnopqrstuvxyzabcdefghijklmnopqrstuvxyzabcdefghijklmnopqrstuvxyzabcdefghijklmnopqrstuvxyzabcdefghijklmnopqrstuvxyzabcdefghijklmnopqrstuvxyzabcdefghijklmnopqrstuvxyz"):
+            font_size = 10
+            text_color = rgba(126, 151, 188, 255)
           element("title_line"):
             layout:
               sizing:
@@ -430,6 +423,9 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                 height = fixed(10)
             background_color = rgba(92, 224, 157, 255)
             corner_radius = corner_radius(5)
+          text("LIVE"):
+            font_size = 10
+            text_color = rgba(167, 238, 200, 255)
           element("status_bar"):
             layout:
               sizing:
@@ -507,6 +503,9 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                     height = fixed(5)
                 background_color = rgba(103, 128, 161, 255)
                 corner_radius = corner_radius(3)
+              text(nav_labels[index]):
+                font_size = 11
+                text_color = rgba(194, 208, 229, 255)
 
         element("main_content"):
           layout:
@@ -540,6 +539,12 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                 border:
                   color = metric_color[1]
                   width = border_outside(1)
+                text(metric_labels[index]):
+                  font_size = 10
+                  text_color = rgba(155, 176, 204, 255)
+                text(metric_values[index]):
+                  font_size = 18
+                  text_color = rgba(235, 243, 255, 255)
                 element(clay_id_with_index("metric_value", uint32(index))):
                   layout:
                     sizing:
@@ -585,6 +590,9 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                   layout_direction = clay_left_to_right
                   child_alignment:
                     y = clay_align_y_center
+                text("TRAFFIC OVERVIEW"):
+                  font_size = 12
+                  text_color = rgba(219, 231, 248, 255)
                 element("chart_title"):
                   layout:
                     sizing:
@@ -662,6 +670,9 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                     height = fixed(8)
                 background_color = rgba(219, 231, 248, 255)
                 corner_radius = corner_radius(4)
+              text("RECENT ACTIVITY"):
+                font_size = 12
+                text_color = rgba(219, 231, 248, 255)
               for index in 0 ..< 11:
                 element(clay_id_with_index("activity_row", uint32(index))):
                   layout:
@@ -678,6 +689,12 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                   border:
                     color = rgba(61, 83, 112, 255)
                     width = clay_border_width(0, 0, 0, 1, 0)
+                  text("EVENT "):
+                    font_size = 10
+                    text_color = rgba(194, 208, 229, 255)
+                  text($index):
+                    font_size = 10
+                    text_color = rgba(114, 143, 178, 255)
                   element(clay_id_with_index("activity_dot", uint32(index))):
                     layout:
                       sizing:
@@ -709,6 +726,9 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
         border:
           color = rgba(66, 86, 116, 255)
           width = border_outside(1)
+        text("CLAY RENDER PIPELINE  /  FRAME 60"):
+          font_size = 10
+          text_color = rgba(155, 176, 204, 255)
         element("footer_indicator"):
           layout:
             sizing:
@@ -730,15 +750,28 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
     case command.command_type:
     of clay_render_command_type_none: discard
     of clay_render_command_type_rectangle:
-      let clip_rect = clip_stack[^1]
+      let current_clip = clip_stack[^1]
+      var box: Rect = command.bounding_box
+      clip_rect(box, current_clip)
       let color = command.render_data.rectangle.background_color
-      if not append_clipped_rect(command.bounding_box, clip_rect, color):
+      if box.is_empty(): continue
+      if instance_data.len >= int(instance_buffer_capacity):
         return app_failure
+      instance_data.add(SpriteInstance(
+        origin: [uint16(box.x), uint16(box.y)],
+        size: [uint16(box.w), uint16(box.h)],
+        color: [
+          uint8(color.r),
+          uint8(color.g),
+          uint8(color.b),
+          uint8(color.a),
+        ],
+      ))
     of clay_render_command_type_border:
       let box: Rect = command.bounding_box
       let color = command.render_data.border.color
       let border_widths = command.render_data.border.width
-      let clip_rect = clip_stack[^1]
+      let current_clip = clip_stack[^1]
 
       var top = Rect(
         x: box.x,
@@ -764,9 +797,22 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
         w: box.w,
         h: float32(border_widths.bottom),
       )
-      for segment in [top, right, left, bottom]:
-        if not append_clipped_rect(segment, clip_rect, color):
+      for source_segment in [top, right, left, bottom]:
+        var segment = source_segment
+        clip_rect(segment, current_clip)
+        if segment.is_empty(): continue
+        if instance_data.len >= int(instance_buffer_capacity):
           return app_failure
+        instance_data.add(SpriteInstance(
+          origin: [uint16(segment.x), uint16(segment.y)],
+          size: [uint16(segment.w), uint16(segment.h)],
+          color: [
+            uint8(color.r),
+            uint8(color.g),
+            uint8(color.b),
+            uint8(color.a),
+          ],
+        ))
     of clay_render_command_type_text: discard
     of clay_render_command_type_image: discard
     of clay_render_command_type_scissor_start:
