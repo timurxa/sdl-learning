@@ -1,0 +1,4 @@
+interface:
+  display_name: "Nim Runtime Workflow"
+  short_description: "Use optimized Nim builds and terminate runs cleanly"
+  default_prompt: "Apply the Nim runtime workflow: prefer release/LTO builds when running performance-relevant code and ensure every task terminates."
