@@ -4,7 +4,6 @@ import std/monotimes
 import std/random
 import std/sequtils
 import std/sets
-import std/strutils
 import std/tables
 import std/times
 import mapper_generator
@@ -315,6 +314,7 @@ proc test_mapper_generator() =
   echo bucketter.mixer
   doAssert bucketter.mixer != nil
   doAssert bucketter.mixer.kind == in_ubfx
+  doAssert bucketter.g_index == 0
 
 proc test_multi_word_mapper_generator() =
   var strings = @[
@@ -338,8 +338,11 @@ proc test_multi_word_mapper_generator() =
     byte_groups.add(byte_group)
 
   let bucketter = find_bucket_separator(byte_groups)
+  let repeated_bucketter = find_bucket_separator(byte_groups)
   let instruction_text = $bucketter.mixer
-  doAssert instruction_text.contains("index: 1")
+  doAssert bucketter.g_index == 1
+  doAssert repeated_bucketter.g_index == bucketter.g_index
+  doAssert $repeated_bucketter.mixer == instruction_text
 
 proc assert_partial_width(strings: seq[string], expected: int) =
   let actual = minimum_loads(strings).classes
