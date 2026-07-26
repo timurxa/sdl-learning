@@ -21,9 +21,10 @@ type
       width: int
   LengthClass = object
     min, max: int
+  CollisionKey = tuple[class_index: int, value: uint64]
   CollisionClass = object
-    start: int
     len: int
+    members: seq[int]
   LengthClassResult = object
     min, max: int
     loads: seq[Load]
@@ -68,6 +69,30 @@ proc min_distinguishable_prefix_bytes(strings: openArray[string]): int =
     max_lcp = max(max_lcp, j)
   result = max_lcp + 1
 
+proc loaded_prefix_value(string: string, width: int): uint64 =
+  for i in 0 ..< width:
+    result = (result shl 8) or uint64(ord(string[i]))
+
+proc prefixes_are_distinct(
+    strings: openArray[string], prefix_length: int
+  ): bool =
+  if prefix_length <= 8:
+    var prefixes = initHashSet[uint64]()
+    for string in strings:
+      let prefix = loaded_prefix_value(string, prefix_length)
+      if prefix in prefixes:
+        return false
+      prefixes.incl(prefix)
+    return true
+
+  var prefixes = initHashSet[string]()
+  for string in strings:
+    let prefix = string[0 ..< prefix_length]
+    if prefix in prefixes:
+      return false
+    prefixes.incl(prefix)
+  true
+
 proc load_order(a, b: string): int =
   if a.len == b.len:
     return cmp(a, b)
@@ -90,10 +115,9 @@ proc length_classes(strings: seq[string]; length_jump_map: LengthJumpMap): seq[L
         length_jump_map.map[length_jump_map.lengths[middle + 1]] - 1
       else:
         strings.high
-      let min_distinguishing = min_distinguishable_prefix_bytes(
-        strings.toOpenArray(start, end_index)
-      )
-      if min_distinguishing <= min_length:
+      if prefixes_are_distinct(
+          strings.toOpenArray(start, end_index), min_length
+        ):
         low = middle
       else:
         high = middle
@@ -104,50 +128,48 @@ proc length_classes(strings: seq[string]; length_jump_map: LengthJumpMap): seq[L
     ))
     first_group = low + 1
 
-const no_collision_class = -1
-
 proc loaded_value(string: string, offset: int): uint64 =
   for i in 0 ..< 8:
     result = (result shl 8) or uint64(ord(string[offset + i]))
 
 proc collision_score(
     strings: seq[string],
-    start, finish: int,
     collision_classes: seq[CollisionClass],
-    class_of: seq[int],
     log_fact: seq[float],
-    group_sizes: var Table[uint64, int],
-    offset: int,
+    group_sizes: var Table[CollisionKey, int],
+    loaded_values: seq[uint64],
   ): float =
+  group_sizes.clear()
   for class_index, collision_class in pairs(collision_classes):
-    group_sizes.clear()
-    for string_index in start .. finish:
-      if class_of[string_index] == class_index:
-        let value = loaded_value(strings[string_index], offset)
-        group_sizes.mgetOrPut(value).inc
-
     result += log_fact[collision_class.len]
-    for group_size in group_sizes.values:
-      result -= log_fact[group_size]
+    for string_index in collision_class.members:
+      let key = (class_index, loaded_values[string_index])
+      group_sizes.mgetOrPut(key).inc
+  for group_size in group_sizes.values:
+    result -= log_fact[group_size]
+
+proc advance_loaded_values(
+    strings: seq[string], collision_classes: seq[CollisionClass], offset: int,
+    loaded_values: var seq[uint64],
+  ) =
+  for collision_class in collision_classes:
+    for string_index in collision_class.members:
+      loaded_values[string_index] =
+        (loaded_values[string_index] shl 8) or
+        uint64(ord(strings[string_index][offset + 7]))
 
 proc apply_load(
     strings: seq[string],
-    start, finish: int,
     collision_classes: var seq[CollisionClass],
-    class_of: var seq[int],
     offset: int,
   ) =
   var next_classes: seq[CollisionClass]
-  var next_groups: seq[seq[int]]
 
-  for class_index in 0 ..< collision_classes.len:
+  for collision_class in collision_classes:
     var groups: seq[seq[int]]
     var group_of = initTable[uint64, int]()
 
-    for string_index in start .. finish:
-      if class_of[string_index] != class_index:
-        continue
-
+    for string_index in collision_class.members:
       let value = loaded_value(strings[string_index], offset)
       let group_index = if group_of.hasKey(value):
         group_of[value]
@@ -159,16 +181,8 @@ proc apply_load(
       groups[group_index].add(string_index)
 
     for group in groups:
-      next_groups.add(group)
-
-  for group in next_groups:
-    if group.len > 1:
-      let new_class_index = next_classes.len
-      next_classes.add(CollisionClass(start: group[0], len: group.len))
-      for string_index in group:
-        class_of[string_index] = new_class_index
-    else:
-      class_of[group[0]] = no_collision_class
+      if group.len > 1:
+        next_classes.add(CollisionClass(len: group.len, members: group))
 
   collision_classes = next_classes
 
@@ -197,14 +211,11 @@ proc minimum_loads(strings: seq[string]): MinimumLoadsResult =
       strings.high
 
     var collision_classes: seq[CollisionClass]
-    var class_of = newSeqWith(strings.len, no_collision_class)
     if class_finish > class_start:
-      collision_classes.add(CollisionClass(
-        start: class_start,
-        len: class_finish - class_start + 1,
-      ))
+      var members = newSeqOfCap[int](class_finish - class_start + 1)
       for string_index in class_start .. class_finish:
-        class_of[string_index] = 0
+        members.add(string_index)
+      collision_classes.add(CollisionClass(len: members.len, members: members))
 
     var loads: seq[Load]
     let min_length = length_class.min
@@ -216,39 +227,44 @@ proc minimum_loads(strings: seq[string]): MinimumLoadsResult =
         let width = min(nextPowerOfTwo(required_bytes), min(min_length, 8))
         loads.add(Load(kind: PartialLoad, offset: 0, width: width))
       else:
-        var group_sizes = initTable[uint64, int](class_finish - class_start + 1)
+        var group_sizes = initTable[CollisionKey, int](class_finish - class_start + 1)
+        var loaded_values = newSeq[uint64](strings.len)
         while collision_classes.len > 0:
+          for collision_class in collision_classes:
+            for string_index in collision_class.members:
+              loaded_values[string_index] = loaded_value(strings[string_index], 0)
           var best_offset = -1
           var best_score = -1.0
+          var perfect_score = 0.0
+          for collision_class in collision_classes:
+            perfect_score += log_fact[collision_class.len]
           for offset in 0 .. min_length - 8:
+            if offset > 0:
+              advance_loaded_values(strings, collision_classes, offset, loaded_values)
             let score = collision_score(
               strings,
-              class_start,
-              class_finish,
               collision_classes,
-              class_of,
               log_fact,
               group_sizes,
-              offset,
+              loaded_values,
             )
             if score > best_score:
               best_score = score
               best_offset = offset
+            if best_score == perfect_score:
+              break
 
           doAssert best_offset >= 0
           apply_load(
             strings,
-            class_start,
-            class_finish,
             collision_classes,
-            class_of,
             best_offset,
           )
           loads.add(Load(kind: FullLoad, offset: best_offset))
 
     result.classes[i] = LengthClassResult(
       min: length_class.min,
-      max: length_class.max,
+      max: if i + 1 < classes.len: classes[i + 1].min - 1 else: length_class.max,
       loads: loads,
     )
 
@@ -277,11 +293,53 @@ proc random_words(count: int): seq[string] =
       result.add(candidate)
   result.sort(load_order)
 
+proc repeated_a_strings(count: int): seq[string] =
+  for length in 1 .. count:
+    var value = newString(length)
+    for index in 0 ..< length:
+      value[index] = 'a'
+    result.add(value)
+
+proc two_component_strings(count, length, component_size: int): seq[string] =
+  for index in 0 ..< count:
+    var value = newString(length)
+    for byte_index in 0 ..< length:
+      value[byte_index] = 'a'
+    value[0] = char(1 + index div component_size)
+    value[component_size div 8] = char(1 + index mod component_size)
+    result.add(value)
+  result.sort(load_order)
+
+proc four_component_strings(count, length, component_size: int): seq[string] =
+  for index in 0 ..< count:
+    var value = newString(length)
+    for byte_index in 0 ..< length:
+      value[byte_index] = 'a'
+    for component in 0 ..< 4:
+      let place = case component
+      of 0: component_size * component_size * component_size
+      of 1: component_size * component_size
+      of 2: component_size
+      else: 1
+      let component_index = index div place mod component_size
+      value[component * 8] = char(1 + component_index)
+    result.add(value)
+  result.sort(load_order)
+
 proc benchmark_minimum_loads(name: string, strings: seq[string]) =
   let started = get_mono_time()
   let loads = minimum_loads(strings)
   let elapsed = get_mono_time() - started
-  echo name, " result: ", loads
+  var counts: seq[int]
+  var total = 0
+  for length_class in loads.classes:
+    counts.add(length_class.loads.len)
+    total += length_class.loads.len
+  if counts.len <= 32:
+    echo name, " partitions: ", counts.len, " loads: ", counts
+  else:
+    echo name, " partitions: ", counts.len, " loads: first=", counts[0],
+      " last=", counts[^1], " total=", total
   echo name, " time: ", inNanoseconds(elapsed), " ns"
 
 proc assert_class_bounds(strings: seq[string], expected: seq[(int, int)]) =
@@ -352,6 +410,89 @@ proc assert_partial_width(strings: seq[string], expected: int) =
   doAssert actual[0].loads[0].offset == 0
   doAssert actual[0].loads[0].width == expected
 
+proc assert_result_class_bounds(strings: seq[string], expected: seq[(int, int)]) =
+  let actual = minimum_loads(strings).classes
+  doAssert actual.len == expected.len
+  for i in 0 ..< expected.len:
+    doAssert actual[i].min == expected[i][0]
+    doAssert actual[i].max == expected[i][1]
+
+proc reference_prefix_length(strings: openArray[string]): int =
+  if strings.len <= 1:
+    return 1
+
+  for first in 0 ..< strings.len:
+    for second in first + 1 ..< strings.len:
+      var common = 0
+      let limit = min(strings[first].len, strings[second].len)
+      while common < limit and strings[first][common] == strings[second][common]:
+        inc common
+      result = max(result, common + 1)
+
+proc load_value_for_test(string: string, load: Load): uint64 =
+  let width = if load.kind == FullLoad: 8 else: load.width
+  for index in 0 ..< width:
+    result = (result shl 8) or uint64(ord(string[load.offset + index]))
+
+proc assert_loads_valid(strings: seq[string], loads: MinimumLoadsResult) =
+  let jump_map = create_length_jump_map(strings)
+  for length_class in loads.classes:
+    let start = jump_map.map[length_class.min]
+    let length_group = jump_map.lengths.find(length_class.max)
+    let finish = if length_group + 1 < jump_map.lengths.len:
+      jump_map.map[jump_map.lengths[length_group + 1]] - 1
+    else:
+      strings.high
+    for load in length_class.loads:
+      doAssert load.offset >= 0
+      if load.kind == FullLoad:
+        doAssert load.offset + 8 <= length_class.min
+      else:
+        doAssert load.width > 0 and load.width <= 8
+        doAssert load.offset + load.width <= length_class.min
+    for first in start ..< finish:
+      for second in first + 1 .. finish:
+        var first_values: seq[uint64]
+        var second_values: seq[uint64]
+        for load in length_class.loads:
+          first_values.add(load_value_for_test(strings[first], load))
+          second_values.add(load_value_for_test(strings[second], load))
+        doAssert first_values != second_values
+
+proc reference_partition_count(strings: seq[string]): int =
+  let jump_map = create_length_jump_map(strings)
+  var best = newSeqWith(jump_map.lengths.len + 1, high(int))
+  best[0] = 0
+  for first_group in 0 ..< jump_map.lengths.len:
+    let start = jump_map.map[jump_map.lengths[first_group]]
+    for last_group in first_group ..< jump_map.lengths.len:
+      let finish = if last_group + 1 < jump_map.lengths.len:
+        jump_map.map[jump_map.lengths[last_group + 1]] - 1
+      else:
+        strings.high
+      let prefix_length = reference_prefix_length(
+        strings.toOpenArray(start, finish)
+      )
+      if prefix_length <= jump_map.lengths[first_group]:
+        best[last_group + 1] = min(best[last_group + 1], best[first_group] + 1)
+  best[^1]
+
+proc test_random_small_cases() =
+  randomize(99173)
+  for trial in 0 ..< 300:
+    var strings: seq[string]
+    var seen = initHashSet[string]()
+    let count = 1 + rand(11)
+    while strings.len < count:
+      let candidate = random_alphanumeric(1 + rand(11))
+      if candidate notin seen:
+        seen.incl(candidate)
+        strings.add(candidate)
+    strings.sort(load_order)
+    let actual = minimum_loads(strings)
+    doAssert actual.classes.len == reference_partition_count(strings)
+    assert_loads_valid(strings, actual)
+
 proc test_length_classes() =
   assert_class_bounds(
     @[
@@ -372,6 +513,7 @@ proc test_length_classes() =
     ], @[(1, 1), (2, 2), (3, 3)])
   assert_class_bounds(@["a", "b", "aa", "ab"], @[(1, 1), (2, 2)])
   assert_class_bounds(@["abc", "abdX", "abcdef"], @[(3, 4), (6, 6)])
+  assert_result_class_bounds(@["a", "abc"], @[(1, 2), (3, 3)])
   assert_class_bounds(@["a", "b", "c"], @[(1, 1)])
   assert_class_bounds(@["x"], @[(1, 1)])
   assert_class_bounds(@[], @[])
@@ -396,9 +538,23 @@ proc main() =
   test_length_classes()
   test_multi_word_mapper_generator()
   test_mapper_generator()
-  randomize()
+  test_random_small_cases()
+  randomize(12345)
+  benchmark_minimum_loads("1 x 1", random_strings(1, 1))
+  benchmark_minimum_loads("16 x 8", random_strings(16, 8))
   benchmark_minimum_loads("64 words", random_words(64))
+  benchmark_minimum_loads("64 x 64", random_strings(64, 64))
   benchmark_minimum_loads("256 x 256", random_strings(256, 256))
+  benchmark_minimum_loads("1024 x 1024", random_strings(1024, 1024))
   benchmark_minimum_loads("4096 x 4096", random_strings(4096, 4096))
+  benchmark_minimum_loads(
+    "4096 x 4096 two component",
+    two_component_strings(4096, 4096, 64),
+  )
+  benchmark_minimum_loads(
+    "4096 x 4096 four component",
+    four_component_strings(4096, 4096, 8),
+  )
+  benchmark_minimum_loads("repeated a 4096", repeated_a_strings(4096))
 
 main()
