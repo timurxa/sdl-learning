@@ -1,6 +1,5 @@
 import std/math
 import std/bitops
-import ./ubfx
 
 type ByteGroup* = seq[uint64]
 
@@ -148,6 +147,13 @@ template next_generation(seen: var seq[uint32]; generation: var uint32) =
     generation = 1
   else:
     inc generation
+
+proc ubfx_runtime(value: uint64; lsb, width: int): uint64 =
+  if lsb < 0 or lsb >= 64 or width <= 0 or width > 64 - lsb:
+    raise newException(ValueError, "UBFX operands are out of range")
+  if width == 64:
+    return value shr lsb
+  (value shr lsb) and ((1'u64 shl width) - 1)
 
 proc high_product(left, right: uint64): uint64 =
   const word_mask = 0xFFFF_FFFF'u64
