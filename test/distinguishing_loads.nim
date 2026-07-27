@@ -1,8 +1,20 @@
 const distinguishing_loads_test = true
 
-import ../src/mapper_generator
+import ../src/perfect_string_map/mapper_generator
 
-include ../src/distinguishing_loads
+include ../src/perfect_string_map/distinguishing_loads
+
+proc assert_mapping(byte_groups: seq[ByteGroup], mapper: Mapper) =
+  let slot_count = 2 * nextPowerOfTwo(byte_groups.len)
+  let slot_mask = uint64(slot_count - 1)
+  var occupied = newSeq[bool](slot_count)
+  for group in byte_groups:
+    let bucket_id = int(evaluate(mapper.mixer, group))
+    doAssert bucket_id >= 0 and bucket_id < mapper.pilots.len
+    let slot = int(
+      (group[mapper.g_index] + uint64(mapper.pilots[bucket_id])) and slot_mask)
+    doAssert not occupied[slot]
+    occupied[slot] = true
 
 proc assert_class_bounds(strings: seq[string], expected: seq[(int, int)]) =
   let actual = length_classes(strings, create_length_jump_map(strings))
@@ -30,11 +42,12 @@ proc test_mapper_generator() =
   for string in strings:
     byte_groups.add(@[loaded_value(string, load.offset)])
 
-  let bucketter = find_bucket_separator(byte_groups)
-  echo bucketter.mixer
-  doAssert bucketter.mixer != nil
-  doAssert bucketter.mixer.kind == in_ubfx
-  doAssert bucketter.g_index == 0
+  let mapper = find_mapping(byte_groups)
+  echo mapper.mixer
+  doAssert mapper.mixer != nil
+  doAssert mapper.mixer.kind == in_ubfx
+  doAssert mapper.g_index == 0
+  assert_mapping(byte_groups, mapper)
 
 proc test_multi_word_mapper_generator() =
   var strings = @[
@@ -57,12 +70,14 @@ proc test_multi_word_mapper_generator() =
       byte_group.add(loaded_value(string, load.offset))
     byte_groups.add(byte_group)
 
-  let bucketter = find_bucket_separator(byte_groups)
-  let repeated_bucketter = find_bucket_separator(byte_groups)
-  let instruction_text = $bucketter.mixer
-  doAssert bucketter.g_index == 1
-  doAssert repeated_bucketter.g_index == bucketter.g_index
-  doAssert $repeated_bucketter.mixer == instruction_text
+  let mapper = find_mapping(byte_groups)
+  let repeated_mapper = find_mapping(byte_groups)
+  let instruction_text = $mapper.mixer
+  doAssert mapper.g_index >= 0 and mapper.g_index < byte_groups[0].len
+  doAssert repeated_mapper.g_index == mapper.g_index
+  doAssert $repeated_mapper.mixer == instruction_text
+  doAssert repeated_mapper.pilots == mapper.pilots
+  assert_mapping(byte_groups, mapper)
 
 proc assert_partial_width(strings: seq[string], expected: int) =
   let actual = minimum_loads(strings).classes

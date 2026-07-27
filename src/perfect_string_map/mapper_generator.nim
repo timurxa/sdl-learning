@@ -1,13 +1,12 @@
 import std/math
 import std/bitops
+import std/algorithm
 
 type ByteGroup* = seq[uint64]
 
-const bucket_bit_count = 10
-
 # for each length partition, we have N static keys
-# which we'll map into M = next_pow_2(N) slots
-# we'll have B = N/4 buckets
+# which we'll map into M = 2 * next_pow_2(N) slots
+# we'll have approximately B = N/4 buckets
 # then construct simple H1(tuple) -> bucket
 # pilot = pilots[bucket]
 # H2(G(tuple), pilot) -> slot
@@ -99,13 +98,17 @@ type
       input: Operand
       pos: Operand
       len: Operand
-  Bucketter* = object
+  Mapper* = object
     mixer*: Instruction
     g_index*: int
+    pilots*: seq[uint16]
   SearchCandidate = object
     instruction: Instruction
     g_index: int
     cost: float
+  Bucket = object
+    id: int
+    g_values: seq[uint64]
   CrossKind = enum
     cross_xor_simple,
     cross_add_simple,
@@ -170,6 +173,94 @@ proc high_product(left, right: uint64): uint64 =
     (left_high * right_low shr 32) +
     (left_low * right_high shr 32) +
     (product_middle shr 32)
+
+proc extr_value(left, right: uint64; shift: int): uint64
+proc evaluate*(instruction: Instruction; group: ByteGroup): uint64
+
+proc evaluate(operand: Operand; group: ByteGroup): uint64 =
+  case operand.kind
+  of op_input:
+    group[operand.index]
+  of op_constant:
+    operand.value
+  of op_instruction:
+    evaluate(operand.instruction, group)
+
+proc evaluate*(instruction: Instruction; group: ByteGroup): uint64 =
+  case instruction.kind
+  of in_and:
+    evaluate(instruction.left, group) and evaluate(instruction.right, group)
+  of in_xor:
+    let source = evaluate(instruction.source, group)
+    let shifted_source = evaluate(instruction.shifted_source, group)
+    let shift = int(evaluate(instruction.shift, group))
+    case instruction.premix_kind
+    of xor_simple:
+      source xor shifted_source
+    of xor_left_shift:
+      source xor (shifted_source shl shift)
+    of xor_right_shift:
+      source xor (shifted_source shr shift)
+    of xor_rotate_right:
+      source xor rotateRightBits(
+        shifted_source, range[0 .. 64](shift))
+    else:
+      raise newException(ValueError, "Invalid XOR premix kind")
+  of in_add:
+    let source = evaluate(instruction.add_source, group)
+    let shifted_source = evaluate(instruction.add_shifted_source, group)
+    let shift = int(evaluate(instruction.add_shift, group))
+    case instruction.add_premix_kind
+    of add_simple:
+      source + shifted_source
+    of add_left_shift:
+      source + (shifted_source shl shift)
+    of add_right_shift:
+      source + (shifted_source shr shift)
+    else:
+      raise newException(ValueError, "Invalid ADD premix kind")
+  of in_sub:
+    let source = evaluate(instruction.sub_source, group)
+    let shifted_source = evaluate(instruction.sub_shifted_source, group)
+    let shift = int(evaluate(instruction.sub_shift, group))
+    case instruction.sub_premix_kind
+    of sub_simple:
+      source - shifted_source
+    of sub_left_shift:
+      source - (shifted_source shl shift)
+    of sub_right_shift:
+      source - (shifted_source shr shift)
+    else:
+      raise newException(ValueError, "Invalid SUB premix kind")
+  of in_ror:
+    rotateRightBits(
+      evaluate(instruction.ror_source, group),
+      range[0 .. 64](evaluate(instruction.ror_shift, group)))
+  of in_extr:
+    extr_value(
+      evaluate(instruction.extr_left, group),
+      evaluate(instruction.extr_right, group),
+      int(evaluate(instruction.extr_shift, group)))
+  of in_mul:
+    evaluate(instruction.mul_left, group) *
+      evaluate(instruction.mul_right, group)
+  of in_umulh:
+    high_product(
+      evaluate(instruction.umulh_left, group),
+      evaluate(instruction.umulh_right, group))
+  of in_madd:
+    evaluate(instruction.madd_left, group) *
+      evaluate(instruction.madd_right, group) +
+      evaluate(instruction.madd_addend, group)
+  of in_msub:
+    evaluate(instruction.msub_subtrahend, group) -
+      (evaluate(instruction.msub_left, group) *
+       evaluate(instruction.msub_right, group))
+  of in_ubfx:
+    ubfx_runtime(
+      evaluate(instruction.input, group),
+      int(evaluate(instruction.pos, group)),
+      int(evaluate(instruction.len, group)))
 
 proc premix_value(value: uint64; premix_kind: PremixKind; shift: int): uint64 =
   case premix_kind
@@ -452,14 +543,32 @@ proc cross_instruction_cost(kind: CrossKind): float =
       cross_madd_constant, cross_msub_constant:
     4.1
 
+const retained_candidate_count = 16
+
+proc retain_candidate(
+    candidates: var seq[SearchCandidate]; candidate: SearchCandidate
+  ) =
+  var insertion_index = 0
+  while insertion_index < candidates.len and
+      candidates[insertion_index].cost <= candidate.cost:
+    inc insertion_index
+  if insertion_index >= retained_candidate_count:
+    return
+  candidates.insert(candidate, insertion_index)
+  if candidates.len > retained_candidate_count:
+    candidates.setLen(retained_candidate_count)
+
+proc cannot_improve(candidates: seq[SearchCandidate]; cost: float): bool =
+  candidates.len == retained_candidate_count and candidates[^1].cost <= cost
+
 proc find_cross_separator(
     byte_groups: seq[ByteGroup]; expression: CrossExpression;
-    submixer_bit_count: int;
-    best: var SearchCandidate; has_best: var bool;
+    bucket_bit_count, submixer_bit_count: int;
+    candidates: var seq[SearchCandidate];
     seen: var seq[uint32]; generation: var uint32
   ) =
   let cost = cross_instruction_cost(expression.kind)
-  if has_best and cost >= best.cost:
+  if candidates.cannot_improve(cost):
     return
 
   for offset in 0 .. 64 - bucket_bit_count:
@@ -477,7 +586,7 @@ proc find_cross_separator(
         seen[index] = generation
 
       if valid:
-        best = SearchCandidate(
+        candidates.retain_candidate(SearchCandidate(
           instruction: Instruction(
             kind: in_ubfx,
             input: Operand(
@@ -489,8 +598,7 @@ proc find_cross_separator(
           ),
           g_index: g_index,
           cost: cost,
-        )
-        has_best = true
+        ))
         return
 
 proc make_cross_expression(
@@ -507,106 +615,106 @@ proc make_cross_expression(
   )
 
 proc find_cross_separators(
-    byte_groups: seq[ByteGroup]; submixer_bit_count: int;
-    best: var SearchCandidate;
-    has_best: var bool; seen: var seq[uint32]; generation: var uint32
+    byte_groups: seq[ByteGroup]; bucket_bit_count, submixer_bit_count: int;
+    candidates: var seq[SearchCandidate];
+    seen: var seq[uint32]; generation: var uint32
   ) =
   let d = byte_groups[0].len
 
-  if has_best and best.cost <= 2.0:
+  if candidates.cannot_improve(2.0):
     return
 
   for i in 0 ..< d:
     for j in i ..< d:
       find_cross_separator(
         byte_groups, make_cross_expression(cross_xor_simple, i, j),
-        submixer_bit_count,
-        best, has_best, seen, generation)
+        bucket_bit_count, submixer_bit_count,
+        candidates, seen, generation)
       find_cross_separator(
         byte_groups, make_cross_expression(cross_add_simple, i, j),
-        submixer_bit_count,
-        best, has_best, seen, generation)
-      if has_best and best.cost <= 2.0:
+        bucket_bit_count, submixer_bit_count,
+        candidates, seen, generation)
+      if candidates.cannot_improve(2.0):
         return
 
   for i in 0 ..< d:
     for j in 0 ..< d:
       find_cross_separator(
         byte_groups, make_cross_expression(cross_sub_simple, i, j),
-        submixer_bit_count,
-        best, has_best, seen, generation)
-      if has_best and best.cost <= 2.0:
+        bucket_bit_count, submixer_bit_count,
+        candidates, seen, generation)
+      if candidates.cannot_improve(2.0):
         return
 
       for shift in 1 .. 63:
         find_cross_separator(
           byte_groups, make_cross_expression(cross_extr, i, j, shift = shift),
-          submixer_bit_count,
-          best, has_best, seen, generation)
-        if has_best and best.cost <= 2.0:
+          bucket_bit_count, submixer_bit_count,
+          candidates, seen, generation)
+        if candidates.cannot_improve(2.0):
           return
 
       for shift in 1 .. 63:
         find_cross_separator(
           byte_groups,
           make_cross_expression(cross_xor_left_shift, i, j, shift = shift),
-          submixer_bit_count,
-          best, has_best, seen, generation)
+          bucket_bit_count, submixer_bit_count,
+          candidates, seen, generation)
         find_cross_separator(
           byte_groups,
           make_cross_expression(cross_xor_right_shift, i, j, shift = shift),
-          submixer_bit_count,
-          best, has_best, seen, generation)
+          bucket_bit_count, submixer_bit_count,
+          candidates, seen, generation)
         find_cross_separator(
           byte_groups,
           make_cross_expression(cross_xor_rotate_right, i, j, shift = shift),
-          submixer_bit_count,
-          best, has_best, seen, generation)
+          bucket_bit_count, submixer_bit_count,
+          candidates, seen, generation)
         find_cross_separator(
           byte_groups,
           make_cross_expression(cross_add_left_shift, i, j, shift = shift),
-          submixer_bit_count,
-          best, has_best, seen, generation)
+          bucket_bit_count, submixer_bit_count,
+          candidates, seen, generation)
         find_cross_separator(
           byte_groups,
           make_cross_expression(cross_add_right_shift, i, j, shift = shift),
-          submixer_bit_count,
-          best, has_best, seen, generation)
+          bucket_bit_count, submixer_bit_count,
+          candidates, seen, generation)
         find_cross_separator(
           byte_groups,
           make_cross_expression(cross_sub_left_shift, i, j, shift = shift),
-          submixer_bit_count,
-          best, has_best, seen, generation)
+          bucket_bit_count, submixer_bit_count,
+          candidates, seen, generation)
         find_cross_separator(
           byte_groups,
           make_cross_expression(cross_sub_right_shift, i, j, shift = shift),
-          submixer_bit_count,
-          best, has_best, seen, generation)
-        if has_best and best.cost <= 3.0:
+          bucket_bit_count, submixer_bit_count,
+          candidates, seen, generation)
+        if candidates.cannot_improve(3.0):
           return
 
   for i in 0 ..< d:
     for j in i ..< d:
       find_cross_separator(
         byte_groups, make_cross_expression(cross_mul, i, j),
-        submixer_bit_count,
-        best, has_best, seen, generation)
+        bucket_bit_count, submixer_bit_count,
+        candidates, seen, generation)
       find_cross_separator(
         byte_groups, make_cross_expression(cross_umulh, i, j),
-        submixer_bit_count,
-        best, has_best, seen, generation)
+        bucket_bit_count, submixer_bit_count,
+        candidates, seen, generation)
       for k in 0 ..< d:
         find_cross_separator(
           byte_groups, make_cross_expression(cross_madd, i, j, third = k),
-          submixer_bit_count,
-          best, has_best, seen, generation)
-        if has_best and best.cost <= 4.0:
+          bucket_bit_count, submixer_bit_count,
+          candidates, seen, generation)
+        if candidates.cannot_improve(4.0):
           return
         find_cross_separator(
           byte_groups, make_cross_expression(cross_msub, i, j, third = k),
-          submixer_bit_count,
-          best, has_best, seen, generation)
-        if has_best and best.cost <= 4.0:
+          bucket_bit_count, submixer_bit_count,
+          candidates, seen, generation)
+        if candidates.cannot_improve(4.0):
           return
 
   const multiplication_constant_count = 1024
@@ -616,37 +724,38 @@ proc find_cross_separators(
       find_cross_separator(
         byte_groups,
         make_cross_expression(cross_mul_constant, i, 0, constant = multiplier),
-        submixer_bit_count,
-        best, has_best, seen, generation)
+        bucket_bit_count, submixer_bit_count,
+        candidates, seen, generation)
       find_cross_separator(
         byte_groups,
         make_cross_expression(cross_umulh_constant, i, 0, constant = multiplier),
-        submixer_bit_count,
-        best, has_best, seen, generation)
+        bucket_bit_count, submixer_bit_count,
+        candidates, seen, generation)
       for j in 0 ..< d:
         find_cross_separator(
           byte_groups,
           make_cross_expression(
             cross_madd_constant, i, 0, third = j, constant = multiplier),
-          submixer_bit_count,
-          best, has_best, seen, generation)
+          bucket_bit_count, submixer_bit_count,
+          candidates, seen, generation)
         find_cross_separator(
           byte_groups,
           make_cross_expression(
             cross_msub_constant, i, 0, third = j, constant = multiplier),
-          submixer_bit_count,
-          best, has_best, seen, generation)
+          bucket_bit_count, submixer_bit_count,
+          candidates, seen, generation)
 
-      if has_best:
+      if candidates.cannot_improve(4.1):
         return
 proc find_ubfx_separator(
     byte_groups: seq[ByteGroup]; input_index: int;
-    premix_kind: PremixKind; shift, submixer_bit_count: int;
-    best: var SearchCandidate; has_best: var bool;
+    premix_kind: PremixKind;
+    shift, bucket_bit_count, submixer_bit_count: int;
+    candidates: var seq[SearchCandidate];
     seen: var seq[uint32]; generation: var uint32
   ) =
   let cost = instruction_cost(premix_kind)
-  if has_best and cost >= best.cost:
+  if candidates.cannot_improve(cost):
     return
 
   for offset in 0 .. 64 - bucket_bit_count:
@@ -664,7 +773,7 @@ proc find_ubfx_separator(
         seen[index] = generation
 
       if valid:
-        best = SearchCandidate(
+        candidates.retain_candidate(SearchCandidate(
           instruction: Instruction(
             kind: in_ubfx,
             input: premix_operand(premix_kind, shift, input_index),
@@ -673,20 +782,21 @@ proc find_ubfx_separator(
           ),
           g_index: g_index,
           cost: cost,
-        )
-        has_best = true
+        ))
         return
 
 proc find_single_word_separators(
-    byte_groups: seq[ByteGroup]; input_index, submixer_bit_count: int;
-    best: var SearchCandidate; has_best: var bool;
+    byte_groups: seq[ByteGroup];
+    input_index, bucket_bit_count, submixer_bit_count: int;
+    candidates: var seq[SearchCandidate];
     seen: var seq[uint32]; generation: var uint32
   ) =
   for shift in 0 .. 63:
     find_ubfx_separator(
-      byte_groups, input_index, rotate_right, shift, submixer_bit_count,
-      best, has_best, seen, generation)
-  if has_best and best.cost <= 2.0:
+      byte_groups, input_index, rotate_right, shift,
+      bucket_bit_count, submixer_bit_count,
+      candidates, seen, generation)
+  if candidates.cannot_improve(2.0):
     return
 
   const shifted_kinds = [
@@ -696,9 +806,10 @@ proc find_single_word_separators(
   for premix_kind in shifted_kinds:
     for shift in 0 .. 63:
       find_ubfx_separator(
-        byte_groups, input_index, premix_kind, shift, submixer_bit_count,
-        best, has_best, seen, generation)
-    if has_best and best.cost <= 3.0:
+        byte_groups, input_index, premix_kind, shift,
+        bucket_bit_count, submixer_bit_count,
+        candidates, seen, generation)
+    if candidates.cannot_improve(3.0):
       return
 
   const multiply_kinds = [
@@ -706,9 +817,10 @@ proc find_single_word_separators(
   ]
   for premix_kind in multiply_kinds:
     find_ubfx_separator(
-      byte_groups, input_index, premix_kind, 0, submixer_bit_count,
-      best, has_best, seen, generation)
-    if has_best and best.cost <= 4.0:
+      byte_groups, input_index, premix_kind, 0,
+      bucket_bit_count, submixer_bit_count,
+      candidates, seen, generation)
+    if candidates.cannot_improve(4.0):
       return
 
   const multiplication_constant_count = 1024
@@ -716,47 +828,126 @@ proc find_single_word_separators(
     let multiplier = 2 * constant_index + 1
     find_ubfx_separator(
       byte_groups, input_index, multiply_constant, multiplier,
-      submixer_bit_count,
-      best, has_best, seen, generation)
-    if has_best:
+      bucket_bit_count, submixer_bit_count,
+      candidates, seen, generation)
+    if candidates.cannot_improve(4.1):
       return
 
-proc find_bucket_separator*(byte_groups: seq[ByteGroup]): Bucketter =
-  block:
-    assert byte_groups.len > 0
-    let len = byte_groups[0].len
-    assert len > 0
-    for g in byte_groups:
-      assert g.len == len
-
-  let key_count = byte_groups.len
-  let bucket_count = nextPowerOfTwo(key_count)
-  let submixer_bit_count = fastLog2(bucket_count)
-  let d = byte_groups[0].len
-
+proc find_h1_g_candidates(
+    byte_groups: seq[ByteGroup]; bucket_bit_count, slot_count: int
+  ): seq[SearchCandidate] =
+  let submixer_bit_count = fastLog2(slot_count)
   let seen_table_size = 1 shl (bucket_bit_count + submixer_bit_count)
-  var best: SearchCandidate
-  var has_best = false
   var seen = newSeq[uint32](seen_table_size)
   var generation: uint32
 
-  for input_index in 0 ..< d:
+  for input_index in 0 ..< byte_groups[0].len:
     find_ubfx_separator(
-      byte_groups, input_index, no_premix, 0, submixer_bit_count,
-      best, has_best, seen, generation)
-  if has_best:
-    return Bucketter(mixer: best.instruction, g_index: best.g_index)
+      byte_groups, input_index, no_premix, 0,
+      bucket_bit_count, submixer_bit_count,
+      result, seen, generation)
 
-  for input_index in 0 ..< d:
+  for input_index in 0 ..< byte_groups[0].len:
     find_single_word_separators(
-      byte_groups, input_index, submixer_bit_count,
-      best, has_best, seen, generation)
+      byte_groups, input_index, bucket_bit_count, submixer_bit_count,
+      result, seen, generation)
 
-  if d > 1:
+  if byte_groups[0].len > 1:
     find_cross_separators(
-      byte_groups, submixer_bit_count, best, has_best, seen, generation)
+      byte_groups, bucket_bit_count, submixer_bit_count,
+      result, seen, generation)
 
-  if not has_best:
-    raise newException(ValueError, "No valid UBFX bucket separator")
+proc construct_pilots(
+    byte_groups: seq[ByteGroup]; candidate: SearchCandidate;
+    bucket_count, slot_count: int; pilots: var seq[uint16]
+  ): bool =
+  var buckets = newSeq[Bucket](bucket_count)
+  for bucket_id in 0 ..< bucket_count:
+    buckets[bucket_id].id = bucket_id
 
-  result = Bucketter(mixer: best.instruction, g_index: best.g_index)
+  for group in byte_groups:
+    let bucket_value = evaluate(candidate.instruction, group)
+    if bucket_value >= uint64(bucket_count):
+      raise newException(ValueError, "H1 bucket ID is out of range")
+    buckets[int(bucket_value)].g_values.add(group[candidate.g_index])
+
+  var non_empty_buckets: seq[Bucket]
+  for bucket in buckets:
+    if bucket.g_values.len > 0:
+      non_empty_buckets.add(bucket)
+  non_empty_buckets.sort(proc(left, right: Bucket): int =
+    result = cmp(right.g_values.len, left.g_values.len)
+    if result == 0:
+      result = cmp(left.id, right.id)
+  )
+
+  pilots = newSeq[uint16](bucket_count)
+  var occupied = newSeq[bool](slot_count)
+  var current_slots = newSeq[int](byte_groups.len)
+  var slot_seen = newSeq[uint32](slot_count)
+  var generation: uint32
+  let slot_mask = uint64(slot_count - 1)
+
+  for bucket in non_empty_buckets:
+    var found_pilot = false
+    for pilot in 0 ..< slot_count:
+      next_generation(slot_seen, generation)
+      var valid = true
+      for item_index, g_value in bucket.g_values:
+        let slot = int((g_value + uint64(pilot)) and slot_mask)
+        if occupied[slot] or slot_seen[slot] == generation:
+          valid = false
+          break
+        slot_seen[slot] = generation
+        current_slots[item_index] = slot
+
+      if valid:
+        pilots[bucket.id] = uint16(pilot)
+        for item_index in 0 ..< bucket.g_values.len:
+          occupied[current_slots[item_index]] = true
+        found_pilot = true
+        break
+
+    if not found_pilot:
+      return false
+
+  true
+
+proc find_mapping*(byte_groups: seq[ByteGroup]): Mapper =
+  if byte_groups.len == 0:
+    raise newException(ValueError, "Mapping requires at least one key")
+  let group_len = byte_groups[0].len
+  if group_len == 0:
+    raise newException(ValueError, "Mapping requires non-empty byte groups")
+  for group in byte_groups:
+    if group.len != group_len:
+      raise newException(ValueError, "Byte groups must have equal lengths")
+
+  let key_count = byte_groups.len
+  if key_count > (int(high(uint16)) + 1) div 2:
+    raise newException(ValueError, "Slot count exceeds uint16 pilot range")
+
+  let slot_count = 2 * nextPowerOfTwo(key_count)
+  if slot_count > int(high(uint16)) + 1:
+    raise newException(ValueError, "Slot count exceeds uint16 pilot range")
+
+  let approximate_bucket_count = max(2, (key_count + 3) div 4)
+  let bucket_count = nextPowerOfTwo(approximate_bucket_count)
+  let bucket_bit_count = fastLog2(bucket_count)
+  let candidates = find_h1_g_candidates(
+    byte_groups, bucket_bit_count, slot_count)
+
+  if candidates.len == 0:
+    raise newException(ValueError, "No valid H1/G candidate")
+
+  for candidate in candidates:
+    var pilots: seq[uint16]
+    if construct_pilots(
+        byte_groups, candidate, bucket_count, slot_count, pilots):
+      return Mapper(
+        mixer: candidate.instruction,
+        g_index: candidate.g_index,
+        pilots: pilots,
+      )
+
+  raise newException(ValueError, "Pilot construction failed for all candidates")
