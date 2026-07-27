@@ -25,7 +25,7 @@ proc assert_constructed_mapping(
   for group in groups:
     let bucket_id = int(evaluate(candidate.instruction, group))
     let slot = int(
-      (group[candidate.g_index] + uint64(pilots[bucket_id])) and slot_mask)
+      (evaluate(candidate.g, group) + uint64(pilots[bucket_id])) and slot_mask)
     doAssert not occupied[slot]
     occupied[slot] = true
 
@@ -37,15 +37,142 @@ proc assert_public_mapping(groups: seq[ByteGroup]; mapper: Mapper) =
     let first_bucket = evaluate(mapper.mixer, first)
     doAssert first_bucket < uint64(mapper.pilots.len)
     let slot = int(
-      (first[mapper.g_index] +
+      (evaluate(mapper.g, first) +
        uint64(mapper.pilots[int(first_bucket)])) and slot_mask)
     doAssert not occupied[slot]
     occupied[slot] = true
     for second_index in first_index + 1 ..< groups.len:
       let second = groups[second_index]
       if evaluate(mapper.mixer, second) == first_bucket:
-        doAssert (first[mapper.g_index] and slot_mask) !=
-          (second[mapper.g_index] and slot_mask)
+        doAssert (evaluate(mapper.g, first) and slot_mask) !=
+          (evaluate(mapper.g, second) and slot_mask)
+
+proc test_g_evaluation() =
+  let word = 0xFEDC_BA98_7654_3210'u64
+  let group: ByteGroup = @[word]
+  const compile_time_shifted = evaluate(
+    G(kind: g_xor_right_shift, word_index: 0, shift: 63),
+    @[0xFEDC_BA98_7654_3210'u64])
+  doAssert evaluate(
+    G(kind: g_raw_word, word_index: 0), group) == word
+  doAssert evaluate(
+    G(kind: g_xor_right_shift, word_index: 0, shift: 1), group) ==
+      (word xor (word shr 1))
+  doAssert evaluate(
+    G(kind: g_xor_right_shift, word_index: 0, shift: 63), group) ==
+      (word xor (word shr 63))
+  doAssert compile_time_shifted == (word xor (word shr 63))
+
+proc test_g_candidate_enumeration() =
+  var empty_count = 0
+  for _ in g_candidates(0):
+    inc empty_count
+  doAssert empty_count == 0
+
+  var candidates: seq[G]
+  for g in g_candidates(2):
+    candidates.add(g)
+  doAssert candidates.len == 128
+  doAssert candidates[0].kind == g_raw_word
+  doAssert candidates[0].word_index == 0
+  doAssert candidates[1].kind == g_raw_word
+  doAssert candidates[1].word_index == 1
+  var seen = newSeq[bool](2 * 64)
+  for g in candidates:
+    let shift = if g.kind == g_raw_word: 0 else: int(g.shift)
+    doAssert shift >= 0 and shift <= 63
+    let index = g.word_index * 64 + shift
+    doAssert not seen[index]
+    seen[index] = true
+  for present in seen:
+    doAssert present
+
+proc test_g_cost_ranking() =
+  let raw_g = G(kind: g_raw_word, word_index: 0)
+  let shifted_g = G(
+    kind: g_xor_right_shift,
+    word_index: 0,
+    shift: 1,
+  )
+  doAssert g_cost(raw_g) == 0.0
+  doAssert g_cost(shifted_g) == 2.0
+
+  var candidates: seq[SearchCandidate]
+  var seen = newSeq[uint32](4)
+  var generation: uint32
+  find_ubfx_separator(
+    @[@[0xFEDC_BA98_7654_3210'u64]],
+    0, no_premix, 0, 1, 1,
+    candidates, seen, generation)
+  doAssert candidates[0].g.kind == g_raw_word
+  doAssert candidates[0].cost == 1.0
+  var shifted_cost = -1.0
+  for candidate in candidates:
+    if candidate.g.kind == g_xor_right_shift:
+      shifted_cost = candidate.cost
+      break
+  doAssert shifted_cost == 3.0
+  doAssert shifted_cost - candidates[0].cost == 2.0
+
+  candidates.setLen(0)
+  candidates.retain_candidate(SearchCandidate(
+    g: raw_g,
+    cost: 4.0 + g_cost(raw_g),
+  ))
+  candidates.retain_candidate(SearchCandidate(
+    g: shifted_g,
+    cost: 1.0 + g_cost(shifted_g),
+  ))
+  doAssert candidates[0].g.kind == g_xor_right_shift
+  doAssert candidates[0].cost == 3.0
+  doAssert candidates[1].cost == 4.0
+
+  candidates.setLen(0)
+  for _ in 0 ..< retained_candidate_count:
+    candidates.add(SearchCandidate(cost: 3.0))
+  doAssert not candidates.cannot_improve(1.0)
+  doAssert candidates.cannot_improve(3.0)
+
+proc some_raw_g_bucket_partition_avoids_collisions(
+    groups: seq[ByteGroup]; bucket_count, slot_count: int
+  ): bool =
+  doAssert bucket_count == 2
+  let raw_g = G(kind: g_raw_word, word_index: 0)
+  let slot_mask = uint64(slot_count - 1)
+  for bucket_assignment in 0 ..< (1 shl groups.len):
+    var seen = newSeq[bool](bucket_count * slot_count)
+    var valid = true
+    for group_index, group in groups:
+      let bucket = (bucket_assignment shr group_index) and 1
+      let slot = int(evaluate(raw_g, group) and slot_mask)
+      let index = bucket * slot_count + slot
+      if seen[index]:
+        valid = false
+        break
+      seen[index] = true
+    if valid:
+      return true
+
+proc test_shifted_g_succeeds_when_raw_g_fails() =
+  let groups: seq[ByteGroup] = @[
+    @[0x1_0000'u64],
+    @[0x2_0000'u64],
+    @[0x3_0000'u64],
+    @[0x4_0000'u64],
+  ]
+  const bucket_count = 2
+  const slot_count = 8
+  doAssert not some_raw_g_bucket_partition_avoids_collisions(
+    groups, bucket_count, slot_count)
+  let candidates = find_h1_g_candidates(
+    groups, fastLog2(bucket_count), slot_count)
+  doAssert candidates.len <= retained_candidate_count
+
+  let mapper = find_mapping(groups)
+  doAssert mapper.g.kind == g_xor_right_shift
+  doAssert mapper.g.word_index == 0
+  doAssert mapper.g.shift >= 1 and mapper.g.shift <= 63
+  assert_public_mapping(groups, mapper)
 
 proc test_evaluator_matches_search_semantics() =
   let group: ByteGroup = @[
@@ -105,7 +232,7 @@ proc test_evaluator_matches_search_semantics() =
 proc test_bucket_order_and_pilot_indexing() =
   let candidate = SearchCandidate(
     instruction: ubfx_instruction(0, 0, 1),
-    g_index: 1,
+    g: G(kind: g_raw_word, word_index: 1),
   )
   let groups: seq[ByteGroup] = @[
     @[1'u64, 0'u64],
@@ -121,7 +248,7 @@ proc test_bucket_order_and_pilot_indexing() =
 proc test_addition_wrap_without_pre_mask() =
   let candidate = SearchCandidate(
     instruction: ubfx_instruction(0, 0, 1),
-    g_index: 1,
+    g: G(kind: g_raw_word, word_index: 1),
   )
   let groups: seq[ByteGroup] = @[
     @[0'u64, high(uint64)],
@@ -138,7 +265,7 @@ proc test_addition_wrap_without_pre_mask() =
 proc test_rejects_duplicate_slots_within_bucket() =
   let candidate = SearchCandidate(
     instruction: ubfx_instruction(0, 0, 1),
-    g_index: 1,
+    g: G(kind: g_raw_word, word_index: 1),
   )
   let groups: seq[ByteGroup] = @[
     @[0'u64, 3'u64],
@@ -149,6 +276,8 @@ proc test_rejects_duplicate_slots_within_bucket() =
 
 proc test_empty_and_singleton_buckets() =
   let mapper = find_mapping(@[@[high(uint64)]])
+  doAssert mapper.g.kind == g_raw_word
+  doAssert mapper.g.word_index == 0
   doAssert mapper.pilots.len == 2
   doAssert mapper.pilots[0] == 0 or mapper.pilots[1] == 0
   let slot = (high(uint64) + uint64(
@@ -190,7 +319,7 @@ proc test_highest_uint16_pilot() =
   let slot_count = int(high(uint16)) + 1
   let candidate = SearchCandidate(
     instruction: ubfx_instruction(0, 0, 1),
-    g_index: 1,
+    g: G(kind: g_raw_word, word_index: 1),
   )
   var groups = newSeqOfCap[ByteGroup](slot_count)
   for g_value in 0 ..< high(uint16).int:
@@ -203,6 +332,10 @@ proc test_highest_uint16_pilot() =
   doAssert pilots[1] == high(uint16)
   assert_constructed_mapping(groups, candidate, 2, slot_count, pilots)
 
+test_g_evaluation()
+test_g_candidate_enumeration()
+test_g_cost_ranking()
+test_shifted_g_succeeds_when_raw_g_fails()
 test_evaluator_matches_search_semantics()
 test_bucket_order_and_pilot_indexing()
 test_addition_wrap_without_pre_mask()

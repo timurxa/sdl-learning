@@ -12,7 +12,8 @@ proc assert_mapping(byte_groups: seq[ByteGroup], mapper: Mapper) =
     let bucket_id = int(evaluate(mapper.mixer, group))
     doAssert bucket_id >= 0 and bucket_id < mapper.pilots.len
     let slot = int(
-      (group[mapper.g_index] + uint64(mapper.pilots[bucket_id])) and slot_mask)
+      (evaluate(mapper.g, group) +
+       uint64(mapper.pilots[bucket_id])) and slot_mask)
     doAssert not occupied[slot]
     occupied[slot] = true
 
@@ -46,7 +47,7 @@ proc test_mapper_generator() =
   echo mapper.mixer
   doAssert mapper.mixer != nil
   doAssert mapper.mixer.kind == in_ubfx
-  doAssert mapper.g_index == 0
+  doAssert mapper.g.word_index == 0
   assert_mapping(byte_groups, mapper)
 
 proc test_multi_word_mapper_generator() =
@@ -73,8 +74,12 @@ proc test_multi_word_mapper_generator() =
   let mapper = find_mapping(byte_groups)
   let repeated_mapper = find_mapping(byte_groups)
   let instruction_text = $mapper.mixer
-  doAssert mapper.g_index >= 0 and mapper.g_index < byte_groups[0].len
-  doAssert repeated_mapper.g_index == mapper.g_index
+  doAssert mapper.g.word_index >= 0 and
+    mapper.g.word_index < byte_groups[0].len
+  doAssert repeated_mapper.g.kind == mapper.g.kind
+  doAssert repeated_mapper.g.word_index == mapper.g.word_index
+  if mapper.g.kind == g_xor_right_shift:
+    doAssert repeated_mapper.g.shift == mapper.g.shift
   doAssert $repeated_mapper.mixer == instruction_text
   doAssert repeated_mapper.pilots == mapper.pilots
   assert_mapping(byte_groups, mapper)

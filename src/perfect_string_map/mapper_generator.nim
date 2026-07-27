@@ -12,6 +12,16 @@ type ByteGroup* = seq[uint64]
 # H2(G(tuple), pilot) -> slot
 
 type
+  GKind* = enum
+    g_raw_word,
+    g_xor_right_shift,
+  G* = object
+    word_index*: int
+    case kind*: GKind
+    of g_raw_word:
+      discard
+    of g_xor_right_shift:
+      shift*: range[1 .. 63]
   InstructionKind* = enum
     in_and,
     in_xor,
@@ -100,11 +110,11 @@ type
       len: Operand
   Mapper* = object
     mixer*: Instruction
-    g_index*: int
+    g*: G
     pilots*: seq[uint16]
   SearchCandidate = object
     instruction: Instruction
-    g_index: int
+    g: G
     cost: float
   Bucket = object
     id: int
@@ -136,6 +146,32 @@ type
     constant: uint64
 
 proc `$`*(instruction: Instruction): string = $(instruction[])
+
+proc evaluate*(g: G; group: ByteGroup): uint64 =
+  let word = group[g.word_index]
+  case g.kind
+  of g_raw_word:
+    word
+  of g_xor_right_shift:
+    word xor (word shr g.shift)
+
+proc g_cost(g: G): float =
+  case g.kind
+  of g_raw_word:
+    0.0
+  of g_xor_right_shift:
+    2.0
+
+iterator g_candidates(word_count: int): G =
+  for word_index in 0 ..< word_count:
+    yield G(kind: g_raw_word, word_index: word_index)
+  for word_index in 0 ..< word_count:
+    for shift in 1 .. 63:
+      yield G(
+        kind: g_xor_right_shift,
+        word_index: word_index,
+        shift: shift,
+      )
 
 proc submixer(value: uint64; bit_count: int): uint64 =
   if bit_count == 0:
@@ -567,18 +603,21 @@ proc find_cross_separator(
     candidates: var seq[SearchCandidate];
     seen: var seq[uint32]; generation: var uint32
   ) =
-  let cost = cross_instruction_cost(expression.kind)
-  if candidates.cannot_improve(cost):
+  let h1_cost = cross_instruction_cost(expression.kind)
+  if candidates.cannot_improve(h1_cost):
     return
 
-  for offset in 0 .. 64 - bucket_bit_count:
-    for g_index in 0 ..< byte_groups[0].len:
+  for g in g_candidates(byte_groups[0].len):
+    let total_cost = h1_cost + g_cost(g)
+    if candidates.cannot_improve(total_cost):
+      continue
+    for offset in 0 .. 64 - bucket_bit_count:
       next_generation(seen, generation)
       var valid = true
       for group in byte_groups:
         let bucket = ubfx_runtime(
           cross_value(group, expression), offset, bucket_bit_count)
-        let sub = submixer(group[g_index], submixer_bit_count)
+        let sub = submixer(evaluate(g, group), submixer_bit_count)
         let index = int((bucket shl submixer_bit_count) or sub)
         if seen[index] == generation:
           valid = false
@@ -596,10 +635,10 @@ proc find_cross_separator(
             pos: constant_operand(uint64(offset)),
             len: constant_operand(uint64(bucket_bit_count)),
           ),
-          g_index: g_index,
-          cost: cost,
+          g: g,
+          cost: total_cost,
         ))
-        return
+        break
 
 proc make_cross_expression(
     kind: CrossKind; left, right: int; third = -1; shift = 0;
@@ -754,18 +793,21 @@ proc find_ubfx_separator(
     candidates: var seq[SearchCandidate];
     seen: var seq[uint32]; generation: var uint32
   ) =
-  let cost = instruction_cost(premix_kind)
-  if candidates.cannot_improve(cost):
+  let h1_cost = instruction_cost(premix_kind)
+  if candidates.cannot_improve(h1_cost):
     return
 
-  for offset in 0 .. 64 - bucket_bit_count:
-    for g_index in 0 ..< byte_groups[0].len:
+  for g in g_candidates(byte_groups[0].len):
+    let total_cost = h1_cost + g_cost(g)
+    if candidates.cannot_improve(total_cost):
+      continue
+    for offset in 0 .. 64 - bucket_bit_count:
       next_generation(seen, generation)
       var valid = true
       for group in byte_groups:
         let mixed_value = premix_value(group[input_index], premix_kind, shift)
         let bucket = ubfx_runtime(mixed_value, offset, bucket_bit_count)
-        let sub = submixer(group[g_index], submixer_bit_count)
+        let sub = submixer(evaluate(g, group), submixer_bit_count)
         let index = int((bucket shl submixer_bit_count) or sub)
         if seen[index] == generation:
           valid = false
@@ -780,10 +822,10 @@ proc find_ubfx_separator(
             pos: Operand(kind: op_constant, value: uint64(offset)),
             len: Operand(kind: op_constant, value: uint64(bucket_bit_count)),
           ),
-          g_index: g_index,
-          cost: cost,
+          g: g,
+          cost: total_cost,
         ))
-        return
+        break
 
 proc find_single_word_separators(
     byte_groups: seq[ByteGroup];
@@ -869,7 +911,7 @@ proc construct_pilots(
     let bucket_value = evaluate(candidate.instruction, group)
     if bucket_value >= uint64(bucket_count):
       raise newException(ValueError, "H1 bucket ID is out of range")
-    buckets[int(bucket_value)].g_values.add(group[candidate.g_index])
+    buckets[int(bucket_value)].g_values.add(evaluate(candidate.g, group))
 
   var non_empty_buckets: seq[Bucket]
   for bucket in buckets:
@@ -946,7 +988,7 @@ proc find_mapping*(byte_groups: seq[ByteGroup]): Mapper =
         byte_groups, candidate, bucket_count, slot_count, pilots):
       return Mapper(
         mixer: candidate.instruction,
-        g_index: candidate.g_index,
+        g: candidate.g,
         pilots: pilots,
       )
 
