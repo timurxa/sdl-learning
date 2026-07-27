@@ -1,12 +1,9 @@
-import std/sequtils
+import std/[macros, os, sequtils]
 
-const distinguishing_loads_test = true
+import mapping_plan
+import perfect_string_map
 
-import mapper_generator
-
-include distinguishing_loads
-
-var strings = deduplicate(@[
+const strings = deduplicate(@[
   "the",
   "of",
   "to",
@@ -1008,72 +1005,130 @@ var strings = deduplicate(@[
   "shell",
   "neck",
 ])
-echo "input_strings: ", strings
 
-strings.sort(load_order)
-echo "sorted_strings: ", strings
+const
+  project_root = currentSourcePath().parentDir() / ".." / ".."
+  cli_source = project_root / "src" / "perfect_string_map" /
+    "perfect_string_map_cli.nim"
+  cli_output_dir = project_root / "out"
+  cli_path = cli_output_dir / "perfect_string_map_cli"
 
-let minimum = minimum_loads(strings)
-echo "partition_count: ", minimum.classes.len
+static:
+  createDir(cli_output_dir)
 
-for partition_index, length_class in minimum.classes:
-  var partition_strings: seq[string]
-  for string in strings:
-    if string.len >= length_class.min and string.len <= length_class.max:
-      partition_strings.add(string)
+  let build_command = quoteShellCommand([
+    getCurrentCompilerExe(),
+    "c",
+    "-d:release",
+    "-d:lto",
+    "-o:" & cli_path,
+    cli_source,
+  ])
+  let build_output = staticExec(build_command)
+  if not fileExists(cli_path):
+    error(
+      "Failed to build perfect_string_map_cli.\n" &
+      "Command: " & build_command & "\n" &
+      build_output
+    )
 
-  echo "partition ", partition_index, ":"
-  echo "  length_range: ", length_class.min, "..", length_class.max
-  echo "  strings: ", partition_strings
-  echo "  loads:"
-  for load_index, load in length_class.loads:
-    case load.kind
-    of FullLoad:
-      echo "    ", load_index, ": kind=full offset=", load.offset,
-        " width=8"
-    of PartialLoad:
-      echo "    ", load_index, ": kind=partial offset=", load.offset,
-        " width=", load.width
+static:
+  var command = quoteShell(cli_path)
+  for value in strings:
+    command.add(' ')
+    command.add(quoteShell(value))
 
-  var groups: seq[ByteGroup]
-  for string in partition_strings:
-    var group: ByteGroup
-    for load in length_class.loads:
-      case load.kind
-      of FullLoad:
-        group.add(loaded_value(string, load.offset))
-      of PartialLoad:
-        group.add(loaded_prefix_value(string, load.width))
-    groups.add(group)
+  let serialized = staticExec(command)
+  if serialized.len == 0:
+    error(
+      "perfect_string_map_cli produced no output.\n" &
+      "Command: " & command
+    )
 
-  echo "  byte_groups:"
-  for key_index, group in groups:
-    echo "    key_index=", key_index,
-      " string=", partition_strings[key_index],
-      " group=", group
+  let plan =
+    try:
+      deserialize_mapping_plan(serialized)
+    except CatchableError as exception:
+      error(
+        "perfect_string_map_cli produced invalid output.\n" &
+        "Command: " & command & "\n" &
+        "Error: " & exception.msg & "\n" &
+        "Output:\n" & serialized
+      )
 
-  let mapper = find_mapping(groups)
-  let slot_count = 2 * nextPowerOfTwo(groups.len)
-  let slot_mask = uint64(slot_count - 1)
+  echo "string_count: ", strings.len
+  echo "serialized_byte_count: ", serialized.len
+  echo "length_partition_count: ", plan.length_partitions.len
+  for index, partition in plan.length_partitions:
+    echo "partition ", index,
+      ": lengths=", partition.min_length, "..", partition.max_length,
+      " loads=", partition.selected_byte_loads,
+      " M=", partition.output_slot_count
+    echo "  mixer: ", partition.mapper.mixer
+    echo "  g: ", partition.mapper.g
+    echo "  bucket_count: ", partition.mapper.pilots.len,
+      " first_pilots: ",
+      partition.mapper.pilots[0 ..< min(8, partition.mapper.pilots.len)]
 
-  echo "  mapper:"
-  echo "    mixer: ", mapper.mixer
-  echo "    g: ", mapper.g
-  echo "    pilots: ", mapper.pilots
-  echo "    bucket_count: ", mapper.pilots.len
-  echo "    slot_count: ", slot_count
-  echo "    slot_mask: ", slot_mask
-  echo "  mappings:"
+define_perfect_string_map_internal(
+  "CheckedTestMap",
+  "int",
+  @["aa", "ab", "ac", "abcdefgh", "abcdefgi", "abcdefgj"],
+  true,
+)
 
-  for key_index, group in groups:
-    let bucket_id = int(evaluate(mapper.mixer, group))
-    let pilot = mapper.pilots[bucket_id]
-    let g = evaluate(mapper.g, group)
-    let slot = (g + uint64(pilot)) and slot_mask
+define_perfect_string_map_internal(
+  "UncheckedTestMap",
+  "int",
+  @["ba", "bb", "bc", "bd"],
+  false,
+)
 
-    echo "    key_index=", key_index,
-      " string=", partition_strings[key_index],
-      " bucket=", bucket_id,
-      " g=", g,
-      " pilot=", pilot,
-      " slot=", slot
+define_perfect_string_map_internal(
+  "LargeCheckedTestMap",
+  "int",
+  strings,
+  true,
+)
+
+var checked_map_1, checked_map_2: CheckedTestMap
+var checked_short_slots: array[3, int]
+for index, value in ["aa", "ab", "ac"]:
+  let slot = checked_map_1.candidate_index(value)
+  doAssert slot >= 0
+  doAssert slot < checked_map_1.values_0.len
+  checked_short_slots[index] = slot
+for left in 0 ..< checked_short_slots.len:
+  for right in left + 1 ..< checked_short_slots.len:
+    doAssert checked_short_slots[left] != checked_short_slots[right]
+
+let checked_long_slot = checked_map_1.candidate_index("abcdefgi")
+doAssert checked_long_slot >= 0
+doAssert checked_long_slot < checked_map_1.values_1.len
+doAssert checked_map_1.candidate_index("a") == -1
+doAssert checked_map_1.candidate_index("abcd") == -1
+doAssert checked_map_1.candidate_index("abcdefghij") == -1
+doAssert checked_map_1.candidate_index("az") == -1
+doAssert checked_map_1.candidate_index("abcdefghx") == -1
+
+checked_map_1.values_0[checked_short_slots[0]] = 11
+checked_map_2.values_0[checked_short_slots[0]] = 22
+doAssert checked_map_1.values_0[checked_short_slots[0]] == 11
+doAssert checked_map_2.values_0[checked_short_slots[0]] == 22
+
+var unchecked_map: UncheckedTestMap
+var unchecked_slots: array[4, int]
+for index, value in ["ba", "bb", "bc", "bd"]:
+  let slot = unchecked_map.candidate_index(value)
+  doAssert slot >= 0
+  doAssert slot < unchecked_map.values_0.len
+  unchecked_slots[index] = slot
+for left in 0 ..< unchecked_slots.len:
+  for right in left + 1 ..< unchecked_slots.len:
+    doAssert unchecked_slots[left] != unchecked_slots[right]
+
+var large_checked_map: LargeCheckedTestMap
+for value in strings:
+  doAssert large_checked_map.candidate_index(value) >= 0
+doAssert large_checked_map.candidate_index("") == -1
+doAssert large_checked_map.candidate_index("not-in-the-map") == -1

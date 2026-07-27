@@ -34,7 +34,7 @@ type
     in_madd,
     in_msub,
     in_ubfx,
-  PremixKind = enum
+  PremixKind* = enum
     no_premix,
     rotate_right,
     xor_simple,
@@ -52,62 +52,62 @@ type
     multiply_add_self,
     multiply_sub_self,
     multiply_constant,
-  OperandKind = enum
+  OperandKind* = enum
     op_input,
     op_constant,
     op_instruction,
-  Operand = object
-    case kind: OperandKind
+  Operand* = object
+    case kind*: OperandKind
     of op_input:
-      index: int
+      index*: int
     of op_constant:
-      value: uint64
+      value*: uint64
     of op_instruction:
-      instruction: Instruction
+      instruction*: Instruction
   Instruction* = ref object
     case kind*: InstructionKind
     of in_and:
-      left, right: Operand
+      left*, right*: Operand
     of in_xor:
-      source: Operand
-      shifted_source: Operand
-      shift: Operand
-      premix_kind: PremixKind
+      source*: Operand
+      shifted_source*: Operand
+      shift*: Operand
+      premix_kind*: PremixKind
     of in_add:
-      add_source: Operand
-      add_shifted_source: Operand
-      add_shift: Operand
-      add_premix_kind: PremixKind
+      add_source*: Operand
+      add_shifted_source*: Operand
+      add_shift*: Operand
+      add_premix_kind*: PremixKind
     of in_sub:
-      sub_source: Operand
-      sub_shifted_source: Operand
-      sub_shift: Operand
-      sub_premix_kind: PremixKind
+      sub_source*: Operand
+      sub_shifted_source*: Operand
+      sub_shift*: Operand
+      sub_premix_kind*: PremixKind
     of in_ror:
-      ror_source: Operand
-      ror_shift: Operand
+      ror_source*: Operand
+      ror_shift*: Operand
     of in_extr:
-      extr_left: Operand
-      extr_right: Operand
-      extr_shift: Operand
+      extr_left*: Operand
+      extr_right*: Operand
+      extr_shift*: Operand
     of in_mul:
-      mul_left: Operand
-      mul_right: Operand
+      mul_left*: Operand
+      mul_right*: Operand
     of in_umulh:
-      umulh_left: Operand
-      umulh_right: Operand
+      umulh_left*: Operand
+      umulh_right*: Operand
     of in_madd:
-      madd_left: Operand
-      madd_right: Operand
-      madd_addend: Operand
+      madd_left*: Operand
+      madd_right*: Operand
+      madd_addend*: Operand
     of in_msub:
-      msub_left: Operand
-      msub_right: Operand
-      msub_subtrahend: Operand
+      msub_left*: Operand
+      msub_right*: Operand
+      msub_subtrahend*: Operand
     of in_ubfx:
-      input: Operand
-      pos: Operand
-      len: Operand
+      input*: Operand
+      pos*: Operand
+      len*: Operand
   Mapper* = object
     mixer*: Instruction
     g*: G
