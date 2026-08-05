@@ -1,5 +1,7 @@
 import ../src/clay
 
+var clay_string_cache: ClayStringCache
+
 proc measure_text(text: ClayStringSlice; config: ptr ClayTextElementConfig;
     user_data: pointer): ClayDimensions {.cdecl.} =
   discard user_data
@@ -14,7 +16,7 @@ proc build_layout(): ClayRenderCommandArray =
     layout = clay_layout(sizing = clay_sizing(clay_sizing_fixed(10), clay_sizing_fixed(10))),
     background_color = clay_color(1, 2, 3, 4))
   let reusable_text = clay_text_config(font_size = 12)
-  clay_frame(1.0 / 60.0):
+  clay_frame(clay_string_cache, 1.0 / 60.0):
     element("root"):
       layout:
         sizing:
@@ -97,7 +99,7 @@ proc build_layout(): ClayRenderCommandArray =
             sibling_ordering = clay_exit_transition_ordering_natural_order
 
 proc build_layout_with_alias(): ClayRenderCommandArray =
-  clay(1.0 / 60.0):
+  clay(clay_string_cache, 1.0 / 60.0):
     element_auto:
       layout:
         sizing:

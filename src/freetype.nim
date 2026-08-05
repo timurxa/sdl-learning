@@ -8,6 +8,73 @@
 
 {.passC: "-I/opt/homebrew/include/freetype2".}
 {.passL: "-L/opt/homebrew/lib -lfreetype".}
+{.emit: """
+#include <stdint.h>
+#include <string.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
+static FT_Error ft_prepare_glyph_bitmap(FT_Face face, FT_UInt glyph_index,
+    FT_UInt pixel_size) {
+    FT_Error error = FT_Set_Pixel_Sizes(face, 0, pixel_size);
+    if (error != 0) {
+        return error;
+    }
+    return FT_Load_Glyph(face, glyph_index,
+        FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL);
+}
+
+int ft_get_glyph_bitmap_metrics(FT_Face face, FT_UInt glyph_index,
+    FT_UInt pixel_size, uint32_t *width, uint32_t *rows,
+    int32_t *left, int32_t *top) {
+    FT_Error error = ft_prepare_glyph_bitmap(face, glyph_index, pixel_size);
+    if (error != 0) {
+        return (int)error;
+    }
+
+    FT_Bitmap *bitmap = &face->glyph->bitmap;
+    *width = bitmap->width;
+    *rows = bitmap->rows;
+    *left = face->glyph->bitmap_left;
+    *top = face->glyph->bitmap_top;
+    return 0;
+}
+
+int ft_copy_glyph_bitmap(FT_Face face, FT_UInt glyph_index,
+    FT_UInt pixel_size, uint8_t *destination, uint32_t destination_capacity) {
+    FT_Error error = ft_prepare_glyph_bitmap(face, glyph_index, pixel_size);
+    if (error != 0) {
+        return (int)error;
+    }
+
+    FT_Bitmap *bitmap = &face->glyph->bitmap;
+    uint32_t required = bitmap->width * bitmap->rows;
+    if (destination == NULL || destination_capacity < required) {
+        return 1;
+    }
+
+    for (uint32_t row = 0; row < bitmap->rows; ++row) {
+        const unsigned char *source_row;
+        if (bitmap->pitch >= 0) {
+            source_row = bitmap->buffer + row * bitmap->pitch;
+        } else {
+            source_row = bitmap->buffer + (bitmap->rows - 1 - row) * (-bitmap->pitch);
+        }
+
+        if (bitmap->pixel_mode == FT_PIXEL_MODE_GRAY) {
+            memcpy(destination + row * bitmap->width, source_row, bitmap->width);
+        } else if (bitmap->pixel_mode == FT_PIXEL_MODE_MONO) {
+            for (uint32_t column = 0; column < bitmap->width; ++column) {
+                destination[row * bitmap->width + column] =
+                    (source_row[column >> 3] & (0x80 >> (column & 7))) ? 255 : 0;
+            }
+        } else {
+            return 1;
+        }
+    }
+    return 0;
+}
+""".}
 
 type
   FtError* = cint
@@ -57,3 +124,10 @@ proc ft_load_glyph*(face: FtFace; glyph_index: FtUInt; load_flags: FtInt32): FtE
     importc: "FT_Load_Glyph", header: "freetype/freetype.h".}
 proc ft_load_char*(face: FtFace; char_code: FtULong; load_flags: FtInt32): FtError {.
     importc: "FT_Load_Char", header: "freetype/freetype.h".}
+
+proc ft_get_glyph_bitmap_metrics*(face: FtFace; glyph_index, pixel_size: FtUInt;
+    width, rows: ptr uint32; left, top: ptr int32): FtError {.
+    importc: "ft_get_glyph_bitmap_metrics".}
+proc ft_copy_glyph_bitmap*(face: FtFace; glyph_index, pixel_size: FtUInt;
+    destination: ptr uint8; destination_capacity: uint32): FtError {.
+    importc: "ft_copy_glyph_bitmap".}

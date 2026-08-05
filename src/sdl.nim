@@ -78,6 +78,7 @@ const
   sdl_gpu_sample_count_2* = SdlGpuSampleCount(1)
   sdl_gpu_sample_count_4* = SdlGpuSampleCount(2)
   sdl_gpu_sample_count_8* = SdlGpuSampleCount(3)
+  sdl_gpu_texture_usage_sampler* = SdlGpuTextureUsageFlags(1'u32 shl 0)
   sdl_gpu_texture_usage_depth_stencil_target* = SdlGpuTextureUsageFlags(1'u32 shl 2)
   sdl_gpu_buffer_usage_vertex* = SdlGpuBufferUsageFlags(1'u32 shl 0)
   sdl_gpu_transfer_buffer_usage_upload* = SdlGpuTransferBufferUsage(0)
@@ -561,12 +562,15 @@ type
 var sdl_event_quit* {.importc: "SDL_EVENT_QUIT", header: "SDL3/SDL_events.h".}: uint32
 var sdl_window_resizable* {.importc: "SDL_WINDOW_RESIZABLE", header: "SDL3/SDL_video.h".}: uint64
 var sdl_window_borderless* {.importc: "SDL_WINDOW_BORDERLESS", header: "SDL3/SDL_video.h".}: uint64
+var sdl_window_high_pixel_density* {.importc: "SDL_WINDOW_HIGH_PIXEL_DENSITY", header: "SDL3/SDL_video.h".}: uint64
 
 proc enter_app_main_callbacks*(argc: cint; argv: ptr ptr char; appinit: SdlAppInitFunc; appiterate: SdlAppIterateFunc; appevent: SdlAppEventFunc; appquit: SdlAppQuitFunc): cint {.importc: "SDL_EnterAppMainCallbacks", header: "SDL3/SDL_main.h".}
 proc set_app_metadata*(name, version, identifier: cstring): bool {.importc: "SDL_SetAppMetadata", header: "SDL3/SDL_init.h".}
 proc run_app*(argc: cint; argv: ptr ptr char; main_function: SdlMainFunc; reserved: pointer): cint {.importc: "SDL_RunApp", header: "SDL3/SDL_main.h".}
 proc create_window*(title: cstring; width, height: cint; flags: uint64): ptr SdlWindow {.importc: "SDL_CreateWindow", header: "SDL3/SDL_video.h".}
 proc destroy_window*(window: ptr SdlWindow) {.importc: "SDL_DestroyWindow", header: "SDL3/SDL_video.h".}
+proc get_window_size*(window: ptr SdlWindow; width, height: ptr cint): bool {.importc: "SDL_GetWindowSize", header: "SDL3/SDL_video.h".}
+proc get_window_display_scale*(window: ptr SdlWindow): cfloat {.importc: "SDL_GetWindowDisplayScale", header: "SDL3/SDL_video.h".}
 
 proc gpu_supports_shader_formats*(format_flags: SdlGpuShaderFormat; name: cstring): bool {.importc: "SDL_GPUSupportsShaderFormats", header: "SDL3/SDL_gpu.h".}
 proc gpu_supports_properties*(props: SdlPropertiesId): bool {.importc: "SDL_GPUSupportsProperties", header: "SDL3/SDL_gpu.h".}

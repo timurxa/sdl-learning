@@ -10,6 +10,21 @@ import std/macros
 {.emit: """
 #define CLAY_IMPLEMENTATION
 #include "clay.h"
+
+bool clay_nim_has_exiting_transitions(void) {
+    Clay_Context *context = Clay_GetCurrentContext();
+    if (context == NULL) {
+        return false;
+    }
+    for (int32_t i = 0; i < context->transitionDatas.length; ++i) {
+        Clay__TransitionDataInternal *data =
+            Clay__TransitionDataInternalArray_Get(&context->transitionDatas, i);
+        if (data->state == CLAY_TRANSITION_STATE_EXITING) {
+            return true;
+        }
+    }
+    return false;
+}
 """.}
 
 type
@@ -29,6 +44,15 @@ type
     next_allocation* {.importc: "nextAllocation".}: uint
     capacity*: csize_t
     memory*: pointer
+
+  ClayStringGeneration = object
+    strings: seq[string]
+    frame_number: uint64
+
+  ClayStringCache* = object
+    generations: seq[ClayStringGeneration]
+    next_frame_number: uint64
+    last_exiting_transitions: bool
 
   ClayDimensions* {.importc: "Clay_Dimensions", header: "clay.h".} = object
     width*: cfloat
@@ -87,7 +111,7 @@ type
   ClayErrorType* = uint8
 
   ClayTransitionState* = cint
-  ClayTransitionProperty* = cint
+  ClayTransitionProperty* {.importc: "Clay_TransitionProperty", header: "clay.h".} = distinct cint
 
   ClayChildAlignment* {.importc: "Clay_ChildAlignment", header: "clay.h".} = object
     x*: ClayLayoutAlignmentX
@@ -493,7 +517,10 @@ proc clay_set_max_measure_text_cache_word_count*(max_count: int32)
 proc clay_reset_measure_text_cache*()
   {.importc: "Clay_ResetMeasureTextCache", header: "clay.h".}
 proc clay_ease_out*(arguments: ClayTransitionCallbackArguments): bool
-  {.importc: "Clay_EaseOut", header: "clay.h".}
+  {.cdecl, importc: "Clay_EaseOut", header: "clay.h".}
+
+proc clay_has_exiting_transitions*(): bool
+  {.importc: "clay_nim_has_exiting_transitions".}
 
 # Internal functions used by the declarative macro layer. These are the
 # functions wrapped by Clay's CLAY, CLAY_AUTO_ID, and CLAY_TEXT macros.
@@ -508,12 +535,76 @@ proc clay_close_element*() {.importc: "Clay__CloseElement", header: "clay.h".}
 proc clay_open_text_element*(text: ClayString; config: ClayTextElementConfig)
   {.importc: "Clay__OpenTextElement", header: "clay.h".}
 
+var clay_active_string_cache: ptr ClayStringCache
+
+proc clay_string_cache_add_generation(cache: var ClayStringCache) {.inline.} =
+  inc cache.next_frame_number
+  cache.generations.add(ClayStringGeneration(frame_number: cache.next_frame_number))
+
+proc clay_string_cache_retain_latest(cache: var ClayStringCache) =
+  if cache.generations.len <= 1:
+    return
+
+  let retained_generation = cache.generations[^1]
+  let reclaimed_count = cache.generations.len - 1
+  cache.generations.setLen(1)
+  cache.generations[0] = retained_generation
+  if reclaimed_count > 1:
+    echo "Clay string cache: reclaimed ", reclaimed_count, " generations"
+
+proc clay_string_cache_begin*(cache: var ClayStringCache) =
+  let has_exiting_transitions = clay_has_exiting_transitions()
+  if has_exiting_transitions != cache.last_exiting_transitions:
+    echo "Clay string cache: exiting transitions = ", has_exiting_transitions
+    cache.last_exiting_transitions = has_exiting_transitions
+
+  if not has_exiting_transitions:
+    clay_string_cache_retain_latest(cache)
+  clay_string_cache_add_generation(cache)
+  clay_active_string_cache = addr cache
+
+proc clay_string_cache_end*() {.inline.} =
+  clay_active_string_cache = nil
+
+proc clay_string_cache_deinit*(cache: var ClayStringCache) =
+  if cache.generations.len > 0:
+    echo "Clay string cache: reclaimed ", cache.generations.len, " generations at shutdown"
+  cache.generations.setLen(0)
+  cache.next_frame_number = 0
+  cache.last_exiting_transitions = false
+  if clay_active_string_cache == addr cache:
+    clay_active_string_cache = nil
+
+proc clay_string_cache_generation_count*(cache: ClayStringCache): int {.inline.} =
+  cache.generations.len
+
+proc clay_string_cache_current_generation*(cache: ClayStringCache): uint64 {.inline.} =
+  if cache.generations.len == 0:
+    0
+  else:
+    cache.generations[^1].frame_number
+
+proc clay_string*(cache: var ClayStringCache; value: string): ClayString {.inline.} =
+  if cache.generations.len == 0:
+    clay_string_cache_add_generation(cache)
+  cache.generations[^1].strings.add(value)
+  let stored = addr cache.generations[^1].strings[^1]
+  ClayString(is_statically_allocated: false, length: stored[].len.int32,
+    chars: stored[].cstring)
+
+proc clay_string*(cache: var ClayStringCache; value: cstring): ClayString {.inline.} =
+  clay_string(cache, $value)
+
 proc clay_string*(value: cstring): ClayString {.inline.} =
+  if clay_active_string_cache != nil:
+    return clay_string(clay_active_string_cache[], value)
   ClayString(is_statically_allocated: false, length: value.len.int32, chars: value)
 
 proc clay_string*(value: ClayString): ClayString {.inline.} = value
 
 proc clay_string*(value: string): ClayString {.inline.} =
+  if clay_active_string_cache != nil:
+    return clay_string(clay_active_string_cache[], value)
   ClayString(is_statically_allocated: false, length: value.len.int32, chars: value.cstring)
 
 proc clay_string*(chars: cstring; length: SomeInteger;
@@ -525,6 +616,10 @@ template clay_string*(value: static[string]): ClayString =
   ClayString(is_statically_allocated: true, length: value.len.int32, chars: value.cstring)
 
 proc clay_string_slice*(value: string): ClayStringSlice {.inline.} =
+  if clay_active_string_cache != nil:
+    let stored = clay_string(clay_active_string_cache[], value)
+    return ClayStringSlice(length: stored.length, chars: stored.chars,
+      base_chars: stored.chars)
   let chars = value.cstring
   ClayStringSlice(length: value.len.int32, chars: chars, base_chars: chars)
 
@@ -893,20 +988,22 @@ macro text*(value: untyped; config: untyped; body: untyped): untyped =
   result = quote do:
     clay_text_scope(clay_string(`value`), `config`)
 
-macro clay_frame*(delta_time: untyped; body: untyped): untyped =
+macro clay_frame*(cache: untyped; delta_time: untyped; body: untyped): untyped =
   result = quote do:
     block:
       var clay_commands: ClayRenderCommandArray
+      clay_string_cache_begin(`cache`)
       clay_begin_layout()
       try:
         `body`
       finally:
         clay_commands = clay_end_layout(`delta_time`)
+        clay_string_cache_end()
       clay_commands
 
-macro clay*(delta_time: untyped; body: untyped): untyped =
+macro clay*(cache: untyped; delta_time: untyped; body: untyped): untyped =
   result = quote do:
-    clay_frame(`delta_time`):
+    clay_frame(`cache`, `delta_time`):
       `body`
 
 proc clay_id_local*(value: cstring): ClayElementId {.inline.} = clay_id_local(clay_string(value))

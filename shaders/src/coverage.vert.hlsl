@@ -11,12 +11,14 @@ struct VertexInput {
 	uint2 origin   : TEXCOORD1;
 	uint2 size     : TEXCOORD2;
 	uint4 color    : TEXCOORD3;
-	float depth    : TEXCOORD4;
+	float4 uv       : TEXCOORD4;
+	float depth    : TEXCOORD5;
 };
 
 struct VertexOutput {
 	float4 position : SV_Position;
 	float4 color    : TEXCOORD0;
+	float2 uv       : TEXCOORD1;
 };
 
 VertexOutput main(VertexInput input) {
@@ -27,8 +29,10 @@ VertexOutput main(VertexInput input) {
 		pixel_position.x * (2.0 * inverse_viewport_size.x) - 1.0,
 		1.0 - pixel_position.y * (2.0 * inverse_viewport_size.y)
 	);
-	
+
 	output.position = float4(ndc_position, input.depth, 1.0);
+	output.uv = input.uv.xy + float2(input.corner) * input.uv.zw;
 	output.color = float4(input.color) / 255.0;
+
 	return output;
 }
