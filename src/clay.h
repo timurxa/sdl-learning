@@ -13,6 +13,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 // SIMD includes on supported platforms
 #if !defined(CLAY_DISABLE_SIMD) && (defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64))
@@ -212,6 +214,11 @@ typedef struct Clay_StringSlice {
     const char *baseChars; // The source string / char* that this slice was derived from
 } Clay_StringSlice;
 
+// Returns the byte offset of the next extended grapheme boundary at or after
+// offset. The returned offset must be greater than offset and no greater than
+// text.length, unless offset == text.length.
+typedef int32_t (*Clay_GraphemeBoundaryProc)(Clay_StringSlice text, int32_t offset, void *userData);
+
 typedef struct Clay_Context Clay_Context;
 
 // Clay_Arena is a memory arena structure that is used by clay to manage its internal allocations.
@@ -369,6 +376,8 @@ typedef CLAY_PACKED_ENUM {
     CLAY_TEXT_WRAP_NEWLINES,
     // Disable text wrapping entirely.
     CLAY_TEXT_WRAP_NONE,
+    // Breaks on whitespace, then splits oversized words at extended grapheme boundaries.
+    CLAY_TEXT_WRAP_WORDS_AND_GRAPHEMES,
 } Clay_TextElementConfigWrapMode;
 
 // Controls how wrapped lines of text are horizontally aligned within the outer text bounding box.
@@ -400,6 +409,7 @@ typedef struct Clay_TextElementConfig {
     // CLAY_TEXT_WRAP_WORDS (default) breaks on whitespace characters.
     // CLAY_TEXT_WRAP_NEWLINES doesn't break on space characters, only on newlines.
     // CLAY_TEXT_WRAP_NONE disables wrapping entirely.
+    // CLAY_TEXT_WRAP_WORDS_AND_GRAPHEMES also splits oversized words at grapheme boundaries.
     Clay_TextElementConfigWrapMode wrapMode;
     // Controls how wrapped lines of text are horizontally aligned within the outer text bounding box.
     // CLAY_TEXT_ALIGN_LEFT (default) - Horizontally aligns wrapped lines of text to the left hand side of their bounding box.
@@ -894,7 +904,11 @@ typedef CLAY_PACKED_ENUM {
     CLAY_ERROR_TYPE_INTERNAL_ERROR,
     // Clay__OpenElement was called more times than Clay__CloseElement, so there were still remaining open elements when the layout ended.
     CLAY_ERROR_TYPE_UNBALANCED_OPEN_CLOSE,
-    CLAY_ERROR_TYPE_HASH_MAP_CAPACITY_EXCEEDED
+    CLAY_ERROR_TYPE_HASH_MAP_CAPACITY_EXCEEDED,
+    // A grapheme-splitting text element was used without a grapheme boundary function.
+    CLAY_ERROR_TYPE_GRAPHEME_BOUNDARY_FUNCTION_NOT_PROVIDED,
+    // A grapheme boundary function returned an invalid byte offset.
+    CLAY_ERROR_TYPE_GRAPHEME_BOUNDARY_FUNCTION_INVALID
 } Clay_ErrorType;
 
 // Data to identify the error that clay has encountered.
@@ -910,6 +924,8 @@ typedef struct Clay_ErrorData {
     // CLAY_ERROR_TYPE_INTERNAL_ERROR - Clay encountered an internal error. It would be wonderful if you could report this so we can fix it!
     // CLAY_ERROR_TYPE_UNBALANCED_OPEN_CLOSE - Clay__OpenElement was called more times than Clay__CloseElement, so there were still remaining open elements when the layout ended.
     // CLAY_ERROR_TYPE_HASH_MAP_CAPACITY_EXCEEDED - Clay ran out of capacity in its internal hash map for storing element IDs -> elements. This limit can be increased with Clay_SetMaxElementCount().
+    // CLAY_ERROR_TYPE_GRAPHEME_BOUNDARY_FUNCTION_NOT_PROVIDED - A grapheme-splitting text element was used without a grapheme boundary function.
+    // CLAY_ERROR_TYPE_GRAPHEME_BOUNDARY_FUNCTION_INVALID - A grapheme boundary function returned an invalid byte offset.
     Clay_ErrorType errorType;
     // A string containing human-readable error text that explains the error in more detail.
     Clay_String errorText;
@@ -946,6 +962,8 @@ CLAY_DLL_EXPORT Clay_PointerData Clay_GetPointerState(void);
 // - layoutDimensions are the initial bounding dimensions of the layout (i.e. the screen width and height for a full screen layout)
 // - errorHandler is used by Clay to inform you if something has gone wrong in configuration or layout.
 CLAY_DLL_EXPORT Clay_Context* Clay_Initialize(Clay_Arena arena, Clay_Dimensions layoutDimensions, Clay_ErrorHandler errorHandler);
+// Releases Clay-owned heap allocations. The arena passed to Clay_Initialize remains owned by the caller.
+CLAY_DLL_EXPORT void Clay_Deinitialize(void);
 // Returns the Context that clay is currently using. Used when using multiple instances of clay simultaneously.
 CLAY_DLL_EXPORT Clay_Context* Clay_GetCurrentContext(void);
 // Sets the context that clay will use to compute the layout.
@@ -1002,6 +1020,11 @@ CLAY_DLL_EXPORT Clay_ScrollContainerData Clay_GetScrollContainerData(Clay_Elemen
 // - measureTextFunction is a user provided function that adheres to the interface Clay_Dimensions (Clay_StringSlice text, Clay_TextElementConfig *config, void *userData);
 // - userData is a pointer that will be transparently passed through when the measureTextFunction is called.
 CLAY_DLL_EXPORT void Clay_SetMeasureTextFunction(Clay_Dimensions (*measureTextFunction)(Clay_StringSlice text, Clay_TextElementConfig *config, void *userData), void *userData);
+// Binds an optional callback used by CLAY_TEXT_WRAP_WORDS_AND_GRAPHEMES.
+// The callback returns the next extended grapheme boundary as a byte offset
+// relative to the supplied text slice.
+// Setting the callback resets Clay's text measurement cache.
+CLAY_DLL_EXPORT void Clay_SetGraphemeBoundaryFunction(Clay_GraphemeBoundaryProc graphemeBoundaryFunction, void *userData);
 // Experimental - Used in cases where Clay needs to integrate with a system that manages its own scrolling containers externally.
 // Please reach out if you plan to use this function, as it may be subject to change.
 CLAY_DLL_EXPORT void Clay_SetQueryScrollOffsetFunction(Clay_Vector2 (*queryScrollOffsetFunction)(uint32_t elementId, void *userData), void *userData);
@@ -1019,9 +1042,9 @@ CLAY_DLL_EXPORT int32_t Clay_GetMaxElementCount(void);
 // Modifies the maximum number of UI elements supported by Clay's current configuration.
 // This may require reallocating additional memory, and re-calling Clay_Initialize();
 CLAY_DLL_EXPORT void Clay_SetMaxElementCount(int32_t maxElementCount);
-// Returns the maximum number of measured "words" (whitespace seperated runs of characters) that Clay can store in its internal text measurement cache.
+// Returns the maximum number of measured words and grapheme boundaries that Clay can store in its internal text measurement cache.
 CLAY_DLL_EXPORT int32_t Clay_GetMaxMeasureTextCacheWordCount(void);
-// Modifies the maximum number of measured "words" (whitespace seperated runs of characters) that Clay can store in its internal text measurement cache.
+// Modifies the maximum number of measured words and grapheme boundaries that Clay can store in its internal text measurement cache.
 // This may require reallocating additional memory, and re-calling Clay_Initialize();
 CLAY_DLL_EXPORT void Clay_SetMaxMeasureTextCacheWordCount(int32_t maxMeasureTextCacheWordCount);
 // Resets Clay's internal text measurement cache. Useful if font mappings have changed or fonts have been reloaded.
@@ -1162,6 +1185,8 @@ typedef struct {
     bool maxRenderCommandsExceeded;
     bool maxTextMeasureCacheExceeded;
     bool textMeasurementFunctionNotSet;
+    bool graphemeBoundaryFunctionNotSet;
+    bool graphemeBoundaryFunctionInvalid;
     bool hashMapCapacityExceeded;
 } Clay_BooleanWarnings;
 
@@ -1247,6 +1272,8 @@ typedef struct {
 
 CLAY__ARRAY_DEFINE(Clay__ScrollContainerDataInternal, Clay__ScrollContainerDataInternalArray)
 
+typedef struct Clay__ExitStringPool Clay__ExitStringPool;
+
 // Data representing the current internal state of a transition element.
 typedef struct Clay__TransitionDataInternal {
     Clay_TransitionData initialState;
@@ -1262,6 +1289,7 @@ typedef struct Clay__TransitionDataInternal {
     bool transitionOut;
     bool reparented;
     Clay_TransitionProperty activeProperties;
+    Clay__ExitStringPool *exitStringPool;
 } Clay__TransitionDataInternal;
 
 CLAY__ARRAY_DEFINE(Clay__TransitionDataInternal, Clay__TransitionDataInternalArray)
@@ -1288,9 +1316,18 @@ typedef struct {
     int32_t length;
     float width;
     int32_t next;
+    int32_t graphemeStartIndex;
 } Clay__MeasuredWord;
 
 CLAY__ARRAY_DEFINE(Clay__MeasuredWord, Clay__MeasuredWordArray)
+
+typedef struct {
+    int32_t startOffset;
+    int32_t length;
+    int32_t next;
+} Clay__GraphemeBoundaryData;
+
+CLAY__ARRAY_DEFINE(Clay__GraphemeBoundaryData, Clay__GraphemeBoundaryArray)
 
 typedef struct {
     Clay_Dimensions unwrappedDimensions;
@@ -1304,6 +1341,19 @@ typedef struct {
 } Clay__MeasureTextCacheItem;
 
 CLAY__ARRAY_DEFINE(Clay__MeasureTextCacheItem, Clay__MeasureTextCacheItemArray)
+
+typedef struct Clay__ExitStringChunk {
+    struct Clay__ExitStringChunk *next;
+    size_t capacity;
+    size_t used;
+    char *data;
+} Clay__ExitStringChunk;
+
+struct Clay__ExitStringPool {
+    struct Clay__ExitStringPool *nextRetired;
+    Clay__ExitStringChunk *chunks;
+    Clay__ExitStringChunk *current;
+};
 
 typedef struct {
     Clay_LayoutElement *layoutElement;
@@ -1346,6 +1396,7 @@ struct Clay_Context {
     uint32_t generation;
     uintptr_t arenaResetOffset;
     void *measureTextUserData;
+    void *graphemeBoundaryUserData;
     void *queryScrollOffsetUserData;
     Clay_Arena internalArena;
     // Layout Elements / Render Commands
@@ -1369,13 +1420,314 @@ struct Clay_Context {
     Clay__int32_tArray measureTextHashMap;
     Clay__MeasuredWordArray measuredWords;
     Clay__int32_tArray measuredWordsFreeList;
+    Clay__GraphemeBoundaryArray graphemeBoundaries;
+    Clay__int32_tArray graphemeBoundariesFreeList;
     Clay__int32_tArray openClipElementStack;
     Clay_ElementIdArray pointerOverIds;
     Clay__ScrollContainerDataInternalArray scrollContainerDatas;
     Clay__TransitionDataInternalArray transitionDatas;
+    Clay__ExitStringPool *retiredExitStringPools;
+    Clay__ExitStringChunk *reusableExitStringChunks;
     Clay__boolArray treeNodeVisited;
     Clay__charArray dynamicStringData;
 };
+
+#define CLAY__EXIT_STRING_CHUNK_MIN_CAPACITY ((size_t)4096)
+
+typedef bool (*Clay__ExitStringVisitor)(Clay_String *string, void *userData);
+
+void Clay__ReportExitStringPoolError(Clay_Context *context, const char *message) {
+    if (context->errorHandler.errorHandlerFunction) {
+        context->errorHandler.errorHandlerFunction(CLAY__INIT(Clay_ErrorData) {
+            .errorType = CLAY_ERROR_TYPE_INTERNAL_ERROR,
+            .errorText = CLAY__INIT(Clay_String) {
+                .length = (int32_t)strlen(message),
+                .chars = message
+            },
+            .userData = context->errorHandler.userData
+        });
+    }
+}
+
+bool Clay__AddExitStringBytes(size_t *total, Clay_String *string) {
+    if (string->isStaticallyAllocated || string->length <= 0) {
+        return true;
+    }
+    if (string->chars == CLAY__NULL) {
+        return false;
+    }
+    size_t bytes = (size_t)string->length + 1;
+    if (*total > (size_t)-1 - bytes) {
+        return false;
+    }
+    *total += bytes;
+    return true;
+}
+
+bool Clay__VisitExitSubtreeStrings(Clay_Context *context, Clay_LayoutElement *root,
+    Clay__ExitStringVisitor visitor, void *userData) {
+    Clay__int32_tArray bfsBuffer = context->openLayoutElementStack;
+    bfsBuffer.length = 0;
+    int32_t rootIndex = (int32_t)(root - context->layoutElements.internalArray);
+    Clay__int32_tArray_Add(&bfsBuffer, rootIndex);
+
+    for (int32_t bufferIndex = 0; bufferIndex < bfsBuffer.length; ++bufferIndex) {
+        int32_t elementIndex = Clay__int32_tArray_GetValue(&bfsBuffer, bufferIndex);
+        Clay_LayoutElement *element = Clay_LayoutElementArray_GetCheckCapacity(
+            &context->layoutElements, elementIndex);
+        Clay_String *elementIdString = Clay__StringArray_GetCheckCapacity(
+            &context->layoutElementIdStrings, elementIndex);
+        if (!visitor(elementIdString, userData)) {
+            return false;
+        }
+        if (element->isTextElement &&
+            !visitor(&element->textElementData.text, userData)) {
+            return false;
+        }
+        for (uint16_t childIndex = 0; childIndex < element->children.length; ++childIndex) {
+            Clay__int32_tArray_Add(&bfsBuffer,
+                element->children.elements[childIndex]);
+        }
+    }
+    return true;
+}
+
+typedef struct {
+    size_t total;
+} Clay__ExitStringCountData;
+
+bool Clay__CountExitString(Clay_String *string, void *userData) {
+    Clay__ExitStringCountData *data = (Clay__ExitStringCountData *)userData;
+    return Clay__AddExitStringBytes(&data->total, string);
+}
+
+typedef struct {
+    Clay__ExitStringPool *pool;
+} Clay__ExitStringCopyData;
+
+bool Clay__CopyExitString(Clay_String *string, void *userData) {
+    Clay__ExitStringCopyData *data = (Clay__ExitStringCopyData *)userData;
+    if (string->isStaticallyAllocated || string->length <= 0) {
+        return true;
+    }
+    size_t bytes = (size_t)string->length + 1;
+    Clay__ExitStringChunk *chunk = data->pool->current;
+    if (!chunk || chunk->capacity - chunk->used < bytes) {
+        return false;
+    }
+    char *copy = chunk->data + chunk->used;
+    memcpy(copy, string->chars, (size_t)string->length);
+    copy[string->length] = '\0';
+    chunk->used += bytes;
+    string->isStaticallyAllocated = false;
+    string->chars = copy;
+    return true;
+}
+
+size_t Clay__RoundExitStringChunkCapacity(size_t required, size_t previous) {
+    size_t target = CLAY__EXIT_STRING_CHUNK_MIN_CAPACITY;
+    if (previous > 0 && previous <= (size_t)-1 / 2) {
+        target = previous * 2;
+    }
+    if (target < required) {
+        target = required;
+    }
+
+    size_t rounded = 1;
+    while (rounded < target) {
+        if (rounded > (size_t)-1 / 2) {
+            return target;
+        }
+        rounded *= 2;
+    }
+    return rounded;
+}
+
+Clay__ExitStringChunk *Clay__TakeReusableExitStringChunk(
+    Clay_Context *context, size_t required) {
+    Clay__ExitStringChunk *previous = CLAY__NULL;
+    Clay__ExitStringChunk *current = context->reusableExitStringChunks;
+    Clay__ExitStringChunk *best = CLAY__NULL;
+    Clay__ExitStringChunk *bestPrevious = CLAY__NULL;
+    while (current) {
+        if (current->capacity >= required &&
+            (!best || current->capacity < best->capacity)) {
+            best = current;
+            bestPrevious = previous;
+        }
+        previous = current;
+        current = current->next;
+    }
+    if (!best) {
+        return CLAY__NULL;
+    }
+    if (bestPrevious) {
+        bestPrevious->next = best->next;
+    } else {
+        context->reusableExitStringChunks = best->next;
+    }
+    best->next = CLAY__NULL;
+    best->used = 0;
+    return best;
+}
+
+Clay__ExitStringChunk *Clay__CreateExitStringChunk(
+    Clay_Context *context, size_t capacity) {
+    if (capacity > (size_t)-1 - sizeof(Clay__ExitStringChunk)) {
+        Clay__ReportExitStringPoolError(context,
+            "Clay exit string pool size overflow.");
+        return CLAY__NULL;
+    }
+    Clay__ExitStringChunk *chunk = (Clay__ExitStringChunk *)malloc(
+        sizeof(Clay__ExitStringChunk) + capacity);
+    if (!chunk) {
+        Clay__ReportExitStringPoolError(context,
+            "Clay could not allocate an exit string pool chunk.");
+        return CLAY__NULL;
+    }
+    chunk->next = CLAY__NULL;
+    chunk->capacity = capacity;
+    chunk->used = 0;
+    chunk->data = (char *)(chunk + 1);
+    return chunk;
+}
+
+Clay__ExitStringPool *Clay__CreateExitStringPool(Clay_Context *context) {
+    Clay__ExitStringPool *pool = (Clay__ExitStringPool *)malloc(
+        sizeof(Clay__ExitStringPool));
+    if (!pool) {
+        Clay__ReportExitStringPoolError(context,
+            "Clay could not allocate an exit string pool.");
+        return CLAY__NULL;
+    }
+    pool->nextRetired = CLAY__NULL;
+    pool->chunks = CLAY__NULL;
+    pool->current = CLAY__NULL;
+    return pool;
+}
+
+bool Clay__ReserveExitStringPool(Clay_Context *context,
+    Clay__ExitStringPool *pool, size_t required) {
+    if (required == 0) {
+        return true;
+    }
+    size_t previous = pool->current ? pool->current->capacity : 0;
+    size_t capacity = Clay__RoundExitStringChunkCapacity(required, previous);
+    Clay__ExitStringChunk *chunk = Clay__TakeReusableExitStringChunk(
+        context, capacity);
+    if (!chunk) {
+        chunk = Clay__CreateExitStringChunk(context, capacity);
+    }
+    if (!chunk) {
+        return false;
+    }
+    chunk->next = pool->chunks;
+    pool->chunks = chunk;
+    pool->current = chunk;
+    return true;
+}
+
+void Clay__ReleaseExitStringPoolChunks(Clay_Context *context,
+    Clay__ExitStringPool *pool, bool reuseChunks) {
+    Clay__ExitStringChunk *chunk = pool->chunks;
+    while (chunk) {
+        Clay__ExitStringChunk *next = chunk->next;
+        if (reuseChunks) {
+            chunk->used = 0;
+            chunk->next = context->reusableExitStringChunks;
+            context->reusableExitStringChunks = chunk;
+        } else {
+            free(chunk);
+        }
+        chunk = next;
+    }
+    pool->chunks = CLAY__NULL;
+    pool->current = CLAY__NULL;
+}
+
+void Clay__DestroyExitStringPool(Clay_Context *context,
+    Clay__ExitStringPool *pool, bool reuseChunks) {
+    if (!pool) {
+        return;
+    }
+    Clay__ReleaseExitStringPoolChunks(context, pool, reuseChunks);
+    free(pool);
+}
+
+void Clay__RetireExitStringPool(Clay_Context *context,
+    Clay__TransitionDataInternal *data) {
+    if (!data->exitStringPool) {
+        return;
+    }
+    Clay__ExitStringPool *pool = data->exitStringPool;
+    data->exitStringPool = CLAY__NULL;
+    pool->nextRetired = context->retiredExitStringPools;
+    context->retiredExitStringPools = pool;
+}
+
+void Clay__ReleaseRetiredExitStringPools(Clay_Context *context) {
+    Clay__ExitStringPool *pool = context->retiredExitStringPools;
+    context->retiredExitStringPools = CLAY__NULL;
+    while (pool) {
+        Clay__ExitStringPool *next = pool->nextRetired;
+        Clay__DestroyExitStringPool(context, pool, true);
+        pool = next;
+    }
+}
+
+void Clay__DestroyExitStringPools(Clay_Context *context) {
+    for (int32_t i = 0; i < context->transitionDatas.length; ++i) {
+        Clay__TransitionDataInternal *data =
+            Clay__TransitionDataInternalArray_Get(&context->transitionDatas, i);
+        Clay__DestroyExitStringPool(context, data->exitStringPool, false);
+        data->exitStringPool = CLAY__NULL;
+    }
+    Clay__ExitStringPool *pool = context->retiredExitStringPools;
+    context->retiredExitStringPools = CLAY__NULL;
+    while (pool) {
+        Clay__ExitStringPool *next = pool->nextRetired;
+        Clay__DestroyExitStringPool(context, pool, false);
+        pool = next;
+    }
+    Clay__ExitStringChunk *chunk = context->reusableExitStringChunks;
+    context->reusableExitStringChunks = CLAY__NULL;
+    while (chunk) {
+        Clay__ExitStringChunk *next = chunk->next;
+        free(chunk);
+        chunk = next;
+    }
+}
+
+bool Clay__PrepareExitStringPool(Clay_Context *context,
+    Clay__TransitionDataInternal *data) {
+    Clay__ExitStringCountData countData = { .total = 0 };
+    if (!Clay__VisitExitSubtreeStrings(context, data->elementThisFrame,
+            Clay__CountExitString, &countData)) {
+        Clay__ReportExitStringPoolError(context,
+            "Clay found an invalid dynamic string while starting an exit transition.");
+        return false;
+    }
+    if (countData.total == 0) {
+        return true;
+    }
+
+    Clay__ExitStringPool *pool = Clay__CreateExitStringPool(context);
+    if (!pool || !Clay__ReserveExitStringPool(context, pool, countData.total)) {
+        Clay__DestroyExitStringPool(context, pool, true);
+        return false;
+    }
+
+    data->exitStringPool = pool;
+    Clay__ExitStringCopyData copyData = { .pool = pool };
+    if (!Clay__VisitExitSubtreeStrings(context, data->elementThisFrame,
+            Clay__CopyExitString, &copyData)) {
+        Clay__ReportExitStringPoolError(context,
+            "Clay failed to copy strings for an exit transition.");
+        // The caller retires the attached pool before abandoning this exit.
+        return false;
+    }
+    return true;
+}
 
 Clay_Context* Clay__Context_Allocate_Arena(Clay_Arena *arena) {
     size_t totalSizeBytes = sizeof(Clay_Context);
@@ -1402,6 +1754,8 @@ Clay_String Clay__WriteStringToCharBuffer(Clay__charArray *buffer, Clay_String s
     Clay_Dimensions (*Clay__MeasureText)(Clay_StringSlice text, Clay_TextElementConfig *config, void *userData);
     Clay_Vector2 (*Clay__QueryScrollOffset)(uint32_t elementId, void *userData);
 #endif
+
+Clay_GraphemeBoundaryProc Clay__GraphemeBoundaryFunction;
 
 Clay_LayoutElement* Clay__GetOpenLayoutElement(void) {
     Clay_Context* context = Clay_GetCurrentContext();
@@ -1616,6 +1970,10 @@ uint32_t Clay__HashStringContentsWithConfig(Clay_String *text, Clay_TextElementC
     hash += (hash << 10);
     hash ^= (hash >> 6);
 
+    hash += config->wrapMode;
+    hash += (hash << 10);
+    hash ^= (hash >> 6);
+
     hash += (hash << 3);
     hash ^= (hash >> 11);
     hash += (hash << 15);
@@ -1634,6 +1992,148 @@ Clay__MeasuredWord *Clay__AddMeasuredWord(Clay__MeasuredWord word, Clay__Measure
         previousWord->next = (int32_t)context->measuredWords.length;
         return Clay__MeasuredWordArray_Add(&context->measuredWords, word);
     }
+}
+
+void Clay__FreeGraphemeBoundaries(int32_t startIndex) {
+    Clay_Context* context = Clay_GetCurrentContext();
+    while (startIndex != -1) {
+        Clay__GraphemeBoundaryData *boundary = Clay__GraphemeBoundaryArray_Get(&context->graphemeBoundaries, startIndex);
+        int32_t nextIndex = boundary->next;
+        Clay__int32_tArray_Add(&context->graphemeBoundariesFreeList, startIndex);
+        startIndex = nextIndex;
+    }
+}
+
+int32_t Clay__AddGraphemeBoundary(Clay__GraphemeBoundaryData boundary) {
+    Clay_Context* context = Clay_GetCurrentContext();
+    if (context->graphemeBoundariesFreeList.length > 0) {
+        int32_t newItemIndex = Clay__int32_tArray_GetValue(&context->graphemeBoundariesFreeList, context->graphemeBoundariesFreeList.length - 1);
+        context->graphemeBoundariesFreeList.length--;
+        Clay__GraphemeBoundaryArray_Set(&context->graphemeBoundaries, newItemIndex, boundary);
+        return newItemIndex;
+    }
+    if (context->graphemeBoundaries.length == context->graphemeBoundaries.capacity - 1) {
+        if (!context->booleanWarnings.maxTextMeasureCacheExceeded) {
+            context->errorHandler.errorHandlerFunction(CLAY__INIT(Clay_ErrorData) {
+                .errorType = CLAY_ERROR_TYPE_TEXT_MEASUREMENT_CAPACITY_EXCEEDED,
+                .errorText = CLAY_STRING("Clay has run out of space in its internal grapheme boundary cache."),
+                .userData = context->errorHandler.userData });
+            context->booleanWarnings.maxTextMeasureCacheExceeded = true;
+        }
+        return -1;
+    }
+    Clay__GraphemeBoundaryArray_Add(&context->graphemeBoundaries, boundary);
+    return context->graphemeBoundaries.length - 1;
+}
+
+void Clay__ReportMissingGraphemeBoundaryFunction(void) {
+    Clay_Context* context = Clay_GetCurrentContext();
+    if (context->booleanWarnings.graphemeBoundaryFunctionNotSet) {
+        return;
+    }
+    context->booleanWarnings.graphemeBoundaryFunctionNotSet = true;
+    context->errorHandler.errorHandlerFunction(CLAY__INIT(Clay_ErrorData) {
+        .errorType = CLAY_ERROR_TYPE_GRAPHEME_BOUNDARY_FUNCTION_NOT_PROVIDED,
+        .errorText = CLAY_STRING("Clay needs a grapheme boundary function for CLAY_TEXT_WRAP_WORDS_AND_GRAPHEMES."),
+        .userData = context->errorHandler.userData });
+}
+
+void Clay__ReportInvalidGraphemeBoundaryFunction(void) {
+    Clay_Context* context = Clay_GetCurrentContext();
+    if (context->booleanWarnings.graphemeBoundaryFunctionInvalid) {
+        return;
+    }
+    context->booleanWarnings.graphemeBoundaryFunctionInvalid = true;
+    context->errorHandler.errorHandlerFunction(CLAY__INIT(Clay_ErrorData) {
+        .errorType = CLAY_ERROR_TYPE_GRAPHEME_BOUNDARY_FUNCTION_INVALID,
+        .errorText = CLAY_STRING("Clay's grapheme boundary function returned an invalid byte offset."),
+        .userData = context->errorHandler.userData });
+}
+
+bool Clay__MeasureWordGraphemes(Clay_String *text, Clay_TextElementConfig *config,
+    int32_t startOffset, int32_t length, int32_t *graphemeStartIndex, float *minWidth) {
+    Clay_Context* context = Clay_GetCurrentContext();
+    *graphemeStartIndex = -1;
+    *minWidth = 0;
+    if (config->wrapMode != CLAY_TEXT_WRAP_WORDS_AND_GRAPHEMES || length <= 0) {
+        return false;
+    }
+    #ifdef CLAY_WASM
+    Clay__ReportMissingGraphemeBoundaryFunction();
+    return false;
+    #else
+    if (!Clay__GraphemeBoundaryFunction) {
+        Clay__ReportMissingGraphemeBoundaryFunction();
+        return false;
+    }
+
+    Clay_StringSlice word = CLAY__INIT(Clay_StringSlice) {
+        .length = length,
+        .chars = &text->chars[startOffset],
+        .baseChars = text->chars
+    };
+    int32_t offset = 0;
+    int32_t previousIndex = -1;
+    while (offset < length) {
+        int32_t nextOffset = Clay__GraphemeBoundaryFunction(word, offset, context->graphemeBoundaryUserData);
+        if (nextOffset <= offset || nextOffset > length) {
+            Clay__ReportInvalidGraphemeBoundaryFunction();
+            Clay__FreeGraphemeBoundaries(*graphemeStartIndex);
+            *graphemeStartIndex = -1;
+            return false;
+        }
+        Clay__GraphemeBoundaryData boundary = CLAY__INIT(Clay__GraphemeBoundaryData) {
+            .startOffset = startOffset + offset,
+            .length = nextOffset - offset,
+            .next = -1
+        };
+        int32_t boundaryIndex = Clay__AddGraphemeBoundary(boundary);
+        if (boundaryIndex < 0) {
+            Clay__FreeGraphemeBoundaries(*graphemeStartIndex);
+            *graphemeStartIndex = -1;
+            return false;
+        }
+        if (*graphemeStartIndex == -1) {
+            *graphemeStartIndex = boundaryIndex;
+        } else {
+            Clay__GraphemeBoundaryArray_Get(&context->graphemeBoundaries, previousIndex)->next = boundaryIndex;
+        }
+        previousIndex = boundaryIndex;
+
+        Clay_Dimensions dimensions = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) {
+            .length = nextOffset - offset,
+            .chars = &word.chars[offset],
+            .baseChars = word.baseChars
+        }, config, context->measureTextUserData);
+        *minWidth = CLAY__MAX(*minWidth, dimensions.width);
+        offset = nextOffset;
+    }
+    return true;
+    #endif
+}
+
+Clay__MeasuredWord *Clay__AddMeasuredTextWord(Clay_String *text, Clay_TextElementConfig *config,
+    int32_t startOffset, int32_t length, float width, float fallbackMinWidth,
+    Clay__MeasuredWord *previousWord, float *minWidth) {
+    int32_t contentLength = length;
+    if (contentLength > 0 && text->chars[startOffset + contentLength - 1] == ' ') {
+        contentLength--;
+    }
+    int32_t graphemeStartIndex = -1;
+    float wordMinWidth = 0;
+    bool measuredGraphemes = Clay__MeasureWordGraphemes(text, config, startOffset, contentLength,
+        &graphemeStartIndex, &wordMinWidth);
+    if (!measuredGraphemes) {
+        wordMinWidth = fallbackMinWidth;
+    }
+    *minWidth = CLAY__MAX(*minWidth, wordMinWidth);
+    return Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) {
+        .startOffset = startOffset,
+        .length = length,
+        .width = width,
+        .next = -1,
+        .graphemeStartIndex = graphemeStartIndex
+    }, previousWord);
 }
 
 Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_TextElementConfig *config) {
@@ -1666,6 +2166,7 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
             int32_t nextWordIndex = hashEntry->measuredWordsStartIndex;
             while (nextWordIndex != -1) {
                 Clay__MeasuredWord *measuredWord = Clay__MeasuredWordArray_Get(&context->measuredWords, nextWordIndex);
+                Clay__FreeGraphemeBoundaries(measuredWord->graphemeStartIndex);
                 Clay__int32_tArray_Add(&context->measuredWordsFreeList, nextWordIndex);
                 nextWordIndex = measuredWord->next;
             }
@@ -1715,7 +2216,7 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
     float measuredWidth = 0;
     float measuredHeight = 0;
     float spaceWidth = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) { .length = 1, .chars = CLAY__SPACECHAR.chars, .baseChars = CLAY__SPACECHAR.chars }, config, context->measureTextUserData).width;
-    Clay__MeasuredWord tempWord = { .next = -1 };
+    Clay__MeasuredWord tempWord = { .next = -1, .graphemeStartIndex = -1 };
     Clay__MeasuredWord *previousWord = &tempWord;
     while (end < text->length) {
         if (context->measuredWords.length == context->measuredWords.capacity - 1) {
@@ -1735,18 +2236,20 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
             if (length > 0) {
                 dimensions = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) {.length = length, .chars = &text->chars[start], .baseChars = text->chars}, config, context->measureTextUserData);
             }
-            measured->minWidth = CLAY__MAX(dimensions.width, measured->minWidth);
             measuredHeight = CLAY__MAX(measuredHeight, dimensions.height);
             if (current == ' ') {
                 dimensions.width += spaceWidth;
-                previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = start, .length = length + 1, .width = dimensions.width, .next = -1 }, previousWord);
+                previousWord = Clay__AddMeasuredTextWord(text, config, start, length + 1,
+                    dimensions.width, dimensions.width - spaceWidth, previousWord, &measured->minWidth);
                 lineWidth += dimensions.width;
             }
             if (current == '\n') {
                 if (length > 0) {
-                    previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = start, .length = length, .width = dimensions.width, .next = -1 }, previousWord);
+                    previousWord = Clay__AddMeasuredTextWord(text, config, start, length,
+                        dimensions.width, dimensions.width, previousWord, &measured->minWidth);
                 }
-                previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = end + 1, .length = 0, .width = 0, .next = -1 }, previousWord);
+                previousWord = Clay__AddMeasuredTextWord(text, config, end + 1, 0,
+                    0, 0, previousWord, &measured->minWidth);
                 lineWidth += dimensions.width;
                 measuredWidth = CLAY__MAX(lineWidth, measuredWidth);
                 measured->containsNewlines = true;
@@ -1758,10 +2261,10 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
     }
     if (end - start > 0) {
         Clay_Dimensions dimensions = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) { .length = end - start, .chars = &text->chars[start], .baseChars = text->chars }, config, context->measureTextUserData);
-        Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = start, .length = end - start, .width = dimensions.width, .next = -1 }, previousWord);
+        Clay__AddMeasuredTextWord(text, config, start, end - start, dimensions.width,
+            dimensions.width, previousWord, &measured->minWidth);
         lineWidth += dimensions.width;
         measuredHeight = CLAY__MAX(measuredHeight, dimensions.height);
-        measured->minWidth = CLAY__MAX(dimensions.width, measured->minWidth);
     }
     measuredWidth = CLAY__MAX(lineWidth, measuredWidth) - config->letterSpacing;
 
@@ -2183,13 +2686,14 @@ void Clay__ConfigureOpenElementPtr(const Clay_ElementDeclaration *declaration) {
     if (declaration->transition.handler) {
         Clay__TransitionDataInternal *transitionData = CLAY__NULL;
         Clay_LayoutElement* parentElement = Clay__GetParentElement();
-        for (int32_t i = 0; i < context->transitionDatas.length; i++) {
-            Clay__TransitionDataInternal *existingData = Clay__TransitionDataInternalArray_Get(&context->transitionDatas, i);
-            if (openLayoutElement->id == existingData->elementId) {
-                if (existingData->state == CLAY_TRANSITION_STATE_EXITING) {
-                    existingData->state = CLAY_TRANSITION_STATE_IDLE;
-                    Clay_LayoutElementHashMapItem* hashMapItem = Clay__GetHashMapItem(openLayoutElement->id);
-                    hashMapItem->appearedThisFrame = false;
+            for (int32_t i = 0; i < context->transitionDatas.length; i++) {
+                Clay__TransitionDataInternal *existingData = Clay__TransitionDataInternalArray_Get(&context->transitionDatas, i);
+                if (openLayoutElement->id == existingData->elementId) {
+                    if (existingData->state == CLAY_TRANSITION_STATE_EXITING) {
+                        Clay__RetireExitStringPool(context, existingData);
+                        existingData->state = CLAY_TRANSITION_STATE_IDLE;
+                        Clay_LayoutElementHashMapItem* hashMapItem = Clay__GetHashMapItem(openLayoutElement->id);
+                        hashMapItem->appearedThisFrame = false;
                 }
                 transitionData = existingData;
                 transitionData->elementThisFrame = openLayoutElement;
@@ -2258,6 +2762,8 @@ void Clay__InitializePersistentMemory(Clay_Context* context) {
     context->measuredWordsFreeList = Clay__int32_tArray_Allocate_Arena(maxMeasureTextCacheWordCount, arena);
     context->measureTextHashMap = Clay__int32_tArray_Allocate_Arena(maxElementCount, arena);
     context->measuredWords = Clay__MeasuredWordArray_Allocate_Arena(maxMeasureTextCacheWordCount, arena);
+    context->graphemeBoundaries = Clay__GraphemeBoundaryArray_Allocate_Arena(maxMeasureTextCacheWordCount, arena);
+    context->graphemeBoundariesFreeList = Clay__int32_tArray_Allocate_Arena(maxMeasureTextCacheWordCount, arena);
     context->pointerOverIds = Clay_ElementIdArray_Allocate_Arena(maxElementCount, arena);
     context->arenaResetOffset = arena->nextAllocation;
 }
@@ -2363,7 +2869,10 @@ void Clay__SizeContainersAlongAxis(bool xAxis, float deltaTime, Clay__int32_tArr
 
                 if (childSizing.type != CLAY__SIZING_TYPE_PERCENT
                     && childSizing.type != CLAY__SIZING_TYPE_FIXED
-                    && (!childElement->isTextElement || childElement->textConfig.wrapMode == CLAY_TEXT_WRAP_WORDS)
+                    && (!childElement->isTextElement ||
+                        (xAxis &&
+                         (childElement->textConfig.wrapMode == CLAY_TEXT_WRAP_WORDS ||
+                          childElement->textConfig.wrapMode == CLAY_TEXT_WRAP_WORDS_AND_GRAPHEMES)))
 //                    && (xAxis || !Clay__ElementHasConfig(childElement, CLAY__ELEMENT_CONFIG_TYPE_ASPECT))
                 ) {
                     Clay__int32_tArray_Add(&resizableContainerBuffer, childElementIndex);
@@ -2570,6 +3079,71 @@ bool Clay__ElementIsOffscreen(Clay_BoundingBox *boundingBox) {
            (boundingBox->y + boundingBox->height < 0);
 }
 
+int32_t Clay__WrapWordByGraphemes(Clay_String *text, Clay_TextElementConfig *config,
+    Clay__MeasuredWord *measuredWord, float maxWidth, float lineHeight) {
+    Clay_Context* context = Clay_GetCurrentContext();
+    if (measuredWord->graphemeStartIndex < 0) {
+        return 0;
+    }
+
+    int32_t lineCount = 0;
+    int32_t lineStartOffset = measuredWord->startOffset;
+    int32_t lineEndOffset = lineStartOffset;
+    float lineWidth = 0;
+    int32_t graphemeIndex = measuredWord->graphemeStartIndex;
+    while (graphemeIndex != -1) {
+        Clay__GraphemeBoundaryData *grapheme = Clay__GraphemeBoundaryArray_Get(
+            &context->graphemeBoundaries, graphemeIndex);
+        int32_t candidateEndOffset = grapheme->startOffset + grapheme->length;
+        Clay_Dimensions candidateDimensions = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) {
+            .length = candidateEndOffset - lineStartOffset,
+            .chars = &text->chars[lineStartOffset],
+            .baseChars = text->chars
+        }, config, context->measureTextUserData);
+
+        if (lineEndOffset > lineStartOffset && candidateDimensions.width > maxWidth) {
+            if (context->wrappedTextLines.length >= context->wrappedTextLines.capacity - 1) {
+                return lineCount;
+            }
+            Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) {
+                { lineWidth, lineHeight },
+                { .length = lineEndOffset - lineStartOffset, .chars = &text->chars[lineStartOffset] }
+            });
+            lineCount++;
+            lineStartOffset = lineEndOffset;
+            lineWidth = 0;
+            continue;
+        }
+
+        lineEndOffset = candidateEndOffset;
+        lineWidth = candidateDimensions.width;
+        graphemeIndex = grapheme->next;
+        if (lineWidth > maxWidth) {
+            if (context->wrappedTextLines.length >= context->wrappedTextLines.capacity - 1) {
+                return lineCount;
+            }
+            Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) {
+                { lineWidth, lineHeight },
+                { .length = lineEndOffset - lineStartOffset, .chars = &text->chars[lineStartOffset] }
+            });
+            lineCount++;
+            lineStartOffset = lineEndOffset;
+            lineWidth = 0;
+        }
+    }
+    if (lineEndOffset > lineStartOffset) {
+        if (context->wrappedTextLines.length >= context->wrappedTextLines.capacity - 1) {
+            return lineCount;
+        }
+        Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) {
+            { lineWidth, lineHeight },
+            { .length = lineEndOffset - lineStartOffset, .chars = &text->chars[lineStartOffset] }
+        });
+        lineCount++;
+    }
+    return lineCount;
+}
+
 void Clay__CalculateFinalLayout(float deltaTime, bool useStoredBoundingBoxes, bool generateRenderCommands) {
     Clay_Context* context = Clay_GetCurrentContext();
 
@@ -2603,8 +3177,23 @@ void Clay__CalculateFinalLayout(float deltaTime, bool useStoredBoundingBoxes, bo
                 break;
             }
             Clay__MeasuredWord *measuredWord = Clay__MeasuredWordArray_Get(&context->measuredWords, wordIndex);
+            // Split an oversized word only in the opt-in grapheme mode.
+            if (lineLengthChars == 0 && lineWidth + measuredWord->width > containerElement->dimensions.width &&
+                containerElement->textConfig.wrapMode == CLAY_TEXT_WRAP_WORDS_AND_GRAPHEMES &&
+                measuredWord->graphemeStartIndex >= 0) {
+                textElementData->wrappedLines.length += Clay__WrapWordByGraphemes(
+                    &textElementData->text,
+                    &containerElement->textConfig,
+                    measuredWord,
+                    containerElement->dimensions.width,
+                    lineHeight);
+                wordIndex = measuredWord->next;
+                lineStartOffset = measuredWord->startOffset + measuredWord->length;
+                lineWidth = 0;
+                lineLengthChars = 0;
+            }
             // Only word on the line is too large, just render it anyway
-            if (lineLengthChars == 0 && lineWidth + measuredWord->width > containerElement->dimensions.width) {
+            else if (lineLengthChars == 0 && lineWidth + measuredWord->width > containerElement->dimensions.width) {
                 Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) { { measuredWord->width, lineHeight }, { .length = measuredWord->length, .chars = &textElementData->text.chars[measuredWord->startOffset] } });
                 textElementData->wrappedLines.length++;
                 wordIndex = measuredWord->next;
@@ -3720,6 +4309,8 @@ void Clay__RenderDebugView(void) {
                             wrapMode = CLAY_STRING("NONE");
                         } else if (textConfig->wrapMode == CLAY_TEXT_WRAP_NEWLINES) {
                             wrapMode = CLAY_STRING("NEWLINES");
+                        } else if (textConfig->wrapMode == CLAY_TEXT_WRAP_WORDS_AND_GRAPHEMES) {
+                            wrapMode = CLAY_STRING("WORDS_AND_GRAPHEMES");
                         }
                         CLAY_TEXT(wrapMode, infoTextConfig);
                         // .textAlignment
@@ -4060,6 +4651,12 @@ void Clay_SetMeasureTextFunction(Clay_Dimensions (*measureTextFunction)(Clay_Str
     Clay__MeasureText = measureTextFunction;
     context->measureTextUserData = userData;
 }
+void Clay_SetGraphemeBoundaryFunction(Clay_GraphemeBoundaryProc graphemeBoundaryFunction, void *userData) {
+    Clay_Context* context = Clay_GetCurrentContext();
+    Clay__GraphemeBoundaryFunction = graphemeBoundaryFunction;
+    context->graphemeBoundaryUserData = userData;
+    Clay_ResetMeasureTextCache();
+}
 void Clay_SetQueryScrollOffsetFunction(Clay_Vector2 (*queryScrollOffsetFunction)(uint32_t elementId, void *userData), void *userData) {
     Clay_Context* context = Clay_GetCurrentContext();
     Clay__QueryScrollOffset = queryScrollOffsetFunction;
@@ -4221,6 +4818,16 @@ void Clay_SetCurrentContext(Clay_Context* context) {
     Clay__currentContext = context;
 }
 
+CLAY_WASM_EXPORT("Clay_Deinitialize")
+void Clay_Deinitialize(void) {
+    Clay_Context *context = Clay_GetCurrentContext();
+    if (!context) {
+        return;
+    }
+    Clay__DestroyExitStringPools(context);
+    Clay_SetCurrentContext(NULL);
+}
+
 CLAY_WASM_EXPORT("Clay_GetScrollOffset")
 Clay_Vector2 Clay_GetScrollOffset(void) {
     Clay_Context* context = Clay_GetCurrentContext();
@@ -4354,6 +4961,7 @@ void Clay_UpdateScrollContainers(bool enableDragScrolling, Clay_Vector2 scrollDe
 CLAY_WASM_EXPORT("Clay_BeginLayout")
 void Clay_BeginLayout(void) {
     Clay_Context* context = Clay_GetCurrentContext();
+    Clay__ReleaseRetiredExitStringPools(context);
     Clay__InitializeEphemeralMemory(context);
     context->generation++;
     context->dynamicElementIndex = 0;
@@ -4463,6 +5071,7 @@ Clay_RenderCommandArray Clay_EndLayout(float deltaTime) {
         // Transition element exited and doesn't have an exit handler defined
         // Or, the user deleted the transition handler from one frame to the next
         if (!data->transitionOut && (hashMapItem->generation <= context->generation || !hashMapItem->layoutElement->config.transition.handler)) {
+            Clay__RetireExitStringPool(context, data);
             Clay__TransitionDataInternalArray_RemoveSwapback(&context->transitionDatas, i);
             i--;
             continue;
@@ -4487,6 +5096,11 @@ Clay_RenderCommandArray Clay_EndLayout(float deltaTime) {
                 if (config->exit.trigger == CLAY_TRANSITION_EXIT_TRIGGER_WHEN_PARENT_EXITS || !parentHashMapItem || parentHashMapItem->generation > context->generation) {
                     // This if only runs one single time when the element first starts exiting
                     if (data->state != CLAY_TRANSITION_STATE_EXITING) {
+                        if (!Clay__PrepareExitStringPool(context, data)) {
+                            data->transitionOut = false;
+                            Clay__RetireExitStringPool(context, data);
+                            continue;
+                        }
                         if (parentHashMapItem->generation <= context->generation) {
                             data->elementThisFrame->config.floating.attachTo = CLAY_ATTACH_TO_ROOT;
                             data->elementThisFrame->config.floating.offset = CLAY__INIT(Clay_Vector2) { hashMapItem->boundingBox.x, hashMapItem->boundingBox.y };
@@ -4584,6 +5198,7 @@ Clay_RenderCommandArray Clay_EndLayout(float deltaTime) {
                     }
                 // Parent exited, just delete child without exit transition
                 } else {
+                    Clay__RetireExitStringPool(context, data);
                     Clay__TransitionDataInternalArray_RemoveSwapback(&context->transitionDatas, i);
                     i--;
                     continue;
@@ -4595,6 +5210,8 @@ Clay_RenderCommandArray Clay_EndLayout(float deltaTime) {
     for (int i = 0; i < elementIdsToRemoveTransitions.length; ++i) {
         for (int j = 0; j < context->transitionDatas.length; ++j) {
             if (Clay__TransitionDataInternalArray_Get(&context->transitionDatas, j)->elementId == Clay__int32_tArray_GetValue(&elementIdsToRemoveTransitions, i)) {
+                Clay__RetireExitStringPool(context,
+                    Clay__TransitionDataInternalArray_Get(&context->transitionDatas, j));
                 Clay__TransitionDataInternalArray_RemoveSwapback(&context->transitionDatas, j);
                 break;
             }
@@ -4737,6 +5354,7 @@ Clay_RenderCommandArray Clay_EndLayout(float deltaTime) {
                                 transitionData->reparented = false;
                                 transitionData->activeProperties = CLAY_TRANSITION_PROPERTY_NONE;
                             } else if (transitionData->state == CLAY_TRANSITION_STATE_EXITING) {
+                                Clay__RetireExitStringPool(context, transitionData);
                                 Clay__TransitionDataInternalArray_RemoveSwapback(&context->transitionDatas, i);
                             }
                         }
@@ -4965,6 +5583,8 @@ void Clay_ResetMeasureTextCache(void) {
     context->measureTextHashMap.length = 0;
     context->measuredWords.length = 0;
     context->measuredWordsFreeList.length = 0;
+    context->graphemeBoundaries.length = 0;
+    context->graphemeBoundariesFreeList.length = 0;
 
     for (int32_t i = 0; i < context->measureTextHashMap.capacity; ++i) {
         context->measureTextHashMap.internalArray[i] = 0;

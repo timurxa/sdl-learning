@@ -4,6 +4,7 @@ import std/os
 import std/tables
 import clay, sdl
 import freetype, harfbuzz
+import utf8proc
 
 type
   QuadVertex = object
@@ -1125,14 +1126,17 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
     padding = padding_all(6),
     child_gap = 3,
     layout_direction = clay_top_to_bottom)
+  let vertical_panel_clip = ClayClipElementConfig(vertical: true)
   let debug_panel_a_declaration = declaration(
     layout = debug_panel_layout,
+    clip = vertical_panel_clip,
     background_color = palette_color(palette.pink),
     border = ClayBorderElementConfig(
       color: palette_color(palette.ink), width: border_outside(3)),
     transition = debug_transition)
   let debug_panel_b_declaration = declaration(
     layout = debug_panel_layout,
+    clip = vertical_panel_clip,
     background_color = palette_color(palette.mint),
     border = ClayBorderElementConfig(
       color: palette_color(palette.ink), width: border_outside(3)),
@@ -1206,6 +1210,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
           padding = padding_all(10)
           child_gap = 12
           layout_direction = clay_left_to_right
+        clip:
+          vertical = true
         background_color = palette_color(palette.paper)
         border:
           color = palette_color(palette.ink)
@@ -1215,10 +1221,12 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
           layout:
             sizing:
               width = fixed(70)
-              height = grow()
+              height = fixed(46)
             child_alignment:
               x = clay_align_x_center
               y = clay_align_y_center
+          clip:
+            vertical = true
           background_color = palette_color(palette.pink)
           border:
             color = palette_color(palette.ink)
@@ -1226,7 +1234,7 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
           text("NB/01"):
             font_size = 16
             text_color = palette_color(palette.ink)
-            wrap_mode = clay_text_wrap_none
+            wrap_mode = clay_text_wrap_words_and_graphemes
 
         element("title"):
           layout:
@@ -1238,14 +1246,16 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
             child_gap = 3
             child_alignment:
               y = clay_align_y_center
+          clip:
+            vertical = true
           text("NEO BRUTAL STACK"):
             font_size = 19
             text_color = palette_color(palette.ink)
-            wrap_mode = clay_text_wrap_none
+            wrap_mode = clay_text_wrap_words_and_graphemes
           text("HARD EDGES / DEEP LAYERS"):
             font_size = 10
             text_color = palette_color(palette.ink)
-            wrap_mode = clay_text_wrap_none
+            wrap_mode = clay_text_wrap_words_and_graphemes
 
         element("status"):
           layout:
@@ -1257,6 +1267,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
             layout_direction = clay_top_to_bottom
             child_alignment:
               x = clay_align_x_center
+          clip:
+            vertical = true
           background_color = palette_color(palette.mint)
           border:
             color = palette_color(palette.ink)
@@ -1264,7 +1276,7 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
           text("STATUS: LIVE"):
             font_size = 10
             text_color = palette_color(palette.ink)
-            wrap_mode = clay_text_wrap_none
+            wrap_mode = clay_text_wrap_words_and_graphemes
           element("status_bar"):
             layout:
               sizing:
@@ -1288,6 +1300,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
             padding = padding_all(10)
             child_gap = 8
             layout_direction = clay_top_to_bottom
+          clip:
+            vertical = true
           background_color = palette_color(palette.yellow)
           border:
             color = palette_color(palette.ink)
@@ -1295,7 +1309,7 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
           text("INDEX // 08"):
             font_size = 13
             text_color = palette_color(palette.ink)
-            wrap_mode = clay_text_wrap_none
+            wrap_mode = clay_text_wrap_words_and_graphemes
           for index in 0 ..< 8:
             element(clay_id_with_index("nav_item", uint32(index))):
               layout:
@@ -1304,6 +1318,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                   height = fixed(28)
                 padding = padding_all(6)
                 layout_direction = clay_left_to_right
+              clip:
+                vertical = true
               background_color = if index == 0:
                 palette_color(palette.pink)
               else:
@@ -1314,7 +1330,7 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
               text(nav_labels[index]):
                 font_size = 10
                 text_color = palette_color(palette.ink)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
 
         element("workbench"):
           layout:
@@ -1324,6 +1340,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
             padding = padding_all(12)
             child_gap = 10
             layout_direction = clay_top_to_bottom
+          clip:
+            vertical = true
           background_color = palette_color(palette.blue)
           border:
             color = palette_color(palette.ink)
@@ -1332,7 +1350,7 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
           text("FLOATING BOX STUDY"):
             font_size = 13
             text_color = palette_color(palette.paper)
-            wrap_mode = clay_text_wrap_none
+            wrap_mode = clay_text_wrap_words_and_graphemes
 
           element("string_pool_debug"):
             layout:
@@ -1342,6 +1360,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
               padding = padding_all(8)
               child_gap = 5
               layout_direction = clay_top_to_bottom
+            clip:
+              vertical = true
             background_color = palette_color(palette.yellow)
             border:
               color = palette_color(palette.ink)
@@ -1349,13 +1369,13 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
             text("STRING POOL / EXIT CYCLE"):
               font_size = 11
               text_color = palette_color(palette.ink)
-              wrap_mode = clay_text_wrap_none
+              wrap_mode = clay_text_wrap_words_and_graphemes
             text("GEN " & $clay_string_cache_current_generation(clay_string_cache) &
               " / LIVE " & $clay_string_cache_generation_count(clay_string_cache) &
               " / EXIT " & $clay_has_exiting_transitions()):
               font_size = 9
               text_color = palette_color(palette.ink)
-              wrap_mode = clay_text_wrap_none
+              wrap_mode = clay_text_wrap_words_and_graphemes
             element("debug_slots"):
               layout:
                 sizing:
@@ -1368,47 +1388,49 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                   text("PANEL B // " & $debug_cycle_frame):
                     font_size = 10
                     text_color = palette_color(palette.ink)
-                    wrap_mode = clay_text_wrap_none
+                    wrap_mode = clay_text_wrap_words_and_graphemes
                   text("DYNAMIC / STABLE POINTER"):
                     font_size = 8
                     text_color = palette_color(palette.ink)
-                    wrap_mode = clay_text_wrap_none
+                    wrap_mode = clay_text_wrap_words_and_graphemes
                 if debug_show_panel_a:
                   element("debug_panel_a", debug_panel_a_declaration):
                     text("PANEL A // " & $debug_cycle_frame):
                       font_size = 10
                       text_color = palette_color(palette.ink)
-                      wrap_mode = clay_text_wrap_none
+                      wrap_mode = clay_text_wrap_words_and_graphemes
                     text("EXIT / RE-ENTER TEST"):
                       font_size = 8
                       text_color = palette_color(palette.ink)
-                      wrap_mode = clay_text_wrap_none
+                      wrap_mode = clay_text_wrap_words_and_graphemes
               else:
                 if debug_show_panel_a:
                   element("debug_panel_a", debug_panel_a_declaration):
                     text("PANEL A // " & $debug_cycle_frame):
                       font_size = 10
                       text_color = palette_color(palette.ink)
-                      wrap_mode = clay_text_wrap_none
+                      wrap_mode = clay_text_wrap_words_and_graphemes
                     text("EXIT / RE-ENTER TEST"):
                       font_size = 8
                       text_color = palette_color(palette.ink)
-                      wrap_mode = clay_text_wrap_none
+                      wrap_mode = clay_text_wrap_words_and_graphemes
                 element("debug_panel_b", debug_panel_b_declaration):
                   text("PANEL B // " & $debug_cycle_frame):
                     font_size = 10
                     text_color = palette_color(palette.ink)
-                    wrap_mode = clay_text_wrap_none
+                    wrap_mode = clay_text_wrap_words_and_graphemes
                   text("DYNAMIC / STABLE POINTER"):
                     font_size = 8
                     text_color = palette_color(palette.ink)
-                    wrap_mode = clay_text_wrap_none
+                    wrap_mode = clay_text_wrap_words_and_graphemes
 
           element("stage"):
             layout:
               sizing:
                 width = grow()
                 height = grow()
+            clip:
+              vertical = true
             background_color = palette_color(palette.paper)
             border:
               color = palette_color(palette.ink)
@@ -1422,6 +1444,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                 padding = padding_all(12)
                 child_gap = 8
                 layout_direction = clay_top_to_bottom
+              clip:
+                vertical = true
               background_color = palette_color(palette.purple)
               border:
                 color = palette_color(palette.ink)
@@ -1429,7 +1453,7 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
               text("LAYER 0 / BACKPLATE"):
                 font_size = 12
                 text_color = palette_color(palette.ink)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
               element("base_row"):
                 layout:
                   sizing:
@@ -1445,6 +1469,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                     padding = padding_all(8)
                     layout_direction = clay_top_to_bottom
                     child_gap = 6
+                  clip:
+                    vertical = true
                   background_color = palette_color(palette.yellow)
                   border:
                     color = palette_color(palette.ink)
@@ -1452,11 +1478,11 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                   text("STATIC BOX"):
                     font_size = 11
                     text_color = palette_color(palette.ink)
-                    wrap_mode = clay_text_wrap_none
+                    wrap_mode = clay_text_wrap_words_and_graphemes
                   text("WAITING FOR IMPACT"):
                     font_size = 10
                     text_color = palette_color(palette.ink)
-                    wrap_mode = clay_text_wrap_none
+                    wrap_mode = clay_text_wrap_words_and_graphemes
                 element("base_right"):
                   layout:
                     sizing:
@@ -1465,6 +1491,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                     padding = padding_all(8)
                     layout_direction = clay_top_to_bottom
                     child_gap = 6
+                  clip:
+                    vertical = true
                   background_color = palette_color(palette.mint)
                   border:
                     color = palette_color(palette.ink)
@@ -1472,11 +1500,15 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                   text("DEPTH MAP"):
                     font_size = 11
                     text_color = palette_color(palette.ink)
-                    wrap_mode = clay_text_wrap_none
+                    wrap_mode = clay_text_wrap_words_and_graphemes
+                  text("supercalifragilisticexpialidocioussupercalifragilisticexpialidocioussupercalifragilisticexpialidocious"):
+                    font_size = 10
+                    text_color = palette_color(palette.ink)
+                    wrap_mode = clay_text_wrap_words_and_graphemes
                   text("0 / 1 / 2 / 3 / 4"):
                     font_size = 10
                     text_color = palette_color(palette.ink)
-                    wrap_mode = clay_text_wrap_none
+                    wrap_mode = clay_text_wrap_words_and_graphemes
 
             element("float_yellow"):
               layout:
@@ -1486,6 +1518,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                 padding = padding_all(10)
                 child_gap = 5
                 layout_direction = clay_top_to_bottom
+              clip:
+                vertical = true
               background_color = palette_color(palette.yellow)
               border:
                 color = palette_color(palette.ink)
@@ -1502,15 +1536,15 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
               text("LAYER 1"):
                 font_size = 12
                 text_color = palette_color(palette.ink)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
               text("YELLOW / FRONT LEFT"):
                 font_size = 16
                 text_color = palette_color(palette.ink)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
               text("OFFSET +018 / +018"):
                 font_size = 10
                 text_color = palette_color(palette.ink)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
               element("yellow_strip"):
                 layout:
                   sizing:
@@ -1526,6 +1560,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                 padding = padding_all(10)
                 child_gap = 5
                 layout_direction = clay_top_to_bottom
+              clip:
+                vertical = true
               background_color = palette_color(palette.blue)
               border:
                 color = palette_color(palette.ink)
@@ -1542,15 +1578,15 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
               text("LAYER 2"):
                 font_size = 12
                 text_color = palette_color(palette.paper)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
               text("BLUE / OVERLAP"):
                 font_size = 16
                 text_color = palette_color(palette.paper)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
               text("Z-INDEX 002"):
                 font_size = 10
                 text_color = palette_color(palette.paper)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
               element("blue_strip"):
                 layout:
                   sizing:
@@ -1566,6 +1602,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                 padding = padding_all(10)
                 child_gap = 5
                 layout_direction = clay_top_to_bottom
+              clip:
+                vertical = true
               background_color = palette_color(palette.pink)
               border:
                 color = palette_color(palette.ink)
@@ -1582,15 +1620,15 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
               text("LAYER 3"):
                 font_size = 12
                 text_color = palette_color(palette.ink)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
               text("PINK / CROSSOVER"):
                 font_size = 15
                 text_color = palette_color(palette.ink)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
               text("Z-INDEX 003"):
                 font_size = 10
                 text_color = palette_color(palette.ink)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
               element("pink_tag"):
                 layout:
                   sizing:
@@ -1600,6 +1638,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                   child_alignment:
                     x = clay_align_x_center
                     y = clay_align_y_center
+                clip:
+                  vertical = true
                 background_color = palette_color(palette.ink)
                 floating:
                   offset = vector2(10, -14)
@@ -1613,7 +1653,7 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                 text("LEVEL 5"):
                   font_size = 10
                   text_color = palette_color(palette.paper)
-                  wrap_mode = clay_text_wrap_none
+                  wrap_mode = clay_text_wrap_words_and_graphemes
 
             element("float_mint"):
               layout:
@@ -1623,6 +1663,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
                 padding = padding_all(10)
                 child_gap = 5
                 layout_direction = clay_top_to_bottom
+              clip:
+                vertical = true
               background_color = palette_color(palette.mint)
               border:
                 color = palette_color(palette.ink)
@@ -1639,15 +1681,15 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
               text("LAYER 4"):
                 font_size = 12
                 text_color = palette_color(palette.ink)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
               text("MINT / LAST WORD"):
                 font_size = 13
                 text_color = palette_color(palette.ink)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
               text("Z-INDEX 004"):
                 font_size = 10
                 text_color = palette_color(palette.ink)
-                wrap_mode = clay_text_wrap_none
+                wrap_mode = clay_text_wrap_words_and_graphemes
 
       element("footer"):
         layout:
@@ -1659,6 +1701,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
           layout_direction = clay_left_to_right
           child_alignment:
             y = clay_align_y_center
+        clip:
+          vertical = true
         background_color = palette_color(palette.ink)
         border:
           color = palette_color(palette.ink)
@@ -1666,7 +1710,7 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
         text("CLAY / FLOATING / 60 FPS"):
           font_size = 10
           text_color = palette_color(palette.paper)
-          wrap_mode = clay_text_wrap_none
+          wrap_mode = clay_text_wrap_words_and_graphemes
         element("footer_pink"):
           layout:
             sizing:
@@ -1675,6 +1719,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
             child_alignment:
               x = clay_align_x_center
               y = clay_align_y_center
+          clip:
+            vertical = true
           background_color = palette_color(palette.pink)
           border:
             color = palette_color(palette.paper)
@@ -1682,7 +1728,7 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
           text("Z: 005"):
             font_size = 9
             text_color = palette_color(palette.ink)
-            wrap_mode = clay_text_wrap_none
+            wrap_mode = clay_text_wrap_words_and_graphemes
         element("footer_yellow"):
           layout:
             sizing:
@@ -1691,6 +1737,8 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
             child_alignment:
               x = clay_align_x_center
               y = clay_align_y_center
+          clip:
+            vertical = true
           background_color = palette_color(palette.yellow)
           border:
             color = palette_color(palette.paper)
@@ -1698,7 +1746,7 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
           text("NO ROUNDED CORNERS"):
             font_size = 8
             text_color = palette_color(palette.ink)
-            wrap_mode = clay_text_wrap_none
+            wrap_mode = clay_text_wrap_words_and_graphemes
 
   instance_data.setLen(0)
   text_instance_data.setLen(0)
@@ -2084,6 +2132,7 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
 proc sdl_app_quit(appstate: pointer; result: SdlAppResult) {.cdecl.} =
   discard appstate
   discard result
+  clay_deinitialize()
   clay_string_cache_deinit(clay_string_cache)
   destroy_font()
   deinit_glyph_atlas()
@@ -2113,6 +2162,7 @@ proc main() =
   discard clay_initialize(clay_arena, clay_dimensions(640, 480), ClayErrorHandler(
     error_handler_function: handle_error, user_data: nil))
   clay_set_measure_text_function(measure_text, nil)
+  clay_set_grapheme_boundary_function(utf8proc_next_grapheme_boundary, nil)
 
   discard run_app(0, nil, run_app_callbacks, nil)
 

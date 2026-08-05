@@ -8,6 +8,11 @@ proc measure_text(text: ClayStringSlice; config: ptr ClayTextElementConfig;
   ClayDimensions(width: cfloat(text.length * int32(config[].font_size)),
     height: cfloat(config[].font_size))
 
+proc next_grapheme_boundary(text: ClayStringSlice; offset: int32;
+    user_data: pointer): int32 {.cdecl.} =
+  discard user_data
+  if offset < text.length: offset + 1 else: text.length
+
 proc handle_error(error_data: ClayErrorData) {.cdecl.} =
   discard error_data
 
@@ -48,7 +53,7 @@ proc build_layout(): ClayRenderCommandArray =
           font_id = 0
           font_size = 24
           text_color = clay_color(255, 255, 255, 255)
-          wrap_mode = clay_text_wrap_none
+          wrap_mode = clay_text_wrap_words_and_graphemes
           text_alignment = clay_text_align_center
 
       for index in 0 ..< 4:
@@ -155,6 +160,7 @@ proc compile_public_api() =
   discard clay_get_pointer_over_ids()
   discard clay_get_scroll_container_data(clay_id("root"))
   clay_set_measure_text_function(measure_text, nil)
+  clay_set_grapheme_boundary_function(next_grapheme_boundary, nil)
   clay_set_query_scroll_offset_function(proc(element_id: uint32; user_data: pointer): ClayVector2 {.cdecl.} =
     (discard user_data; clay_vector2(element_id, 0)), nil)
   clay_set_debug_mode_enabled(true)
@@ -167,6 +173,7 @@ proc compile_public_api() =
   clay_reset_measure_text_cache()
   clay_on_hover(nil, nil)
   discard clay_ease_out(ClayTransitionCallbackArguments())
+  clay_deinitialize()
 
 proc compile_render_union(command: var ClayRenderCommand) =
   command.command_type = clay_render_command_type_rectangle

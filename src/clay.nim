@@ -38,6 +38,9 @@ type
     chars*: cstring
     base_chars* {.importc: "baseChars".}: cstring
 
+  ClayGraphemeBoundaryProc* = proc(text: ClayStringSlice; offset: int32;
+      user_data: pointer): int32 {.cdecl.}
+
   ClayContext* {.importc: "Clay_Context", incompleteStruct, header: "clay.h".} = object
 
   ClayArena* {.importc: "Clay_Arena", header: "clay.h".} = object
@@ -362,6 +365,7 @@ const
   clay_text_wrap_words* = ClayTextElementConfigWrapMode(0)
   clay_text_wrap_newlines* = ClayTextElementConfigWrapMode(1)
   clay_text_wrap_none* = ClayTextElementConfigWrapMode(2)
+  clay_text_wrap_words_and_graphemes* = ClayTextElementConfigWrapMode(3)
 
   clay_text_align_left* = ClayTextAlignment(0)
   clay_text_align_center* = ClayTextAlignment(1)
@@ -444,6 +448,8 @@ const
   clay_error_type_internal_error* = ClayErrorType(7)
   clay_error_type_unbalanced_open_close* = ClayErrorType(8)
   clay_error_type_hash_map_capacity_exceeded* = ClayErrorType(9)
+  clay_error_type_grapheme_boundary_function_not_provided* = ClayErrorType(10)
+  clay_error_type_grapheme_boundary_function_invalid* = ClayErrorType(11)
 
 var clay_layout_default* {.importc: "CLAY_LAYOUT_DEFAULT", header: "clay.h".}: ClayLayoutConfig
 
@@ -458,6 +464,8 @@ proc clay_get_pointer_state*(): ClayPointerData
 proc clay_initialize*(arena: ClayArena; layout_dimensions: ClayDimensions;
     error_handler: ClayErrorHandler): ptr ClayContext
   {.importc: "Clay_Initialize", header: "clay.h".}
+proc clay_deinitialize*()
+  {.importc: "Clay_Deinitialize", header: "clay.h".}
 proc clay_get_current_context*(): ptr ClayContext
   {.importc: "Clay_GetCurrentContext", header: "clay.h".}
 proc clay_set_current_context*(context: ptr ClayContext)
@@ -496,6 +504,9 @@ proc clay_get_scroll_container_data*(id: ClayElementId): ClayScrollContainerData
   {.importc: "Clay_GetScrollContainerData", header: "clay.h".}
 proc clay_set_measure_text_function*(measure_text_function: ClayMeasureTextProc; user_data: pointer)
   {.importc: "Clay_SetMeasureTextFunction", header: "clay.h".}
+proc clay_set_grapheme_boundary_function*(grapheme_boundary_function: ClayGraphemeBoundaryProc;
+    user_data: pointer)
+  {.importc: "Clay_SetGraphemeBoundaryFunction", header: "clay.h".}
 proc clay_set_query_scroll_offset_function*(query_scroll_offset_function: ClayQueryScrollOffsetProc;
     user_data: pointer) {.importc: "Clay_SetQueryScrollOffsetFunction", header: "clay.h".}
 proc clay_render_command_array_get*(array: ptr ClayRenderCommandArray; index: int32): ptr ClayRenderCommand
@@ -545,21 +556,14 @@ proc clay_string_cache_retain_latest(cache: var ClayStringCache) =
   if cache.generations.len <= 1:
     return
 
-  let retained_generation = cache.generations[^1]
   let reclaimed_count = cache.generations.len - 1
+  swap(cache.generations[0], cache.generations[^1])
   cache.generations.setLen(1)
-  cache.generations[0] = retained_generation
   if reclaimed_count > 1:
     echo "Clay string cache: reclaimed ", reclaimed_count, " generations"
 
 proc clay_string_cache_begin*(cache: var ClayStringCache) =
-  let has_exiting_transitions = clay_has_exiting_transitions()
-  if has_exiting_transitions != cache.last_exiting_transitions:
-    echo "Clay string cache: exiting transitions = ", has_exiting_transitions
-    cache.last_exiting_transitions = has_exiting_transitions
-
-  if not has_exiting_transitions:
-    clay_string_cache_retain_latest(cache)
+  clay_string_cache_retain_latest(cache)
   clay_string_cache_add_generation(cache)
   clay_active_string_cache = addr cache
 
