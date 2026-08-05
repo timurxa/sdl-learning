@@ -21,13 +21,14 @@ struct main0_in
     uint2 in_var_TEXCOORD1 [[attribute(1)]];
     uint2 in_var_TEXCOORD2 [[attribute(2)]];
     uint4 in_var_TEXCOORD3 [[attribute(3)]];
+    float in_var_TEXCOORD4 [[attribute(4)]];
 };
 
 vertex main0_out main0(main0_in in [[stage_in]], constant type_FrameData& FrameData [[buffer(0)]])
 {
     main0_out out = {};
-    float2 _40 = float2(in.in_var_TEXCOORD1) + (in.in_var_TEXCOORD0 * float2(in.in_var_TEXCOORD2));
-    out.gl_Position = float4((_40.x * (2.0 * FrameData.inverse_viewport_size.x)) - 1.0, 1.0 - (_40.y * (2.0 * FrameData.inverse_viewport_size.y)), 0.0, 1.0);
+    float2 _42 = float2(in.in_var_TEXCOORD1) + (in.in_var_TEXCOORD0 * float2(in.in_var_TEXCOORD2));
+    out.gl_Position = float4((_42.x * (2.0 * FrameData.inverse_viewport_size.x)) - 1.0, 1.0 - (_42.y * (2.0 * FrameData.inverse_viewport_size.y)), in.in_var_TEXCOORD4, 1.0);
     out.out_var_TEXCOORD0 = float4(in.in_var_TEXCOORD3) * float4(0.0039215688593685626983642578125);
     return out;
 }

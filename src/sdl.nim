@@ -78,6 +78,7 @@ const
   sdl_gpu_sample_count_2* = SdlGpuSampleCount(1)
   sdl_gpu_sample_count_4* = SdlGpuSampleCount(2)
   sdl_gpu_sample_count_8* = SdlGpuSampleCount(3)
+  sdl_gpu_texture_usage_depth_stencil_target* = SdlGpuTextureUsageFlags(1'u32 shl 2)
   sdl_gpu_buffer_usage_vertex* = SdlGpuBufferUsageFlags(1'u32 shl 0)
   sdl_gpu_transfer_buffer_usage_upload* = SdlGpuTransferBufferUsage(0)
   sdl_gpu_transfer_buffer_usage_download* = SdlGpuTransferBufferUsage(1)

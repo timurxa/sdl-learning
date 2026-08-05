@@ -9,6 +9,7 @@ type
     origin: array[2, uint16]
     size: array[2, uint16]
     color: array[4, uint8]
+    depth: float32
   Rect = object
     x, w, y, h: float32
   FrameData = object
@@ -34,30 +35,32 @@ const
   metric_labels = ["REQUESTS", "SUCCESS RATE", "LATENCY"]
   metric_values = ["24.8K", "98.7%", "142 MS"]
 
-doAssert sizeof(SpriteInstance) == 12
+doAssert sizeof(SpriteInstance) == 16
 
 static:
   discard staticExec("mkdir -p " & quoteShell(shader_output_dir))
-  discard staticExec("shadercross " & quoteShell(shader_source_dir / "analytic.vert.hlsl") &
+  discard staticExec("shadercross " & quoteShell(shader_source_dir / "opaque.vert.hlsl") &
     " -s HLSL -d MSL -t vertex -o " &
-    quoteShell(shader_output_dir / "analytic.vert.msl"))
-  discard staticExec("shadercross " & quoteShell(shader_source_dir / "analytic.frag.hlsl") &
+    quoteShell(shader_output_dir / "opaque.vert.msl"))
+  discard staticExec("shadercross " & quoteShell(shader_source_dir / "opaque.frag.hlsl") &
     " -s HLSL -d MSL -t fragment -o " &
-    quoteShell(shader_output_dir / "analytic.frag.msl"))
+    quoteShell(shader_output_dir / "opaque.frag.msl"))
 
 const
-  analytic_vertex_shader_code = staticRead(
-    project_dir / "shaders" / "compiled" / "analytic.vert.msl"
+  opaque_vertex_shader_code = staticRead(
+    project_dir / "shaders" / "compiled" / "opaque.vert.msl"
   )
-  analytic_fragment_shader_code = staticRead(
-    project_dir / "shaders" / "compiled" / "analytic.frag.msl"
+  opaque_fragment_shader_code = staticRead(
+    project_dir / "shaders" / "compiled" / "opaque.frag.msl"
   )
 
 var
   window: ptr SdlWindow
 
   gpu_device: ptr SdlGpuDevice
-  analytic_pipeline: ptr SdlGpuGraphicsPipeline
+  opaque_pipeline: ptr SdlGpuGraphicsPipeline
+  depth_texture: ptr SdlGpuTexture
+  depth_texture_width, depth_texture_height: uint32
   quad_vertex_buffer: ptr SdlGpuBuffer
   instance_buffer: ptr SdlGpuBuffer
   instance_transfer_buffer: ptr SdlGpuTransferBuffer
@@ -112,37 +115,37 @@ proc sdl_app_init(appstate: ptr pointer; argc: cint; argv: ptr ptr char): SdlApp
   if not set_gpu_allowed_frames_in_flight(gpu_device, 1):
     return app_failure
 
-  let analytic_color_target_format =
+  let opaque_color_target_format =
     get_gpu_swapchain_texture_format(gpu_device, window)
 
-  var analytic_vertex_shader_create_info = SdlGpuShaderCreateInfo(
-    code_size: csize_t(analytic_vertex_shader_code.len),
-    code: cast[ptr uint8](cstring(analytic_vertex_shader_code)),
+  var opaque_vertex_shader_create_info = SdlGpuShaderCreateInfo(
+    code_size: csize_t(opaque_vertex_shader_code.len),
+    code: cast[ptr uint8](cstring(opaque_vertex_shader_code)),
     entrypoint: "main0",
     format: sdl_gpu_shader_format_msl,
     stage: sdl_gpu_shader_stage_vertex,
     num_uniform_buffers: 1,
   )
   
-  var analytic_vertex_shader =
-    create_gpu_shader(gpu_device, addr analytic_vertex_shader_create_info)
+  var opaque_vertex_shader =
+    create_gpu_shader(gpu_device, addr opaque_vertex_shader_create_info)
   defer:
-    release_gpu_shader(gpu_device, analytic_vertex_shader)
+    release_gpu_shader(gpu_device, opaque_vertex_shader)
   
-  var analytic_fragment_shader_create_info = SdlGpuShaderCreateInfo(
-    code_size: csize_t(analytic_fragment_shader_code.len),
-    code: cast[ptr uint8](cstring(analytic_fragment_shader_code)),
+  var opaque_fragment_shader_create_info = SdlGpuShaderCreateInfo(
+    code_size: csize_t(opaque_fragment_shader_code.len),
+    code: cast[ptr uint8](cstring(opaque_fragment_shader_code)),
     entrypoint: "main0",
     format: sdl_gpu_shader_format_msl,
     stage: sdl_gpu_shader_stage_fragment,
   )
   
-  var analytic_fragment_shader =
-    create_gpu_shader(gpu_device, addr analytic_fragment_shader_create_info)
+  var opaque_fragment_shader =
+    create_gpu_shader(gpu_device, addr opaque_fragment_shader_create_info)
   defer:
-    release_gpu_shader(gpu_device, analytic_fragment_shader)
+    release_gpu_shader(gpu_device, opaque_fragment_shader)
   
-  var analytic_vertex_buffer_descriptions = [
+  var opaque_vertex_buffer_descriptions = [
     SdlGpuVertexBufferDescription(
       slot: 0,
       pitch: uint32(sizeof(QuadVertex)),
@@ -157,7 +160,7 @@ proc sdl_app_init(appstate: ptr pointer; argc: cint; argv: ptr ptr char): SdlApp
     ),
   ]
   
-  var analytic_vertex_attributes = [
+  var opaque_vertex_attributes = [
     SdlGpuVertexAttribute(
       location: 0,
       buffer_slot: 0,
@@ -182,10 +185,16 @@ proc sdl_app_init(appstate: ptr pointer; argc: cint; argv: ptr ptr char): SdlApp
       format: sdl_gpu_vertex_element_format_ubyte4,
       offset: uint32(offsetOf(SpriteInstance, color)),
     ),
+    SdlGpuVertexAttribute(
+      location: 4,
+      buffer_slot: 1,
+      format: sdl_gpu_vertex_element_format_float,
+      offset: uint32(offsetOf(SpriteInstance, depth)),
+    ),
   ]
   
-  var analytic_color_target_description = SdlGpuColorTargetDescription(
-    format: analytic_color_target_format,
+  var opaque_color_target_description = SdlGpuColorTargetDescription(
+    format: opaque_color_target_format,
     blend_state: SdlGpuColorTargetBlendState(
       # Straight-alpha blending.
       src_color_blendfactor: sdl_gpu_blend_factor_src_alpha,
@@ -200,15 +209,15 @@ proc sdl_app_init(appstate: ptr pointer; argc: cint; argv: ptr ptr char): SdlApp
     ),
   )
   
-  var analytic_pipeline_create_info = SdlGpuGraphicsPipelineCreateInfo(
-    vertex_shader: analytic_vertex_shader,
-    fragment_shader: analytic_fragment_shader,
+  var opaque_pipeline_create_info = SdlGpuGraphicsPipelineCreateInfo(
+    vertex_shader: opaque_vertex_shader,
+    fragment_shader: opaque_fragment_shader,
   
     vertex_input_state: SdlGpuVertexInputState(
-      vertex_buffer_descriptions: addr analytic_vertex_buffer_descriptions[0],
-      num_vertex_buffers: uint32(analytic_vertex_buffer_descriptions.len),
-      vertex_attributes: addr analytic_vertex_attributes[0],
-      num_vertex_attributes: uint32(analytic_vertex_attributes.len),
+      vertex_buffer_descriptions: addr opaque_vertex_buffer_descriptions[0],
+      num_vertex_buffers: uint32(opaque_vertex_buffer_descriptions.len),
+      vertex_attributes: addr opaque_vertex_attributes[0],
+      num_vertex_attributes: uint32(opaque_vertex_attributes.len),
     ),
   
     primitive_type: sdl_gpu_primitive_type_triangle_list,
@@ -225,7 +234,7 @@ proc sdl_app_init(appstate: ptr pointer; argc: cint; argv: ptr ptr char): SdlApp
     ),
   
     depth_stencil_state: SdlGpuDepthStencilState(
-      compare_op: sdl_gpu_compare_op_always,
+      compare_op: sdl_gpu_compare_op_less,
   
       back_stencil_state: SdlGpuStencilOpState(
         fail_op: sdl_gpu_stencil_op_keep,
@@ -243,20 +252,20 @@ proc sdl_app_init(appstate: ptr pointer; argc: cint; argv: ptr ptr char): SdlApp
   
       compare_mask: 0xff,
       write_mask: 0xff,
-      enable_depth_test: false,
-      enable_depth_write: false,
+      enable_depth_test: true,
+      enable_depth_write: true,
       enable_stencil_test: false,
     ),
   
     target_info: SdlGpuGraphicsPipelineTargetInfo(
-      color_target_descriptions: addr analytic_color_target_description,
+      color_target_descriptions: addr opaque_color_target_description,
       num_color_targets: 1,
-      depth_stencil_format: sdl_gpu_texture_format_invalid,
-      has_depth_stencil_target: false,
+      depth_stencil_format: sdl_gpu_texture_format_d16_unorm,
+      has_depth_stencil_target: true,
     ),
   )
 
-  analytic_pipeline = create_gpu_graphics_pipeline(gpu_device, addr analytic_pipeline_create_info)
+  opaque_pipeline = create_gpu_graphics_pipeline(gpu_device, addr opaque_pipeline_create_info)
 
   instance_buffer_capacity = uint32(clay_get_max_element_count())
   instance_data = newSeqOfCap[SpriteInstance](int(instance_buffer_capacity))
@@ -283,7 +292,7 @@ proc sdl_app_init(appstate: ptr pointer; argc: cint; argv: ptr ptr char): SdlApp
     addr instance_transfer_buffer_create_info,
   )
 
-  if analytic_pipeline == nil or quad_vertex_buffer == nil or
+  if opaque_pipeline == nil or quad_vertex_buffer == nil or
       instance_buffer == nil or instance_transfer_buffer == nil:
     return app_failure
 
@@ -321,6 +330,29 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
     return app_failure
   if swapchain_texture == nil:
     return app_continue
+
+  if depth_texture == nil or depth_texture_width != width or depth_texture_height != height:
+    if depth_texture != nil:
+      if not wait_for_gpu_idle(gpu_device):
+        return app_failure
+      release_gpu_texture(gpu_device, depth_texture)
+      depth_texture = nil
+
+    var depth_texture_create_info = SdlGpuTextureCreateInfo(
+      `type`: sdl_gpu_texture_type_2d,
+      format: sdl_gpu_texture_format_d16_unorm,
+      usage: sdl_gpu_texture_usage_depth_stencil_target,
+      width: width,
+      height: height,
+      layer_count_or_depth: 1,
+      num_levels: 1,
+      sample_count: sdl_gpu_sample_count_1,
+    )
+    depth_texture = create_gpu_texture(gpu_device, addr depth_texture_create_info)
+    if depth_texture == nil:
+      return app_failure
+    depth_texture_width = width
+    depth_texture_height = height
 
   clay_set_layout_dimensions(clay_dimensions(width, height))
 
@@ -746,7 +778,10 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
     h: float32(height),
   )
 
+  var paint_rank = 0
   for command in commands:
+    let depth = 1.0'f32 - float32(paint_rank + 1) / float32(commands.length + 1)
+    inc paint_rank
     case command.command_type:
     of clay_render_command_type_none: discard
     of clay_render_command_type_rectangle:
@@ -766,6 +801,7 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
           uint8(color.b),
           uint8(color.a),
         ],
+        depth: depth,
       ))
     of clay_render_command_type_border:
       let box: Rect = command.bounding_box
@@ -812,6 +848,7 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
             uint8(color.b),
             uint8(color.a),
           ],
+          depth: depth,
         ))
     of clay_render_command_type_text: discard
     of clay_render_command_type_image: discard
@@ -921,11 +958,24 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
     load_op: sdl_gpu_load_op_clear,
     store_op: sdl_gpu_store_op_store
   )
-  let render_pass = begin_gpu_render_pass(command_buffer, addr target, 1, nil)
+  var depth_target = SdlGpuDepthStencilTargetInfo(
+    texture: depth_texture,
+    clear_depth: 1.0,
+    load_op: sdl_gpu_load_op_clear,
+    store_op: sdl_gpu_store_op_dont_care,
+    stencil_load_op: sdl_gpu_load_op_dont_care,
+    stencil_store_op: sdl_gpu_store_op_dont_care,
+  )
+  let render_pass = begin_gpu_render_pass(
+    command_buffer,
+    addr target,
+    1,
+    addr depth_target,
+  )
   if render_pass == nil:
     return app_failure
 
-  bind_gpu_graphics_pipeline(render_pass, analytic_pipeline)
+  bind_gpu_graphics_pipeline(render_pass, opaque_pipeline)
 
   var frame_data = FrameData(
     viewport_size: [width_f32, height_f32],
@@ -976,10 +1026,11 @@ proc sdl_app_quit(appstate: pointer; result: SdlAppResult) {.cdecl.} =
   discard appstate
   discard result
   if gpu_device != nil:
+    release_gpu_texture(gpu_device, depth_texture)
     release_gpu_transfer_buffer(gpu_device, instance_transfer_buffer)
     release_gpu_buffer(gpu_device, instance_buffer)
     release_gpu_buffer(gpu_device, quad_vertex_buffer)
-    release_gpu_graphics_pipeline(gpu_device, analytic_pipeline)
+    release_gpu_graphics_pipeline(gpu_device, opaque_pipeline)
     if window != nil:
       release_window_from_gpu_device(gpu_device, window)
     destroy_gpu_device(gpu_device)
