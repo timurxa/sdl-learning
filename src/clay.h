@@ -3382,6 +3382,12 @@ void Clay__CalculateFinalLayout(float deltaTime, bool useStoredBoundingBoxes, bo
                 if (generateRenderCommands) {
                     Clay__AddRenderCommand(CLAY__INIT(Clay_RenderCommand) {
                         .boundingBox = clipHashMapItem->boundingBox,
+                        .renderData = {
+                            .clip = {
+                                .horizontal = clipHashMapItem->layoutElement->config.clip.horizontal,
+                                .vertical = clipHashMapItem->layoutElement->config.clip.vertical,
+                            }
+                        },
                         .userData = 0,
                         .id = Clay__HashNumber(rootElement->id, rootElement->children.length + 10).id, // TODO need a better strategy for managing derived ids
                         .zIndex = root->zIndex,

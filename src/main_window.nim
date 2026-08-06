@@ -2,6 +2,7 @@ import clay
 import sdl
 import ui
 import renderer
+import graph_ui
 
 type
   Palette = object
@@ -17,6 +18,7 @@ type
   MainWindow* = ref object
     palette: Palette
     ui_state: UiState
+    graph_view: GraphView
     debug_cycle_frame: uint64
     debug_last_phase: int
 
@@ -37,7 +39,20 @@ proc new_main_window*(): MainWindow =
       pink: rgba(255, 103, 174, 255),
       mint: rgba(83, 220, 169, 255),
       purple: rgba(169, 126, 255, 255)),
-    ui_state: new_ui_state())
+    ui_state: new_ui_state(),
+    graph_view: GraphView(nodes: @[
+      GraphNode(
+        stable_id: 1,
+        screen_position: vector2(300, 300),
+        size: dimensions(154, 62),
+        title: "INPUT NODE",
+        detail: "SOURCE / READY"),
+      GraphNode(
+        stable_id: 2,
+        screen_position: vector2(500, 500),
+        size: dimensions(154, 62),
+        title: "OUTPUT NODE",
+        detail: "SINK / WAITING")]))
 
 proc background_color*(view: MainWindow): ClayColor =
   view.palette.background
@@ -394,85 +409,28 @@ proc build_elements*(view: MainWindow; frame: ViewFrame) =
               width = grow()
               height = grow()
           clip:
+            horizontal = true
             vertical = true
           background_color = palette_color(view.palette.paper)
           border:
-            color = palette_color(view.palette.ink)
+            color = palette_color(view.palette.purple)
             width = border_outside(4)
 
-          element("stage_base"):
-            layout:
-              sizing:
-                width = grow()
-                height = grow()
-              padding = padding_all(12)
-              child_gap = 8
-              layout_direction = clay_top_to_bottom
-            clip:
-              vertical = true
-            background_color = palette_color(view.palette.purple)
-            border:
-              color = palette_color(view.palette.ink)
-              width = border_outside(3)
-            text("LAYER 0 / BACKPLATE"):
-              font_size = 12
-              text_color = palette_color(view.palette.ink)
-              wrap_mode = clay_text_wrap_words_and_graphemes
-            element("base_row"):
-              layout:
-                sizing:
-                  width = grow()
-                  height = grow()
-                child_gap = 8
-                layout_direction = clay_left_to_right
-              element("base_left"):
-                layout:
-                  sizing:
-                    width = percent(0.48)
-                    height = grow()
-                  padding = padding_all(8)
-                  layout_direction = clay_top_to_bottom
-                  child_gap = 6
-                clip:
-                  vertical = true
-                background_color = palette_color(view.palette.yellow)
-                border:
-                  color = palette_color(view.palette.ink)
-                  width = border_outside(3)
-                text("STATIC BOX"):
-                  font_size = 11
-                  text_color = palette_color(view.palette.ink)
-                  wrap_mode = clay_text_wrap_words_and_graphemes
-                text("WAITING FOR IMPACT"):
-                  font_size = 10
-                  text_color = palette_color(view.palette.ink)
-                  wrap_mode = clay_text_wrap_words_and_graphemes
-              element("base_right"):
-                layout:
-                  sizing:
-                    width = grow()
-                    height = grow()
-                  padding = padding_all(8)
-                  layout_direction = clay_top_to_bottom
-                  child_gap = 6
-                clip:
-                  vertical = true
-                background_color = palette_color(view.palette.mint)
-                border:
-                  color = palette_color(view.palette.ink)
-                  width = border_outside(3)
-                text("DEPTH MAP"):
-                  font_size = 11
-                  text_color = palette_color(view.palette.ink)
-                  wrap_mode = clay_text_wrap_words_and_graphemes
-                text("supercalifragilisticexpialidocioussupercalifragilisticexpialidocioussupercalifragilisticexpialidocious"):
-                  font_size = 10
-                  text_color = palette_color(view.palette.ink)
-                  wrap_mode = clay_text_wrap_words_and_graphemes
-                text("0 / 1 / 2 / 3 / 4"):
-                  font_size = 10
-                  text_color = palette_color(view.palette.ink)
-                  wrap_mode = clay_text_wrap_words_and_graphemes
+          graph_window(view.graph_view, node):
+            let node_background_color = if node.stable_id == 1:
+              palette_color(view.palette.yellow)
+            else:
+              palette_color(view.palette.mint)
+            graph_node_panel(node, node_background_color,
+                palette_color(view.palette.ink)):
+              text(node.title):
+                font_size = 11
+                text_color = palette_color(view.palette.ink)
+                wrap_mode = clay_text_wrap_words_and_graphemes
+              text(node.detail):
+                font_size = 9
+                text_color = palette_color(view.palette.ink)
+                wrap_mode = clay_text_wrap_words_and_graphemes
 
           element("float_yellow"):
             layout:
