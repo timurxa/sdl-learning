@@ -57,6 +57,19 @@ type
     padding: uint8
     x*: cfloat
     y*: cfloat
+  SdlMouseWheelEvent* = object
+    kind*: uint32
+    reserved: uint32
+    timestamp: uint64
+    window_id*: uint32
+    which: uint32
+    x*: cfloat
+    y*: cfloat
+    direction*: uint32
+    mouse_x*: cfloat
+    mouse_y*: cfloat
+    integer_x: int32
+    integer_y: int32
   SdlWindow* {.importc: "SDL_Window", header: "SDL3/SDL.h".} = object
   SdlWindowEvent* = object
     kind*: uint32
@@ -617,14 +630,19 @@ type
 
 var sdl_event_quit* {.importc: "SDL_EVENT_QUIT", header: "SDL3/SDL_events.h".}: uint32
 var sdl_event_window_focus_lost* {.importc: "SDL_EVENT_WINDOW_FOCUS_LOST", header: "SDL3/SDL_events.h".}: uint32
+var sdl_event_window_mouse_leave* {.importc: "SDL_EVENT_WINDOW_MOUSE_LEAVE", header: "SDL3/SDL_events.h".}: uint32
 var sdl_event_key_down* {.importc: "SDL_EVENT_KEY_DOWN", header: "SDL3/SDL_events.h".}: uint32
 var sdl_event_text_editing* {.importc: "SDL_EVENT_TEXT_EDITING", header: "SDL3/SDL_events.h".}: uint32
 var sdl_event_text_input* {.importc: "SDL_EVENT_TEXT_INPUT", header: "SDL3/SDL_events.h".}: uint32
 var sdl_event_mouse_motion* {.importc: "SDL_EVENT_MOUSE_MOTION", header: "SDL3/SDL_events.h".}: uint32
 var sdl_event_mouse_button_down* {.importc: "SDL_EVENT_MOUSE_BUTTON_DOWN", header: "SDL3/SDL_events.h".}: uint32
 var sdl_event_mouse_button_up* {.importc: "SDL_EVENT_MOUSE_BUTTON_UP", header: "SDL3/SDL_events.h".}: uint32
+var sdl_event_mouse_wheel* {.importc: "SDL_EVENT_MOUSE_WHEEL", header: "SDL3/SDL_events.h".}: uint32
 var sdl_button_left* {.importc: "SDL_BUTTON_LEFT", header: "SDL3/SDL_mouse.h".}: uint8
+var sdl_button_middle* {.importc: "SDL_BUTTON_MIDDLE", header: "SDL3/SDL_mouse.h".}: uint8
+var sdl_button_right* {.importc: "SDL_BUTTON_RIGHT", header: "SDL3/SDL_mouse.h".}: uint8
 var sdl_button_left_mask* {.importc: "SDL_BUTTON_LMASK", header: "SDL3/SDL_mouse.h".}: uint32
+var sdl_mousewheel_flipped* {.importc: "SDL_MOUSEWHEEL_FLIPPED", header: "SDL3/SDL_mouse.h".}: uint32
 var sdl_key_return* {.importc: "SDLK_RETURN", header: "SDL3/SDL_keycode.h".}: uint32
 var sdl_key_escape* {.importc: "SDLK_ESCAPE", header: "SDL3/SDL_keycode.h".}: uint32
 var sdl_key_backspace* {.importc: "SDLK_BACKSPACE", header: "SDL3/SDL_keycode.h".}: uint32

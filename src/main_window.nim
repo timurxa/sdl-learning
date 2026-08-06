@@ -73,8 +73,7 @@ proc new_main_window*(): MainWindow =
           size: dimensions(154, 62),
           circle_color: rgba(83, 220, 169, 255),
           title: "OUTPUT NODE",
-          detail: "SINK / WAITING")],
-        draw_list: new_opaque_draw_list())),
+          detail: "SINK / WAITING")])),
     graph_tab: GraphTab(
       graph_view: GraphView(
         nodes: @[
@@ -113,7 +112,6 @@ proc new_main_window*(): MainWindow =
             shaft_width: 3,
             head_length: 12,
             head_width: 12)],
-        draw_list: new_opaque_draw_list(),
         node_pointer_capture_mode: clay_pointer_capture_mode_passthrough)))
 
 proc background_color*(view: MainWindow): ClayColor =
@@ -137,7 +135,10 @@ proc render*(view: MainWindow; renderer: Renderer; clay_context: ptr ClayContext
     clay_context,
     string_cache,
     proc() =
-      view.ui_state.prepare_frame()
+      view.ui_state.prepare_frame(
+        proc(event: UiEvent) =
+          if view.tab_manager.active_tab == main_tab_graph:
+            view.graph_tab.graph_view.handle_event(event))
       view.apply_ui_actions(),
     proc(frame: ViewFrame) = view.build_elements(frame),
     proc() = view.ui_state.finish_frame(),
@@ -162,6 +163,7 @@ proc debug_transition_set_final_state(initial_state: ClayTransitionData;
 proc select_tab(view: MainWindow; tab_kind: MainTabKind) =
   if view.tab_manager.active_tab == tab_kind:
     return
+  view.graph_tab.graph_view.cancel_pan()
   view.ui_state.clear_focus()
   view.tab_manager.active_tab = tab_kind
 
@@ -873,7 +875,49 @@ proc build_graph_tab(view: MainWindow) =
           width = border_outside(4)
 
         graph_window(view.graph_tab.graph_view, node):
-          discard
+          if node.stable_id == 1:
+            let popup_id = clay_id_with_index("graph_popup", node.stable_id)
+            let graph_anchor = vector2(
+              node.screen_position.x + node.size.width,
+              node.screen_position.y)
+            let popup_offset = vector2(
+              view.graph_tab.graph_view.pan.x +
+                graph_anchor.x * view.graph_tab.graph_view.zoom,
+              view.graph_tab.graph_view.pan.y +
+                graph_anchor.y * view.graph_tab.graph_view.zoom)
+            let popup_declaration = declaration(
+              layout = layout(
+                sizing = sizing(fixed(168), fixed(88)),
+                padding = padding_all(8),
+                child_gap = 4,
+                layout_direction = clay_top_to_bottom),
+              background_color = palette_color(view.palette.yellow),
+              border = ClayBorderElementConfig(
+                color: palette_color(view.palette.ink),
+                width: border_outside(3)),
+              floating = ClayFloatingElementConfig(
+                parent_id: clay_id("graph_surface").id,
+                offset: popup_offset,
+                attach_points: ClayFloatingAttachPoints(
+                  element: clay_attach_point_left_top,
+                  parent: clay_attach_point_left_top),
+                pointer_capture_mode: clay_pointer_capture_mode_capture,
+                attach_to: clay_attach_to_element_with_id,
+                clip_to: clay_clip_to_attached_parent,
+                z_index: int16(graph_node_z_index(node) + 2)))
+            element(popup_id, popup_declaration):
+              text("NODE 1 / FLOATING WINDOW"):
+                font_size = 10
+                text_color = palette_color(view.palette.ink)
+                wrap_mode = clay_text_wrap_words_and_graphemes
+              text("FIXED-SIZE CLAY UI"):
+                font_size = 9
+                text_color = palette_color(view.palette.ink)
+                wrap_mode = clay_text_wrap_words_and_graphemes
+              text("FOLLOWS GRAPH ANCHOR"):
+                font_size = 8
+                text_color = palette_color(view.palette.ink)
+                wrap_mode = clay_text_wrap_words_and_graphemes
 
 proc build_elements*(view: MainWindow; frame: ViewFrame) =
   case view.tab_manager.active_tab

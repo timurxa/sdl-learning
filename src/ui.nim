@@ -21,6 +21,8 @@ type
     ui_event_mouse_move
     ui_event_mouse_button_down
     ui_event_mouse_button_up
+    ui_event_mouse_wheel
+    ui_event_mouse_leave
     ui_event_key_down
     ui_event_text_editing
     ui_event_text_input
@@ -31,12 +33,16 @@ type
     window_id*: uint32
     x*, y*: float32
     pointer_down*: bool
+    button*: uint8
+    wheel_y*: float32
     key*: uint32
     modifiers*: uint16
     repeat*: bool
     text*: string
     composition_start*: int32
     composition_length*: int32
+
+  UiEventHandler* = proc(event: UiEvent) {.closure.}
 
   UiActionKind* = enum
     ui_action_button_clicked
@@ -162,8 +168,6 @@ proc to_ui_event*(event: ptr SdlEvent): UiEvent =
 
   if kind == sdl_event_mouse_button_down or kind == sdl_event_mouse_button_up:
     let mouse_event = cast[ptr SdlMouseButtonEvent](event)
-    if mouse_event.button != sdl_button_left:
-      return
     return UiEvent(
       kind: if kind == sdl_event_mouse_button_down:
         ui_event_mouse_button_down
@@ -172,7 +176,26 @@ proc to_ui_event*(event: ptr SdlEvent): UiEvent =
       window_id: mouse_event.window_id,
       x: float32(mouse_event.x),
       y: float32(mouse_event.y),
-      pointer_down: mouse_event.down)
+      pointer_down: mouse_event.down,
+      button: mouse_event.button)
+
+  if kind == sdl_event_mouse_wheel:
+    let wheel_event = cast[ptr SdlMouseWheelEvent](event)
+    return UiEvent(
+      kind: ui_event_mouse_wheel,
+      window_id: wheel_event.window_id,
+      x: float32(wheel_event.mouse_x),
+      y: float32(wheel_event.mouse_y),
+      wheel_y: if wheel_event.direction == sdl_mousewheel_flipped:
+        -float32(wheel_event.y)
+      else:
+        float32(wheel_event.y))
+
+  if kind == sdl_event_window_mouse_leave:
+    let window_event = cast[ptr SdlWindowEvent](event)
+    return UiEvent(
+      kind: ui_event_mouse_leave,
+      window_id: window_event.window_id)
 
   if kind == sdl_event_key_down:
     let key_event = cast[ptr SdlKeyboardEvent](event)
@@ -381,20 +404,31 @@ proc handle_event(state: UiState; event: UiEvent) =
     clay_set_pointer_state(state.pointer_position, state.pointer_down)
   of ui_event_mouse_button_down:
     state.pointer_position = clay_vector2(event.x, event.y)
-    state.pointer_down = true
-    clay_set_pointer_state(state.pointer_position, true)
+    if event.button == 0 or event.button == sdl_button_left:
+      state.pointer_down = true
+    clay_set_pointer_state(state.pointer_position, state.pointer_down)
+    if event.button != 0 and event.button != sdl_button_left:
+      return
     state.pressed_button = state.button_target()
     set_focus(state, state.pointer_target())
   of ui_event_mouse_button_up:
     state.pointer_position = clay_vector2(event.x, event.y)
-    state.pointer_down = false
-    clay_set_pointer_state(state.pointer_position, false)
+    if event.button == 0 or event.button == sdl_button_left:
+      state.pointer_down = false
+    clay_set_pointer_state(state.pointer_position, state.pointer_down)
+    if event.button != 0 and event.button != sdl_button_left:
+      return
     let released_button = state.button_target()
     if state.pressed_button.len > 0 and state.pressed_button == released_button:
       state.action_queue.addLast(UiAction(
         kind: ui_action_button_clicked,
         button_id: state.pressed_button))
     state.pressed_button.setLen(0)
+  of ui_event_mouse_wheel:
+    state.pointer_position = clay_vector2(event.x, event.y)
+    clay_set_pointer_state(state.pointer_position, state.pointer_down)
+  of ui_event_mouse_leave:
+    discard
   of ui_event_key_down:
     handle_key_down(state, event)
   of ui_event_text_editing:
@@ -412,13 +446,16 @@ proc handle_event(state: UiState; event: UiEvent) =
   of ui_event_none:
     discard
 
-proc prepare_frame*(state: UiState) =
+proc prepare_frame*(state: UiState; event_handler: UiEventHandler = nil) =
   state.previous_fields = state.current_fields
   state.current_fields = @[]
   state.previous_buttons = state.current_buttons
   state.current_buttons = @[]
   while state.event_queue.len > 0:
-    handle_event(state, state.event_queue.popFirst())
+    let event = state.event_queue.popFirst()
+    handle_event(state, event)
+    if event_handler != nil:
+      event_handler(event)
 
 proc finish_frame*(state: UiState) =
   if state.window == nil or state.focused_field.len == 0:
