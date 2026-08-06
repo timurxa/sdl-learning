@@ -5,6 +5,13 @@ import renderer
 import graph_ui
 
 type
+  MainTabKind = enum
+    main_tab_workspace
+    main_tab_graph
+
+  TabManager = object
+    active_tab: MainTabKind
+
   Palette = object
     background: ClayColor
     ink: ClayColor
@@ -15,15 +22,25 @@ type
     mint: ClayColor
     purple: ClayColor
 
-  MainWindow* = ref object
-    palette: Palette
-    ui_state: UiState
+  WorkspaceTab = ref object
     graph_view: GraphView
     debug_cycle_frame: uint64
     debug_last_phase: int
 
+  GraphTab = ref object
+    graph_view: GraphView
+
+  MainWindow* = ref object
+    palette: Palette
+    ui_state: UiState
+    tab_manager: TabManager
+    workspace_tab: WorkspaceTab
+    graph_tab: GraphTab
+
 const
   nav_labels = ["Overview", "Activity", "Analytics", "Deployments", "Alerts", "Settings", "Team", "Archive"]
+  workspace_tab_button_id = "tab_workspace"
+  graph_tab_button_id = "tab_graph"
 
 proc palette_color(color: ClayColor): ClayColor =
   color
@@ -40,22 +57,47 @@ proc new_main_window*(): MainWindow =
       mint: rgba(83, 220, 169, 255),
     purple: rgba(169, 126, 255, 255)),
     ui_state: new_ui_state(),
-    graph_view: GraphView(nodes: @[
-      GraphNode(
-        stable_id: 1,
-        screen_position: vector2(300, 300),
-        size: dimensions(154, 62),
-        circle_color: rgba(255, 210, 63, 255),
-        title: "INPUT NODE",
-        detail: "SOURCE / READY"),
-      GraphNode(
-        stable_id: 2,
-        screen_position: vector2(500, 500),
-        size: dimensions(154, 62),
-        circle_color: rgba(83, 220, 169, 255),
-        title: "OUTPUT NODE",
-        detail: "SINK / WAITING")],
-      draw_list: new_opaque_draw_list()))
+    tab_manager: TabManager(active_tab: main_tab_workspace),
+    workspace_tab: WorkspaceTab(
+      graph_view: GraphView(nodes: @[
+        GraphNode(
+          stable_id: 1,
+          screen_position: vector2(300, 300),
+          size: dimensions(154, 62),
+          circle_color: rgba(255, 210, 63, 255),
+          title: "INPUT NODE",
+          detail: "SOURCE / READY"),
+        GraphNode(
+          stable_id: 2,
+          screen_position: vector2(500, 500),
+          size: dimensions(154, 62),
+          circle_color: rgba(83, 220, 169, 255),
+          title: "OUTPUT NODE",
+          detail: "SINK / WAITING")],
+        draw_list: new_opaque_draw_list())),
+    graph_tab: GraphTab(
+      graph_view: GraphView(
+        nodes: @[
+          GraphNode(
+            stable_id: 1,
+            screen_position: vector2(96, 90),
+            size: dimensions(32, 32),
+            circle_color: rgba(255, 210, 63, 255),
+            z_index: 1),
+          GraphNode(
+            stable_id: 2,
+            screen_position: vector2(264, 190),
+            size: dimensions(32, 32),
+            circle_color: rgba(83, 220, 169, 255),
+            z_index: 2),
+          GraphNode(
+            stable_id: 3,
+            screen_position: vector2(438, 104),
+            size: dimensions(32, 32),
+            circle_color: rgba(169, 126, 255, 255),
+            z_index: 3)],
+        draw_list: new_opaque_draw_list(),
+        node_pointer_capture_mode: clay_pointer_capture_mode_passthrough)))
 
 proc background_color*(view: MainWindow): ClayColor =
   view.palette.background
@@ -67,13 +109,19 @@ proc handle_event*(view: MainWindow; event: UiEvent) =
   view.ui_state.enqueue_event(event)
 
 proc build_elements*(view: MainWindow; frame: ViewFrame)
+proc build_workspace_tab(view: MainWindow; frame: ViewFrame)
+proc build_graph_tab(view: MainWindow)
+proc apply_ui_actions(view: MainWindow)
+proc build_tab_bar(view: MainWindow)
 
 proc render*(view: MainWindow; renderer: Renderer; clay_context: ptr ClayContext;
     string_cache: var ClayStringCache; delta_time: float32): bool =
   renderer.render_frame(
     clay_context,
     string_cache,
-    proc() = view.ui_state.prepare_frame(),
+    proc() =
+      view.ui_state.prepare_frame()
+      view.apply_ui_actions(),
     proc(frame: ViewFrame) = view.build_elements(frame),
     proc() = view.ui_state.finish_frame(),
     delta_time)
@@ -94,20 +142,107 @@ proc debug_transition_set_final_state(initial_state: ClayTransitionData;
   if (int32(properties) and int32(clay_transition_property_y)) != 0:
     result.bounding_box.y += 18
 
+proc select_tab(view: MainWindow; tab_kind: MainTabKind) =
+  if view.tab_manager.active_tab == tab_kind:
+    return
+  view.ui_state.clear_focus()
+  view.tab_manager.active_tab = tab_kind
 
-proc build_elements*(view: MainWindow; frame: ViewFrame) =
+proc apply_ui_actions(view: MainWindow) =
+  var action: UiAction
+  while view.ui_state.next_action(action):
+    case action.kind
+    of ui_action_button_clicked:
+      case action.button_id
+      of workspace_tab_button_id:
+        view.select_tab(main_tab_workspace)
+      of graph_tab_button_id:
+        view.select_tab(main_tab_graph)
+      else:
+        discard
+
+proc build_tab_bar(view: MainWindow) =
+  let workspace_button_element_id = clay_id(workspace_tab_button_id)
+  let graph_button_element_id = clay_id(graph_tab_button_id)
+  view.ui_state.register_button(
+    workspace_tab_button_id, workspace_button_element_id)
+  view.ui_state.register_button(graph_tab_button_id, graph_button_element_id)
+
+  element("tab_bar"):
+    layout:
+      sizing:
+        width = grow()
+        height = fixed(48)
+      padding = padding_all(6)
+      child_gap = 8
+      layout_direction = clay_left_to_right
+    clip:
+      vertical = true
+    background_color = palette_color(view.palette.paper)
+    border:
+      color = palette_color(view.palette.ink)
+      width = border_outside(4)
+
+    element(workspace_button_element_id):
+      layout:
+        sizing:
+          width = fixed(142)
+          height = grow()
+        padding = padding_all(6)
+        child_alignment:
+          x = clay_align_x_center
+          y = clay_align_y_center
+      clip:
+        vertical = true
+      background_color = if view.tab_manager.active_tab == main_tab_workspace:
+        palette_color(view.palette.pink)
+      else:
+        palette_color(view.palette.paper)
+      border:
+        color = palette_color(view.palette.ink)
+        width = border_outside(3)
+      text("WORKSPACE"):
+        font_size = 10
+        text_color = palette_color(view.palette.ink)
+        wrap_mode = clay_text_wrap_words_and_graphemes
+
+    element(graph_button_element_id):
+      layout:
+        sizing:
+          width = fixed(142)
+          height = grow()
+        padding = padding_all(6)
+        child_alignment:
+          x = clay_align_x_center
+          y = clay_align_y_center
+      clip:
+        vertical = true
+      background_color = if view.tab_manager.active_tab == main_tab_graph:
+        palette_color(view.palette.pink)
+      else:
+        palette_color(view.palette.paper)
+      border:
+        color = palette_color(view.palette.ink)
+        width = border_outside(3)
+      text("GRAPH"):
+        font_size = 10
+        text_color = palette_color(view.palette.ink)
+        wrap_mode = clay_text_wrap_words_and_graphemes
+
+
+proc build_workspace_tab(view: MainWindow; frame: ViewFrame) =
   let search_element_id = clay_id("search_field")
   view.ui_state.register_text_field(
     text_field_search,
     search_element_id,
     initial_value = "type here")
 
-  inc view.debug_cycle_frame
-  let debug_phase = int((view.debug_cycle_frame div 60'u64) mod 4'u64)
-  if debug_phase != view.debug_last_phase:
+  inc view.workspace_tab.debug_cycle_frame
+  let debug_phase = int((view.workspace_tab.debug_cycle_frame div 60'u64) mod 4'u64)
+  if debug_phase != view.workspace_tab.debug_last_phase:
     echo "Clay transition debug: phase ", debug_phase,
       ", exiting transitions = ", frame.exiting_transitions
-    view.debug_last_phase = debug_phase
+    view.workspace_tab.debug_last_phase = debug_phase
   let debug_show_panel_a = debug_phase != 2
   let debug_swap_panels = debug_phase == 1 or debug_phase == 2
 
@@ -157,6 +292,8 @@ proc build_elements*(view: MainWindow; frame: ViewFrame) =
     border:
       color = palette_color(view.palette.ink)
       width = border_outside(4)
+
+    build_tab_bar(view)
 
     element("top_bar"):
       layout:
@@ -367,7 +504,7 @@ proc build_elements*(view: MainWindow; frame: ViewFrame) =
               layout_direction = clay_left_to_right
             if debug_swap_panels:
               element("debug_panel_b", debug_panel_b_declaration):
-                text("PANEL B // " & $view.debug_cycle_frame):
+                text("PANEL B // " & $view.workspace_tab.debug_cycle_frame):
                   font_size = 10
                   text_color = palette_color(view.palette.ink)
                   wrap_mode = clay_text_wrap_words_and_graphemes
@@ -377,7 +514,7 @@ proc build_elements*(view: MainWindow; frame: ViewFrame) =
                   wrap_mode = clay_text_wrap_words_and_graphemes
               if debug_show_panel_a:
                 element("debug_panel_a", debug_panel_a_declaration):
-                  text("PANEL A // " & $view.debug_cycle_frame):
+                  text("PANEL A // " & $view.workspace_tab.debug_cycle_frame):
                     font_size = 10
                     text_color = palette_color(view.palette.ink)
                     wrap_mode = clay_text_wrap_words_and_graphemes
@@ -388,7 +525,7 @@ proc build_elements*(view: MainWindow; frame: ViewFrame) =
             else:
               if debug_show_panel_a:
                 element("debug_panel_a", debug_panel_a_declaration):
-                  text("PANEL A // " & $view.debug_cycle_frame):
+                  text("PANEL A // " & $view.workspace_tab.debug_cycle_frame):
                     font_size = 10
                     text_color = palette_color(view.palette.ink)
                     wrap_mode = clay_text_wrap_words_and_graphemes
@@ -397,7 +534,7 @@ proc build_elements*(view: MainWindow; frame: ViewFrame) =
                     text_color = palette_color(view.palette.ink)
                     wrap_mode = clay_text_wrap_words_and_graphemes
               element("debug_panel_b", debug_panel_b_declaration):
-                text("PANEL B // " & $view.debug_cycle_frame):
+                text("PANEL B // " & $view.workspace_tab.debug_cycle_frame):
                   font_size = 10
                   text_color = palette_color(view.palette.ink)
                   wrap_mode = clay_text_wrap_words_and_graphemes
@@ -419,7 +556,7 @@ proc build_elements*(view: MainWindow; frame: ViewFrame) =
             color = palette_color(view.palette.purple)
             width = border_outside(4)
 
-          graph_window(view.graph_view, node):
+          graph_window(view.workspace_tab.graph_view, node):
             graph_node_panel(node, rgba(0, 0, 0, 0),
                 palette_color(view.palette.ink)):
               text(node.title):
@@ -668,3 +805,62 @@ proc build_elements*(view: MainWindow; frame: ViewFrame) =
           font_size = 8
           text_color = palette_color(view.palette.ink)
           wrap_mode = clay_text_wrap_words_and_graphemes
+
+proc build_graph_tab(view: MainWindow) =
+  element("root"):
+    layout:
+      sizing:
+        width = grow()
+        height = grow()
+      padding = padding_all(16)
+      child_gap = 14
+      layout_direction = clay_top_to_bottom
+    background_color = palette_color(view.palette.background)
+    border:
+      color = palette_color(view.palette.ink)
+      width = border_outside(4)
+
+    build_tab_bar(view)
+
+    element("graph_section"):
+      layout:
+        sizing:
+          width = grow()
+          height = grow()
+        padding = padding_all(12)
+        child_gap = 10
+        layout_direction = clay_top_to_bottom
+      clip:
+        vertical = true
+      background_color = palette_color(view.palette.blue)
+      border:
+        color = palette_color(view.palette.ink)
+        width = border_outside(4)
+
+      text("GRAPH / CIRCLE DEBUG"):
+        font_size = 13
+        text_color = palette_color(view.palette.paper)
+        wrap_mode = clay_text_wrap_words_and_graphemes
+
+      element("graph_stage"):
+        layout:
+          sizing:
+            width = grow()
+            height = grow()
+        clip:
+          horizontal = true
+          vertical = true
+        background_color = palette_color(view.palette.paper)
+        border:
+          color = palette_color(view.palette.purple)
+          width = border_outside(4)
+
+        graph_window(view.graph_tab.graph_view, node):
+          discard
+
+proc build_elements*(view: MainWindow; frame: ViewFrame) =
+  case view.tab_manager.active_tab
+  of main_tab_workspace:
+    view.build_workspace_tab(frame)
+  of main_tab_graph:
+    view.build_graph_tab()

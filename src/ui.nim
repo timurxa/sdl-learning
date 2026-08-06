@@ -6,6 +6,7 @@ import utf8proc
 
 type
   TextFieldId* = string
+  ButtonId* = string
 
   TextFieldState* = object
     value*: string
@@ -37,18 +38,34 @@ type
     composition_start*: int32
     composition_length*: int32
 
+  UiActionKind* = enum
+    ui_action_button_clicked
+
+  UiAction* = object
+    kind*: UiActionKind
+    button_id*: ButtonId
+
   InteractiveField = object
     id: TextFieldId
     element_id: ClayElementId
     interaction_priority: int
     registration_order: int
 
+  InteractiveButton = object
+    id: ButtonId
+    element_id: ClayElementId
+    registration_order: int
+
   UiState* = ref object
     text_fields*: Table[TextFieldId, TextFieldState]
     focused_field*: TextFieldId
     event_queue: Deque[UiEvent]
+    action_queue: Deque[UiAction]
     previous_fields: seq[InteractiveField]
     current_fields: seq[InteractiveField]
+    previous_buttons: seq[InteractiveButton]
+    current_buttons: seq[InteractiveButton]
+    pressed_button: ButtonId
     pointer_position: ClayVector2
     pointer_down: bool
     window: ptr SdlWindow
@@ -61,6 +78,7 @@ proc new_ui_state*(): UiState =
   new(result)
   result.text_fields = initTable[TextFieldId, TextFieldState]()
   result.event_queue = initDeque[UiEvent]()
+  result.action_queue = initDeque[UiAction]()
 
 proc set_window*(state: UiState; window: ptr SdlWindow) =
   state.window = window
@@ -88,6 +106,20 @@ proc register_text_field*(state: UiState; id: TextFieldId;
     element_id: element_id,
     interaction_priority: interaction_priority,
     registration_order: state.current_fields.len))
+
+proc register_button*(state: UiState; id: ButtonId; element_id: ClayElementId) =
+  if id.len == 0:
+    return
+  state.current_buttons.add(InteractiveButton(
+    id: id,
+    element_id: element_id,
+    registration_order: state.current_buttons.len))
+
+proc next_action*(state: UiState; action: var UiAction): bool =
+  if state.action_queue.len == 0:
+    return false
+  action = state.action_queue.popFirst()
+  true
 
 proc text_field_value*(state: UiState; id: TextFieldId): string =
   if state.text_fields.hasKey(id):
@@ -243,6 +275,9 @@ proc set_focus(state: UiState; id: TextFieldId) =
   if state.window != nil:
     state.text_input_active = start_text_input(state.window)
 
+proc clear_focus*(state: UiState) =
+  set_focus(state, "")
+
 proc pointer_target(state: UiState): TextFieldId =
   var best_priority = low(int)
   var best_pointer_rank = high(int)
@@ -270,6 +305,15 @@ proc pointer_target(state: UiState): TextFieldId =
         result = field.id
         best_priority = field.interaction_priority
         best_order = field.registration_order
+
+proc button_target(state: UiState): ButtonId =
+  var best_order = -1
+  for button in state.previous_buttons:
+    if not clay_pointer_over(button.element_id):
+      continue
+    if button.registration_order > best_order:
+      result = button.id
+      best_order = button.registration_order
 
 proc handle_key_down(state: UiState; event: UiEvent) =
   if state.focused_field.len == 0:
@@ -339,11 +383,18 @@ proc handle_event(state: UiState; event: UiEvent) =
     state.pointer_position = clay_vector2(event.x, event.y)
     state.pointer_down = true
     clay_set_pointer_state(state.pointer_position, true)
+    state.pressed_button = state.button_target()
     set_focus(state, state.pointer_target())
   of ui_event_mouse_button_up:
     state.pointer_position = clay_vector2(event.x, event.y)
     state.pointer_down = false
     clay_set_pointer_state(state.pointer_position, false)
+    let released_button = state.button_target()
+    if state.pressed_button.len > 0 and state.pressed_button == released_button:
+      state.action_queue.addLast(UiAction(
+        kind: ui_action_button_clicked,
+        button_id: state.pressed_button))
+    state.pressed_button.setLen(0)
   of ui_event_key_down:
     handle_key_down(state, event)
   of ui_event_text_editing:
@@ -357,12 +408,15 @@ proc handle_event(state: UiState; event: UiEvent) =
       replace_selection(state.text_field_state_pointer(state.focused_field)[], event.text)
   of ui_event_window_focus_lost:
     set_focus(state, "")
+    state.pressed_button.setLen(0)
   of ui_event_none:
     discard
 
 proc prepare_frame*(state: UiState) =
   state.previous_fields = state.current_fields
   state.current_fields = @[]
+  state.previous_buttons = state.current_buttons
+  state.current_buttons = @[]
   while state.event_queue.len > 0:
     handle_event(state, state.event_queue.popFirst())
 

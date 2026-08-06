@@ -14,6 +14,7 @@ type
   GraphView* = object
     nodes*: seq[GraphNode]
     draw_list*: OpaqueDrawList
+    node_pointer_capture_mode*: ClayPointerCaptureMode
 
 proc graph_node_z_index*(node: GraphNode): int16 {.inline.} =
   int16(10 + int(node.z_index))
@@ -45,6 +46,7 @@ template graph_node*(graph: GraphView; graph_id: ClayElementId;
       attach_points: ClayFloatingAttachPoints(
         element: clay_attach_point_left_top,
         parent: clay_attach_point_left_top),
+      pointer_capture_mode: graph.node_pointer_capture_mode,
       attach_to: clay_attach_to_element_with_id,
       clip_to: clay_clip_to_attached_parent,
       z_index: node_z_index))
