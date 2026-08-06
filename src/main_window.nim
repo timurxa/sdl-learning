@@ -1,7 +1,6 @@
 import clay
 import sdl
 import ui
-import window
 import renderer
 
 type
@@ -15,7 +14,7 @@ type
     mint: ClayColor
     purple: ClayColor
 
-  MainWindow* = ref object of WindowView
+  MainWindow* = ref object
     palette: Palette
     ui_state: UiState
     debug_cycle_frame: uint64
@@ -43,13 +42,15 @@ proc new_main_window*(): MainWindow =
 proc background_color*(view: MainWindow): ClayColor =
   view.palette.background
 
-method set_window*(view: MainWindow; window: ptr SdlWindow) =
+proc set_window*(view: MainWindow; window: ptr SdlWindow) =
   view.ui_state.set_window(window)
 
-method handle_event*(view: MainWindow; event: UiEvent) =
+proc handle_event*(view: MainWindow; event: UiEvent) =
   view.ui_state.enqueue_event(event)
 
-method render*(view: MainWindow; renderer: Renderer; clay_context: ptr ClayContext;
+proc build_elements*(view: MainWindow; frame: ViewFrame)
+
+proc render*(view: MainWindow; renderer: Renderer; clay_context: ptr ClayContext;
     string_cache: var ClayStringCache; delta_time: float32): bool =
   renderer.render_frame(
     clay_context,
@@ -76,7 +77,7 @@ proc debug_transition_set_final_state(initial_state: ClayTransitionData;
     result.bounding_box.y += 18
 
 
-method build_elements*(view: MainWindow; frame: ViewFrame) =
+proc build_elements*(view: MainWindow; frame: ViewFrame) =
   let search_element_id = clay_id("search_field")
   view.ui_state.register_text_field(
     text_field_search,

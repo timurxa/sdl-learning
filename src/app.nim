@@ -9,16 +9,21 @@ import ui
 import window
 
 type
+  WindowKind = enum
+    window_kind_main
+
   WindowState = ref object
     window_id: uint32
     sdl_window: ptr SdlWindow
     config: WindowConfig
-    view: WindowView
     clay_arena_memory: pointer
     clay_arena: ClayArena
     clay_context: ptr ClayContext
     clay_string_cache: ClayStringCache
     renderer: Renderer
+    case kind: WindowKind
+    of window_kind_main:
+      main_window: MainWindow
 
   AppState = ref object
     windows: seq[WindowState]
@@ -29,14 +34,15 @@ var app_state_root: AppState
 
 proc init_window_state(
     state: var WindowState;
-    view: WindowView;
+    main_window: MainWindow;
     config: WindowConfig;
     window_id: uint32
   ): bool =
-  new(state)
-  state.window_id = window_id
-  state.config = config
-  state.view = view
+  state = WindowState(
+    kind: window_kind_main,
+    window_id: window_id,
+    config: config,
+    main_window: main_window)
   state.sdl_window = create_window(
     config.title.cstring,
     config.width,
@@ -109,7 +115,9 @@ proc dispatch_events(state: AppState) =
 
     for window in state.windows:
       if event.window_id == 0 or event.window_id == window.window_id:
-        window.view.handle_event(event)
+        case window.kind:
+        of window_kind_main:
+          window.main_window.handle_event(event)
 
 proc sdl_app_init(appstate: ptr pointer; argc: cint;
     argv: ptr ptr char): SdlAppResult {.cdecl.} =
@@ -119,21 +127,23 @@ proc sdl_app_init(appstate: ptr pointer; argc: cint;
     return app_failure
 
   app_state_root = new_app_state()
-  let view = new_main_window()
+  let main_window = new_main_window()
   let config = WindowConfig(
     title: "SDL GPU Window",
     width: 640,
     height: 480,
     flags: sdl_window_resizable or sdl_window_borderless or
       sdl_window_high_pixel_density,
-    clear_color: view.background_color())
+    clear_color: main_window.background_color())
 
   var window_state: WindowState
-  if not init_window_state(window_state, view, config, 0):
+  if not init_window_state(window_state, main_window, config, 0):
     deinitLock(app_state_root.event_lock)
     app_state_root = nil
     return app_failure
-  view.set_window(window_state.sdl_window)
+  case window_state.kind:
+  of window_kind_main:
+    window_state.main_window.set_window(window_state.sdl_window)
 
   app_state_root.windows.add(window_state)
   appstate[] = cast[pointer](app_state_root)
@@ -161,12 +171,14 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
   let state = cast[AppState](appstate)
   dispatch_events(state)
   for window in state.windows:
-    if not window.view.render(
-        window.renderer,
-        window.clay_context,
-        window.clay_string_cache,
-        1.0 / 60.0):
-      return app_failure
+    case window.kind:
+    of window_kind_main:
+      if not window.main_window.render(
+          window.renderer,
+          window.clay_context,
+          window.clay_string_cache,
+          1.0 / 60.0):
+        return app_failure
   app_continue
 
 proc sdl_app_quit(appstate: pointer; result: SdlAppResult) {.cdecl.} =
