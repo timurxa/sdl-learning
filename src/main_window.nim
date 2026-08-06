@@ -1,5 +1,8 @@
 import clay
+import sdl
+import ui
 import window
+import renderer
 
 type
   Palette = object
@@ -14,6 +17,7 @@ type
 
   MainWindow* = ref object of WindowView
     palette: Palette
+    ui_state: UiState
     debug_cycle_frame: uint64
     debug_last_phase: int
 
@@ -33,10 +37,27 @@ proc new_main_window*(): MainWindow =
       blue: rgba(70, 145, 255, 255),
       pink: rgba(255, 103, 174, 255),
       mint: rgba(83, 220, 169, 255),
-      purple: rgba(169, 126, 255, 255)))
+      purple: rgba(169, 126, 255, 255)),
+    ui_state: new_ui_state())
 
 proc background_color*(view: MainWindow): ClayColor =
   view.palette.background
+
+method set_window*(view: MainWindow; window: ptr SdlWindow) =
+  view.ui_state.set_window(window)
+
+method handle_event*(view: MainWindow; event: UiEvent) =
+  view.ui_state.enqueue_event(event)
+
+method render*(view: MainWindow; renderer: Renderer; clay_context: ptr ClayContext;
+    string_cache: var ClayStringCache; delta_time: float32): bool =
+  renderer.render_frame(
+    clay_context,
+    string_cache,
+    proc() = view.ui_state.prepare_frame(),
+    proc(frame: ViewFrame) = view.build_elements(frame),
+    proc() = view.ui_state.finish_frame(),
+    delta_time)
 
 proc debug_transition_set_initial_state(target_state: ClayTransitionData;
     properties: ClayTransitionProperty): ClayTransitionData {.cdecl.} =
@@ -56,6 +77,12 @@ proc debug_transition_set_final_state(initial_state: ClayTransitionData;
 
 
 method build_elements*(view: MainWindow; frame: ViewFrame) =
+  let search_element_id = clay_id("search_field")
+  view.ui_state.register_text_field(
+    text_field_search,
+    search_element_id,
+    initial_value = "type here")
+
   inc view.debug_cycle_frame
   let debug_phase = int((view.debug_cycle_frame div 60'u64) mod 4'u64)
   if debug_phase != view.debug_last_phase:
@@ -164,6 +191,32 @@ method build_elements*(view: MainWindow; frame: ViewFrame) =
           wrap_mode = clay_text_wrap_words_and_graphemes
         text("HARD EDGES / DEEP LAYERS"):
           font_size = 10
+          text_color = palette_color(view.palette.ink)
+          wrap_mode = clay_text_wrap_words_and_graphemes
+
+      element(search_element_id):
+        layout:
+          sizing:
+            width = fixed(174)
+            height = grow()
+          padding = padding_all(8)
+          child_gap = 3
+          layout_direction = clay_top_to_bottom
+        clip:
+          vertical = true
+        background_color = if view.ui_state.text_field_focused(text_field_search):
+          palette_color(view.palette.yellow)
+        else:
+          palette_color(view.palette.paper)
+        border:
+          color = palette_color(view.palette.ink)
+          width = border_outside(3)
+        text("INPUT // SEARCH"):
+          font_size = 8
+          text_color = palette_color(view.palette.ink)
+          wrap_mode = clay_text_wrap_words_and_graphemes
+        text(view.ui_state.text_field_display(text_field_search)):
+          font_size = 11
           text_color = palette_color(view.palette.ink)
           wrap_mode = clay_text_wrap_words_and_graphemes
 
@@ -657,5 +710,3 @@ method build_elements*(view: MainWindow; frame: ViewFrame) =
           font_size = 8
           text_color = palette_color(view.palette.ink)
           wrap_mode = clay_text_wrap_words_and_graphemes
-
-

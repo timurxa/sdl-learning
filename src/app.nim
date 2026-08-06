@@ -5,6 +5,7 @@ import sdl
 import utf8proc
 import main_window
 import renderer
+import ui
 import window
 
 type
@@ -21,7 +22,7 @@ type
 
   AppState = ref object
     windows: seq[WindowState]
-    event_queue: Deque[SdlEvent]
+    event_queue: Deque[UiEvent]
     event_lock: Lock
 
 var app_state_root: AppState
@@ -44,6 +45,7 @@ proc init_window_state(
   if state.sdl_window == nil:
     state = nil
     return false
+  state.window_id = get_window_id(state.sdl_window)
 
   let memory_size = clay_min_memory_size()
   state.clay_arena_memory = alloc0(int(memory_size))
@@ -92,12 +94,12 @@ proc deinit_window_state(state: WindowState) =
 
 proc new_app_state(): AppState =
   new(result)
-  result.event_queue = initDeque[SdlEvent]()
+  result.event_queue = initDeque[UiEvent]()
   initLock(result.event_lock)
 
 proc dispatch_events(state: AppState) =
   while true:
-    var event: SdlEvent
+    var event: UiEvent
     acquire(state.event_lock)
     if state.event_queue.len == 0:
       release(state.event_lock)
@@ -106,7 +108,8 @@ proc dispatch_events(state: AppState) =
     release(state.event_lock)
 
     for window in state.windows:
-      window.view.handle_event(addr event)
+      if event.window_id == 0 or event.window_id == window.window_id:
+        window.view.handle_event(event)
 
 proc sdl_app_init(appstate: ptr pointer; argc: cint;
     argv: ptr ptr char): SdlAppResult {.cdecl.} =
@@ -130,6 +133,7 @@ proc sdl_app_init(appstate: ptr pointer; argc: cint;
     deinitLock(app_state_root.event_lock)
     app_state_root = nil
     return app_failure
+  view.set_window(window_state.sdl_window)
 
   app_state_root.windows.add(window_state)
   appstate[] = cast[pointer](app_state_root)
@@ -142,8 +146,11 @@ proc sdl_app_event(appstate: pointer; event: ptr SdlEvent): SdlAppResult {.cdecl
     return app_failure
 
   let state = cast[AppState](appstate)
+  let ui_event = to_ui_event(event)
+  if ui_event.kind == ui_event_none:
+    return app_continue
   acquire(state.event_lock)
-  state.event_queue.addLast(event[])
+  state.event_queue.addLast(ui_event)
   release(state.event_lock)
   app_continue
 
@@ -154,11 +161,10 @@ proc sdl_app_iterate(appstate: pointer): SdlAppResult {.cdecl.} =
   let state = cast[AppState](appstate)
   dispatch_events(state)
   for window in state.windows:
-    if not render_frame(
+    if not window.view.render(
         window.renderer,
         window.clay_context,
         window.clay_string_cache,
-        window.view,
         1.0 / 60.0):
       return app_failure
   app_continue

@@ -8,7 +8,63 @@ type
     app_failure = 2
   SdlEvent* {.importc: "SDL_Event", header: "SDL3/SDL.h".} = object
     kind* {.importc: "type".}: uint32
+  SdlKeyboardEvent* = object
+    kind*: uint32
+    reserved: uint32
+    timestamp: uint64
+    window_id*: uint32
+    which: uint32
+    scancode: uint32
+    key*: uint32
+    modifiers*: uint16
+    raw: uint16
+    down: bool
+    repeat*: bool
+  SdlTextEditingEvent* = object
+    kind*: uint32
+    reserved: uint32
+    timestamp: uint64
+    window_id*: uint32
+    text*: cstring
+    start*: cint
+    length*: cint
+  SdlTextInputEvent* = object
+    kind*: uint32
+    reserved: uint32
+    timestamp: uint64
+    window_id*: uint32
+    text*: cstring
+  SdlMouseMotionEvent* = object
+    kind*: uint32
+    reserved: uint32
+    timestamp: uint64
+    window_id*: uint32
+    which: uint32
+    state*: uint32
+    x*: cfloat
+    y*: cfloat
+    xrel: cfloat
+    yrel: cfloat
+  SdlMouseButtonEvent* = object
+    kind*: uint32
+    reserved: uint32
+    timestamp: uint64
+    window_id*: uint32
+    which: uint32
+    button*: uint8
+    down*: bool
+    clicks: uint8
+    padding: uint8
+    x*: cfloat
+    y*: cfloat
   SdlWindow* {.importc: "SDL_Window", header: "SDL3/SDL.h".} = object
+  SdlWindowEvent* = object
+    kind*: uint32
+    reserved: uint32
+    timestamp: uint64
+    window_id*: uint32
+    data1: int32
+    data2: int32
   SdlGpuDevice* {.importc: "SDL_GPUDevice", header: "SDL3/SDL_gpu.h", incompleteStruct.} = object
   SdlGpuBuffer* {.importc: "SDL_GPUBuffer", header: "SDL3/SDL_gpu.h", incompleteStruct.} = object
   SdlGpuTransferBuffer* {.importc: "SDL_GPUTransferBuffer", header: "SDL3/SDL_gpu.h", incompleteStruct.} = object
@@ -560,6 +616,27 @@ type
   SdlMainFunc* = proc(argc: cint; argv: ptr ptr char): cint {.cdecl.}
 
 var sdl_event_quit* {.importc: "SDL_EVENT_QUIT", header: "SDL3/SDL_events.h".}: uint32
+var sdl_event_window_focus_lost* {.importc: "SDL_EVENT_WINDOW_FOCUS_LOST", header: "SDL3/SDL_events.h".}: uint32
+var sdl_event_key_down* {.importc: "SDL_EVENT_KEY_DOWN", header: "SDL3/SDL_events.h".}: uint32
+var sdl_event_text_editing* {.importc: "SDL_EVENT_TEXT_EDITING", header: "SDL3/SDL_events.h".}: uint32
+var sdl_event_text_input* {.importc: "SDL_EVENT_TEXT_INPUT", header: "SDL3/SDL_events.h".}: uint32
+var sdl_event_mouse_motion* {.importc: "SDL_EVENT_MOUSE_MOTION", header: "SDL3/SDL_events.h".}: uint32
+var sdl_event_mouse_button_down* {.importc: "SDL_EVENT_MOUSE_BUTTON_DOWN", header: "SDL3/SDL_events.h".}: uint32
+var sdl_event_mouse_button_up* {.importc: "SDL_EVENT_MOUSE_BUTTON_UP", header: "SDL3/SDL_events.h".}: uint32
+var sdl_button_left* {.importc: "SDL_BUTTON_LEFT", header: "SDL3/SDL_mouse.h".}: uint8
+var sdl_button_left_mask* {.importc: "SDL_BUTTON_LMASK", header: "SDL3/SDL_mouse.h".}: uint32
+var sdl_key_return* {.importc: "SDLK_RETURN", header: "SDL3/SDL_keycode.h".}: uint32
+var sdl_key_escape* {.importc: "SDLK_ESCAPE", header: "SDL3/SDL_keycode.h".}: uint32
+var sdl_key_backspace* {.importc: "SDLK_BACKSPACE", header: "SDL3/SDL_keycode.h".}: uint32
+var sdl_key_delete* {.importc: "SDLK_DELETE", header: "SDL3/SDL_keycode.h".}: uint32
+var sdl_key_left* {.importc: "SDLK_LEFT", header: "SDL3/SDL_keycode.h".}: uint32
+var sdl_key_right* {.importc: "SDLK_RIGHT", header: "SDL3/SDL_keycode.h".}: uint32
+var sdl_key_home* {.importc: "SDLK_HOME", header: "SDL3/SDL_keycode.h".}: uint32
+var sdl_key_end* {.importc: "SDLK_END", header: "SDL3/SDL_keycode.h".}: uint32
+var sdl_key_a* {.importc: "SDLK_A", header: "SDL3/SDL_keycode.h".}: uint32
+var sdl_kmod_ctrl* {.importc: "SDL_KMOD_CTRL", header: "SDL3/SDL_keycode.h".}: uint16
+var sdl_kmod_shift* {.importc: "SDL_KMOD_SHIFT", header: "SDL3/SDL_keycode.h".}: uint16
+var sdl_kmod_gui* {.importc: "SDL_KMOD_GUI", header: "SDL3/SDL_keycode.h".}: uint16
 var sdl_window_resizable* {.importc: "SDL_WINDOW_RESIZABLE", header: "SDL3/SDL_video.h".}: uint64
 var sdl_window_borderless* {.importc: "SDL_WINDOW_BORDERLESS", header: "SDL3/SDL_video.h".}: uint64
 var sdl_window_high_pixel_density* {.importc: "SDL_WINDOW_HIGH_PIXEL_DENSITY", header: "SDL3/SDL_video.h".}: uint64
@@ -569,8 +646,12 @@ proc set_app_metadata*(name, version, identifier: cstring): bool {.importc: "SDL
 proc run_app*(argc: cint; argv: ptr ptr char; main_function: SdlMainFunc; reserved: pointer): cint {.importc: "SDL_RunApp", header: "SDL3/SDL_main.h".}
 proc create_window*(title: cstring; width, height: cint; flags: uint64): ptr SdlWindow {.importc: "SDL_CreateWindow", header: "SDL3/SDL_video.h".}
 proc destroy_window*(window: ptr SdlWindow) {.importc: "SDL_DestroyWindow", header: "SDL3/SDL_video.h".}
+proc get_window_id*(window: ptr SdlWindow): uint32 {.importc: "SDL_GetWindowID", header: "SDL3/SDL_video.h".}
 proc get_window_size*(window: ptr SdlWindow; width, height: ptr cint): bool {.importc: "SDL_GetWindowSize", header: "SDL3/SDL_video.h".}
 proc get_window_display_scale*(window: ptr SdlWindow): cfloat {.importc: "SDL_GetWindowDisplayScale", header: "SDL3/SDL_video.h".}
+proc start_text_input*(window: ptr SdlWindow): bool {.importc: "SDL_StartTextInput", header: "SDL3/SDL_keyboard.h".}
+proc stop_text_input*(window: ptr SdlWindow): bool {.importc: "SDL_StopTextInput", header: "SDL3/SDL_keyboard.h".}
+proc set_text_input_area*(window: ptr SdlWindow; rect: ptr SdlRect; cursor: cint): bool {.importc: "SDL_SetTextInputArea", header: "SDL3/SDL_keyboard.h".}
 
 proc gpu_supports_shader_formats*(format_flags: SdlGpuShaderFormat; name: cstring): bool {.importc: "SDL_GPUSupportsShaderFormats", header: "SDL3/SDL_gpu.h".}
 proc gpu_supports_properties*(props: SdlPropertiesId): bool {.importc: "SDL_GPUSupportsProperties", header: "SDL3/SDL_gpu.h".}

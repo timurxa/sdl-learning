@@ -3,9 +3,23 @@ import std/os
 import std/tables
 import clay, sdl
 import freetype, harfbuzz
-import window as window_types
 
 type
+  ViewFrame* = object
+    logical_width*: uint32
+    logical_height*: uint32
+    pixel_width*: uint32
+    pixel_height*: uint32
+    display_scale*: float32
+    delta_time*: float32
+    string_cache_generation*: uint64
+    string_cache_generation_count*: int
+    exiting_transitions*: bool
+
+  PrepareFrameProc* = proc()
+  BuildElementsProc* = proc(frame: ViewFrame)
+  FinishFrameProc* = proc()
+
   QuadVertex = object
     corners: array[2, uint16]
   SpriteInstance = object
@@ -1067,7 +1081,8 @@ proc handle_error*(error_data: ClayErrorData) {.cdecl.} =
 
 
 proc render_frame*(renderer: Renderer; clay_context: ptr ClayContext;
-    string_cache: var ClayStringCache; view: window_types.WindowView;
+    string_cache: var ClayStringCache; prepare_frame: PrepareFrameProc;
+    build_elements: BuildElementsProc; finish_frame: FinishFrameProc;
     delta_time: float32): bool =
   active_renderer = renderer
   clay_set_current_context(clay_context)
@@ -1126,8 +1141,10 @@ proc render_frame*(renderer: Renderer; clay_context: ptr ClayContext;
 
   clay_set_layout_dimensions(clay_dimensions(logical_width, logical_height))
 
+  if prepare_frame != nil:
+    prepare_frame()
   let commands = clay(string_cache, delta_time):
-    view.build_elements(window_types.ViewFrame(
+    build_elements(ViewFrame(
       logical_width: logical_width,
       logical_height: logical_height,
       pixel_width: width,
@@ -1137,6 +1154,8 @@ proc render_frame*(renderer: Renderer; clay_context: ptr ClayContext;
       string_cache_generation: clay_string_cache_current_generation(string_cache),
       string_cache_generation_count: clay_string_cache_generation_count(string_cache),
       exiting_transitions: clay_has_exiting_transitions()))
+  if finish_frame != nil:
+    finish_frame()
   instance_data.setLen(0)
   text_instance_data.setLen(0)
   clip_stack.setLen(0)
