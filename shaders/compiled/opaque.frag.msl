@@ -13,6 +13,7 @@ struct main0_in
     float4 in_var_TEXCOORD0 [[user(locn0), flat]];
     uint in_var_TEXCOORD1 [[user(locn1)]];
     float4 in_var_TEXCOORD2 [[user(locn2), flat]];
+    float4 in_var_TEXCOORD3 [[user(locn3), flat]];
 };
 
 fragment main0_out main0(main0_in in [[stage_in]], float4 gl_FragCoord [[position]])
@@ -20,10 +21,203 @@ fragment main0_out main0(main0_in in [[stage_in]], float4 gl_FragCoord [[positio
     main0_out out = {};
     if (in.in_var_TEXCOORD1 == 1u)
     {
-        float2 _31 = gl_FragCoord.xy - in.in_var_TEXCOORD2.xy;
-        if (dot(_31, _31) > (in.in_var_TEXCOORD2.z * in.in_var_TEXCOORD2.z))
+        float2 _39 = gl_FragCoord.xy - in.in_var_TEXCOORD2.xy;
+        if (dot(_39, _39) > (in.in_var_TEXCOORD2.z * in.in_var_TEXCOORD2.z))
         {
             discard_fragment();
+        }
+    }
+    else
+    {
+        if (in.in_var_TEXCOORD1 == 2u)
+        {
+            float2 _56 = in.in_var_TEXCOORD2.zw - in.in_var_TEXCOORD2.xy;
+            float2 _57 = gl_FragCoord.xy - in.in_var_TEXCOORD2.xy;
+            float _59 = _57.y;
+            float _62 = _57.x;
+            float _64 = (_56.x * _59) - (_56.y * _62);
+            float2 _65 = in.in_var_TEXCOORD3.xy - in.in_var_TEXCOORD2.zw;
+            float2 _66 = gl_FragCoord.xy - in.in_var_TEXCOORD2.zw;
+            float _73 = (_65.x * _66.y) - (_65.y * _66.x);
+            float2 _74 = in.in_var_TEXCOORD2.xy - in.in_var_TEXCOORD3.xy;
+            float2 _75 = gl_FragCoord.xy - in.in_var_TEXCOORD3.xy;
+            float _77 = _75.y;
+            float _80 = _75.x;
+            float _82 = (_74.x * _77) - (_74.y * _80);
+            bool _87;
+            if (_64 >= 0.0)
+            {
+                _87 = _73 >= 0.0;
+            }
+            else
+            {
+                _87 = false;
+            }
+            bool _91;
+            if (_87)
+            {
+                _91 = _82 >= 0.0;
+            }
+            else
+            {
+                _91 = false;
+            }
+            bool _104;
+            if (!_91)
+            {
+                bool _99;
+                if (_64 <= 0.0)
+                {
+                    _99 = _73 <= 0.0;
+                }
+                else
+                {
+                    _99 = false;
+                }
+                bool _103;
+                if (_99)
+                {
+                    _103 = _82 <= 0.0;
+                }
+                else
+                {
+                    _103 = false;
+                }
+                _104 = _103;
+            }
+            else
+            {
+                _104 = true;
+            }
+            bool _152;
+            if (!_104)
+            {
+                float2 _108 = in.in_var_TEXCOORD3.xy - in.in_var_TEXCOORD2.xy;
+                float _113 = (_108.x * _59) - (_108.y * _62);
+                float2 _114 = in.in_var_TEXCOORD3.zw - in.in_var_TEXCOORD3.xy;
+                float _119 = (_114.x * _77) - (_114.y * _80);
+                float2 _120 = in.in_var_TEXCOORD2.xy - in.in_var_TEXCOORD3.zw;
+                float2 _121 = gl_FragCoord.xy - in.in_var_TEXCOORD3.zw;
+                float _128 = (_120.x * _121.y) - (_120.y * _121.x);
+                bool _133;
+                if (_113 >= 0.0)
+                {
+                    _133 = _119 >= 0.0;
+                }
+                else
+                {
+                    _133 = false;
+                }
+                bool _137;
+                if (_133)
+                {
+                    _137 = _128 >= 0.0;
+                }
+                else
+                {
+                    _137 = false;
+                }
+                bool _150;
+                if (!_137)
+                {
+                    bool _145;
+                    if (_113 <= 0.0)
+                    {
+                        _145 = _119 <= 0.0;
+                    }
+                    else
+                    {
+                        _145 = false;
+                    }
+                    bool _149;
+                    if (_145)
+                    {
+                        _149 = _128 <= 0.0;
+                    }
+                    else
+                    {
+                        _149 = false;
+                    }
+                    _150 = _149;
+                }
+                else
+                {
+                    _150 = true;
+                }
+                _152 = !_150;
+            }
+            else
+            {
+                _152 = false;
+            }
+            if (_152)
+            {
+                discard_fragment();
+            }
+        }
+        else
+        {
+            if (in.in_var_TEXCOORD1 == 3u)
+            {
+                float2 _162 = in.in_var_TEXCOORD2.zw - in.in_var_TEXCOORD2.xy;
+                float2 _163 = gl_FragCoord.xy - in.in_var_TEXCOORD2.xy;
+                float _170 = (_162.x * _163.y) - (_162.y * _163.x);
+                float2 _171 = in.in_var_TEXCOORD3.xy - in.in_var_TEXCOORD2.zw;
+                float2 _172 = gl_FragCoord.xy - in.in_var_TEXCOORD2.zw;
+                float _179 = (_171.x * _172.y) - (_171.y * _172.x);
+                float2 _180 = in.in_var_TEXCOORD2.xy - in.in_var_TEXCOORD3.xy;
+                float2 _181 = gl_FragCoord.xy - in.in_var_TEXCOORD3.xy;
+                float _188 = (_180.x * _181.y) - (_180.y * _181.x);
+                bool _193;
+                if (_170 >= 0.0)
+                {
+                    _193 = _179 >= 0.0;
+                }
+                else
+                {
+                    _193 = false;
+                }
+                bool _197;
+                if (_193)
+                {
+                    _197 = _188 >= 0.0;
+                }
+                else
+                {
+                    _197 = false;
+                }
+                bool _210;
+                if (!_197)
+                {
+                    bool _205;
+                    if (_170 <= 0.0)
+                    {
+                        _205 = _179 <= 0.0;
+                    }
+                    else
+                    {
+                        _205 = false;
+                    }
+                    bool _209;
+                    if (_205)
+                    {
+                        _209 = _188 <= 0.0;
+                    }
+                    else
+                    {
+                        _209 = false;
+                    }
+                    _210 = _209;
+                }
+                else
+                {
+                    _210 = true;
+                }
+                if (!_210)
+                {
+                    discard_fragment();
+                }
+            }
         }
     }
     out.out_var_SV_Target0 = in.in_var_TEXCOORD0;

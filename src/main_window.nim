@@ -96,6 +96,23 @@ proc new_main_window*(): MainWindow =
             size: dimensions(32, 32),
             circle_color: rgba(169, 126, 255, 255),
             z_index: 3)],
+        arrows: @[
+          GraphArrow(
+            start_node_index: 0,
+            end_node_index: 1,
+            padding: 8,
+            color: rgba(20, 18, 15, 255),
+            shaft_width: 3,
+            head_length: 12,
+            head_width: 12),
+          GraphArrow(
+            start_node_index: 1,
+            end_node_index: 2,
+            padding: 8,
+            color: rgba(20, 18, 15, 255),
+            shaft_width: 3,
+            head_length: 12,
+            head_width: 12)],
         draw_list: new_opaque_draw_list(),
         node_pointer_capture_mode: clay_pointer_capture_mode_passthrough)))
 

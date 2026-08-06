@@ -26,6 +26,8 @@ type
   OpaqueDrawKind* = enum
     opaque_draw_rectangle
     opaque_draw_circle
+    opaque_draw_quad
+    opaque_draw_triangle
   OpaqueDrawItem* = object
     kind*: OpaqueDrawKind
     origin*: ClayVector2
@@ -33,6 +35,7 @@ type
     color*: ClayColor
     z_index*: int16
     insertion_order*: uint32
+    shape_data*: array[8, float32]
   OpaqueDrawList* = ref object
     ## Frame-confined. Owner retains this object while Clay/rendering use it.
     items*: seq[OpaqueDrawItem]
@@ -42,7 +45,7 @@ type
     size: array[2, uint16]
     color: array[4, uint8]
     kind: uint32
-    shape_data: array[4, float32]
+    shape_data: array[8, float32]
     depth: float32
   TextInstance = object
     origin: array[2, uint16]
@@ -143,10 +146,10 @@ const
   glyph_atlas_padding = 1'u32
 
 
-doAssert sizeof(SpriteInstance) == 36
+doAssert sizeof(SpriteInstance) == 52
 doAssert offsetOf(SpriteInstance, kind) == 12
 doAssert offsetOf(SpriteInstance, shape_data) == 16
-doAssert offsetOf(SpriteInstance, depth) == 32
+doAssert offsetOf(SpriteInstance, depth) == 48
 doAssert sizeof(TextInstance) == 32
 doAssert offsetOf(TextInstance, uv) == 12
 doAssert offsetOf(TextInstance, depth) == 28
@@ -197,7 +200,7 @@ proc clear_opaque_draw_list*(draw_list: OpaqueDrawList) =
 
 proc add_opaque_draw_item(draw_list: OpaqueDrawList; kind: OpaqueDrawKind;
     origin: ClayVector2; size: ClayDimensions; color: ClayColor;
-    z_index: int16) =
+    z_index: int16; shape_data: array[8, float32]) =
   doAssert draw_list != nil
   draw_list.items.add(OpaqueDrawItem(
     kind: kind,
@@ -206,6 +209,7 @@ proc add_opaque_draw_item(draw_list: OpaqueDrawList; kind: OpaqueDrawKind;
     color: color,
     z_index: z_index,
     insertion_order: draw_list.next_insertion_order,
+    shape_data: shape_data,
   ))
   inc draw_list.next_insertion_order
 
@@ -219,6 +223,7 @@ proc add_opaque_circle*(draw_list: OpaqueDrawList; origin: ClayVector2;
     clay_dimensions(circle_diameter, circle_diameter),
     color,
     z_index,
+    [0'f32, 0'f32, 0'f32, 0'f32, 0'f32, 0'f32, 0'f32, 0'f32],
   )
 
 proc add_opaque_rectangle*(draw_list: OpaqueDrawList; origin: ClayVector2;
@@ -230,7 +235,104 @@ proc add_opaque_rectangle*(draw_list: OpaqueDrawList; origin: ClayVector2;
     size,
     color,
     z_index,
+    [0'f32, 0'f32, 0'f32, 0'f32, 0'f32, 0'f32, 0'f32, 0'f32],
   )
+
+proc add_opaque_arrow*(draw_list: OpaqueDrawList; start_point, end_point: ClayVector2;
+    color: ClayColor; shaft_width, head_length, head_width: SomeNumber;
+    z_index: int16 = 0) =
+  let delta_x = float32(end_point.x - start_point.x)
+  let delta_y = float32(end_point.y - start_point.y)
+  let arrow_length = sqrt(delta_x * delta_x + delta_y * delta_y)
+  if arrow_length <= 0:
+    return
+
+  let direction_x = delta_x / arrow_length
+  let direction_y = delta_y / arrow_length
+  let normal_x = -direction_y
+  let normal_y = direction_x
+  let actual_shaft_width = max(float32(shaft_width), 0'f32)
+  let actual_head_length = min(
+    max(float32(head_length), 0'f32),
+    arrow_length,
+  )
+  let actual_head_width = max(float32(head_width), 0'f32)
+  let shaft_half_width = actual_shaft_width / 2'f32
+  let head_base_x = float32(end_point.x) - direction_x * actual_head_length
+  let head_base_y = float32(end_point.y) - direction_y * actual_head_length
+  let head_half_width = actual_head_width / 2'f32
+
+  let shaft_points = [
+    vector2(
+      float32(start_point.x) + normal_x * shaft_half_width,
+      float32(start_point.y) + normal_y * shaft_half_width),
+    vector2(
+      head_base_x + normal_x * shaft_half_width,
+      head_base_y + normal_y * shaft_half_width),
+    vector2(
+      head_base_x - normal_x * shaft_half_width,
+      head_base_y - normal_y * shaft_half_width),
+    vector2(
+      float32(start_point.x) - normal_x * shaft_half_width,
+      float32(start_point.y) - normal_y * shaft_half_width),
+  ]
+  let head_points = [
+    end_point,
+    vector2(
+      head_base_x + normal_x * head_half_width,
+      head_base_y + normal_y * head_half_width),
+    vector2(
+      head_base_x - normal_x * head_half_width,
+      head_base_y - normal_y * head_half_width),
+  ]
+
+  var min_x = float32(start_point.x)
+  var max_x = min_x
+  var min_y = float32(start_point.y)
+  var max_y = min_y
+  for point in shaft_points:
+    min_x = min(min_x, float32(point.x))
+    max_x = max(max_x, float32(point.x))
+    min_y = min(min_y, float32(point.y))
+    max_y = max(max_y, float32(point.y))
+  for point in head_points:
+    min_x = min(min_x, float32(point.x))
+    max_x = max(max_x, float32(point.x))
+    min_y = min(min_y, float32(point.y))
+    max_y = max(max_y, float32(point.y))
+
+  let arrow_origin = vector2(min_x, min_y)
+  let arrow_size = clay_dimensions(max_x - min_x, max_y - min_y)
+  if actual_shaft_width > 0:
+    add_opaque_draw_item(
+      draw_list,
+      opaque_draw_quad,
+      arrow_origin,
+      arrow_size,
+      color,
+      z_index,
+      [
+        float32(shaft_points[0].x), float32(shaft_points[0].y),
+        float32(shaft_points[1].x), float32(shaft_points[1].y),
+        float32(shaft_points[2].x), float32(shaft_points[2].y),
+        float32(shaft_points[3].x), float32(shaft_points[3].y),
+      ],
+    )
+  if actual_head_length > 0 and actual_head_width > 0:
+    add_opaque_draw_item(
+      draw_list,
+      opaque_draw_triangle,
+      arrow_origin,
+      arrow_size,
+      color,
+      z_index,
+      [
+        float32(head_points[0].x), float32(head_points[0].y),
+        float32(head_points[1].x), float32(head_points[1].y),
+        float32(head_points[2].x), float32(head_points[2].y),
+        0'f32, 0'f32,
+      ],
+    )
 
 proc opaque_draw_list_pointer*(draw_list: OpaqueDrawList): pointer {.inline.} =
   cast[pointer](draw_list)
@@ -312,7 +414,7 @@ proc to_pixel_rect(rect: Rect; scale: float32): PixelRect =
 proc is_empty(rect: PixelRect): bool = rect.size[0] == 0 or rect.size[1] == 0
 
 proc append_opaque_instance(pixel_box: PixelRect; color: ClayColor;
-    kind: OpaqueDrawKind; shape_data: array[4, float32];
+    kind: OpaqueDrawKind; shape_data: array[8, float32];
     depth: float32): bool =
   if instance_data.len >= int(instance_buffer_capacity):
     return false
@@ -359,14 +461,22 @@ proc append_opaque_draw_item(item: OpaqueDrawItem; command_box, current_clip: Re
   if pixel_box.is_empty():
     return true
 
-  var shape_data = [0'f32, 0'f32, 0'f32, 0'f32]
+  var shape_data = item.shape_data
   if item.kind == opaque_draw_circle:
     shape_data = [
       (source_box.x + source_box.w / 2'f32) * display_scale,
       (source_box.y + source_box.h / 2'f32) * display_scale,
       min(source_box.w, source_box.h) * display_scale / 2'f32,
       0'f32,
+      0'f32,
+      0'f32,
+      0'f32,
+      0'f32,
     ]
+  elif item.kind == opaque_draw_quad or item.kind == opaque_draw_triangle:
+    for index in countup(0, shape_data.high, 2):
+      shape_data[index] = (shape_data[index] + command_box.x) * display_scale
+      shape_data[index + 1] = (shape_data[index + 1] + command_box.y) * display_scale
 
   append_opaque_instance(pixel_box, item.color, item.kind, shape_data, depth)
 
@@ -987,6 +1097,12 @@ proc init_renderer*(renderer: Renderer; target_window: ptr SdlWindow;
     SdlGpuVertexAttribute(
       location: 6,
       buffer_slot: 1,
+      format: sdl_gpu_vertex_element_format_float4,
+      offset: uint32(offsetOf(SpriteInstance, shape_data) + sizeof(array[4, float32])),
+    ),
+    SdlGpuVertexAttribute(
+      location: 7,
+      buffer_slot: 1,
       format: sdl_gpu_vertex_element_format_float,
       offset: uint32(offsetOf(SpriteInstance, depth)),
     ),
@@ -1326,7 +1442,7 @@ proc render_frame*(renderer: Renderer; clay_context: ptr ClayContext;
           pixel_box,
           color,
           opaque_draw_rectangle,
-          [0'f32, 0'f32, 0'f32, 0'f32],
+          [0'f32, 0'f32, 0'f32, 0'f32, 0'f32, 0'f32, 0'f32, 0'f32],
           depth):
         return false
     of clay_render_command_type_border:
@@ -1369,7 +1485,7 @@ proc render_frame*(renderer: Renderer; clay_context: ptr ClayContext;
             pixel_segment,
             color,
             opaque_draw_rectangle,
-            [0'f32, 0'f32, 0'f32, 0'f32],
+            [0'f32, 0'f32, 0'f32, 0'f32, 0'f32, 0'f32, 0'f32, 0'f32],
             depth):
           return false
     of clay_render_command_type_text:

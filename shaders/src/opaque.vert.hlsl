@@ -12,15 +12,17 @@ struct VertexInput {
 	uint2 size     : TEXCOORD2;
 	uint4 color    : TEXCOORD3;
 	uint kind      : TEXCOORD4;
-	float4 shape_data : TEXCOORD5;
-	float depth    : TEXCOORD6;
+	float4 shape_data_a : TEXCOORD5;
+	float4 shape_data_b : TEXCOORD6;
+	float depth    : TEXCOORD7;
 };
 
 struct VertexOutput {
 	float4 position : SV_Position;
 	nointerpolation float4 color : TEXCOORD0;
 	nointerpolation uint kind : TEXCOORD1;
-	nointerpolation float4 shape_data : TEXCOORD2;
+	nointerpolation float4 shape_data_a : TEXCOORD2;
+	nointerpolation float4 shape_data_b : TEXCOORD3;
 };
 
 VertexOutput main(VertexInput input) {
@@ -35,6 +37,7 @@ VertexOutput main(VertexInput input) {
 	output.position = float4(ndc_position, input.depth, 1.0);
 	output.color = float4(input.color) / 255.0;
 	output.kind = input.kind;
-	output.shape_data = input.shape_data;
+	output.shape_data_a = input.shape_data_a;
+	output.shape_data_b = input.shape_data_b;
 	return output;
 }

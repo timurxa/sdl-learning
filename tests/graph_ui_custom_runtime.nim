@@ -27,6 +27,15 @@ var graph = GraphView(
       size: dimensions(24, 24),
       circle_color: rgba(0, 255, 0, 255),
       z_index: -1)],
+  arrows: @[
+    GraphArrow(
+      start_node_index: 0,
+      end_node_index: 1,
+      padding: 4,
+      color: rgba(255, 255, 255, 255),
+      shaft_width: 3,
+      head_length: 6,
+      head_width: 8)],
   draw_list: new_opaque_draw_list())
 
 clay_begin_layout()
@@ -39,11 +48,17 @@ element("root"):
     discard
 let commands = clay_end_layout(0)
 
-doAssert graph.draw_list.items.len == 2
-doAssert graph.draw_list.items[0].kind == opaque_draw_circle
-doAssert graph.draw_list.items[1].kind == opaque_draw_circle
-doAssert graph.draw_list.items[0].z_index == 12
-doAssert graph.draw_list.items[1].z_index == 9
+doAssert graph.draw_list.items.len == 4
+doAssert graph.draw_list.items[0].kind == opaque_draw_quad
+doAssert graph.draw_list.items[1].kind == opaque_draw_triangle
+doAssert graph.draw_list.items[2].kind == opaque_draw_circle
+doAssert graph.draw_list.items[3].kind == opaque_draw_circle
+doAssert graph.draw_list.items[0].z_index == 0
+doAssert graph.draw_list.items[1].z_index == 0
+doAssert graph.draw_list.items[0].shape_data[0] == 40
+doAssert graph.draw_list.items[0].shape_data[2] == 46
+doAssert graph.draw_list.items[2].z_index == 12
+doAssert graph.draw_list.items[3].z_index == 9
 
 var custom_command_count: int
 for command in commands:
