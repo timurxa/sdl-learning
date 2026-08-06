@@ -38,21 +38,24 @@ proc new_main_window*(): MainWindow =
       blue: rgba(70, 145, 255, 255),
       pink: rgba(255, 103, 174, 255),
       mint: rgba(83, 220, 169, 255),
-      purple: rgba(169, 126, 255, 255)),
+    purple: rgba(169, 126, 255, 255)),
     ui_state: new_ui_state(),
     graph_view: GraphView(nodes: @[
       GraphNode(
         stable_id: 1,
         screen_position: vector2(300, 300),
         size: dimensions(154, 62),
+        circle_color: rgba(255, 210, 63, 255),
         title: "INPUT NODE",
         detail: "SOURCE / READY"),
       GraphNode(
         stable_id: 2,
         screen_position: vector2(500, 500),
         size: dimensions(154, 62),
+        circle_color: rgba(83, 220, 169, 255),
         title: "OUTPUT NODE",
-        detail: "SINK / WAITING")]))
+        detail: "SINK / WAITING")],
+      draw_list: new_opaque_draw_list()))
 
 proc background_color*(view: MainWindow): ClayColor =
   view.palette.background
@@ -417,11 +420,7 @@ proc build_elements*(view: MainWindow; frame: ViewFrame) =
             width = border_outside(4)
 
           graph_window(view.graph_view, node):
-            let node_background_color = if node.stable_id == 1:
-              palette_color(view.palette.yellow)
-            else:
-              palette_color(view.palette.mint)
-            graph_node_panel(node, node_background_color,
+            graph_node_panel(node, rgba(0, 0, 0, 0),
                 palette_color(view.palette.ink)):
               text(node.title):
                 font_size = 11

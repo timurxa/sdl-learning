@@ -11,11 +11,21 @@ struct main0_out
 struct main0_in
 {
     float4 in_var_TEXCOORD0 [[user(locn0), flat]];
+    uint in_var_TEXCOORD1 [[user(locn1)]];
+    float4 in_var_TEXCOORD2 [[user(locn2), flat]];
 };
 
-fragment main0_out main0(main0_in in [[stage_in]])
+fragment main0_out main0(main0_in in [[stage_in]], float4 gl_FragCoord [[position]])
 {
     main0_out out = {};
+    if (in.in_var_TEXCOORD1 == 1u)
+    {
+        float2 _31 = gl_FragCoord.xy - in.in_var_TEXCOORD2.xy;
+        if (dot(_31, _31) > (in.in_var_TEXCOORD2.z * in.in_var_TEXCOORD2.z))
+        {
+            discard_fragment();
+        }
+    }
     out.out_var_SV_Target0 = in.in_var_TEXCOORD0;
     return out;
 }

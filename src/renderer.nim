@@ -1,3 +1,4 @@
+import std/algorithm
 import std/math
 import std/os
 import std/tables
@@ -22,10 +23,26 @@ type
 
   QuadVertex = object
     corners: array[2, uint16]
+  OpaqueDrawKind* = enum
+    opaque_draw_rectangle
+    opaque_draw_circle
+  OpaqueDrawItem* = object
+    kind*: OpaqueDrawKind
+    origin*: ClayVector2
+    size*: ClayDimensions
+    color*: ClayColor
+    z_index*: int16
+    insertion_order*: uint32
+  OpaqueDrawList* = ref object
+    ## Frame-confined. Owner retains this object while Clay/rendering use it.
+    items*: seq[OpaqueDrawItem]
+    next_insertion_order: uint32
   SpriteInstance = object
     origin: array[2, uint16]
     size: array[2, uint16]
     color: array[4, uint8]
+    kind: uint32
+    shape_data: array[4, float32]
     depth: float32
   TextInstance = object
     origin: array[2, uint16]
@@ -126,7 +143,10 @@ const
   glyph_atlas_padding = 1'u32
 
 
-doAssert sizeof(SpriteInstance) == 16
+doAssert sizeof(SpriteInstance) == 36
+doAssert offsetOf(SpriteInstance, kind) == 12
+doAssert offsetOf(SpriteInstance, shape_data) == 16
+doAssert offsetOf(SpriteInstance, depth) == 32
 doAssert sizeof(TextInstance) == 32
 doAssert offsetOf(TextInstance, uv) == 12
 doAssert offsetOf(TextInstance, depth) == 28
@@ -165,6 +185,55 @@ var active_renderer: Renderer
 
 proc new_renderer*(): Renderer =
   new(result)
+
+proc new_opaque_draw_list*(): OpaqueDrawList =
+  new(result)
+
+proc clear_opaque_draw_list*(draw_list: OpaqueDrawList) =
+  if draw_list == nil:
+    return
+  draw_list.items.setLen(0)
+  draw_list.next_insertion_order = 0
+
+proc add_opaque_draw_item(draw_list: OpaqueDrawList; kind: OpaqueDrawKind;
+    origin: ClayVector2; size: ClayDimensions; color: ClayColor;
+    z_index: int16) =
+  doAssert draw_list != nil
+  draw_list.items.add(OpaqueDrawItem(
+    kind: kind,
+    origin: origin,
+    size: size,
+    color: color,
+    z_index: z_index,
+    insertion_order: draw_list.next_insertion_order,
+  ))
+  inc draw_list.next_insertion_order
+
+proc add_opaque_circle*(draw_list: OpaqueDrawList; origin: ClayVector2;
+    diameter: SomeNumber; color: ClayColor; z_index: int16 = 0) =
+  let circle_diameter = cfloat(diameter)
+  add_opaque_draw_item(
+    draw_list,
+    opaque_draw_circle,
+    origin,
+    clay_dimensions(circle_diameter, circle_diameter),
+    color,
+    z_index,
+  )
+
+proc add_opaque_rectangle*(draw_list: OpaqueDrawList; origin: ClayVector2;
+    size: ClayDimensions; color: ClayColor; z_index: int16 = 0) =
+  add_opaque_draw_item(
+    draw_list,
+    opaque_draw_rectangle,
+    origin,
+    size,
+    color,
+    z_index,
+  )
+
+proc opaque_draw_list_pointer*(draw_list: OpaqueDrawList): pointer {.inline.} =
+  cast[pointer](draw_list)
 
 template window: untyped = active_renderer.window
 template display_scale: untyped = active_renderer.display_scale
@@ -241,6 +310,65 @@ proc to_pixel_rect(rect: Rect; scale: float32): PixelRect =
   ]
 
 proc is_empty(rect: PixelRect): bool = rect.size[0] == 0 or rect.size[1] == 0
+
+proc append_opaque_instance(pixel_box: PixelRect; color: ClayColor;
+    kind: OpaqueDrawKind; shape_data: array[4, float32];
+    depth: float32): bool =
+  if instance_data.len >= int(instance_buffer_capacity):
+    return false
+  instance_data.add(SpriteInstance(
+    origin: pixel_box.origin,
+    size: pixel_box.size,
+    color: [
+      uint8(color.r),
+      uint8(color.g),
+      uint8(color.b),
+      uint8(color.a),
+    ],
+    kind: uint32(ord(kind)),
+    shape_data: shape_data,
+    depth: depth,
+  ))
+  true
+
+proc compare_opaque_draw_items(left, right: OpaqueDrawItem): int =
+  if left.z_index < right.z_index:
+    return -1
+  if left.z_index > right.z_index:
+    return 1
+  if left.insertion_order < right.insertion_order:
+    return -1
+  if left.insertion_order > right.insertion_order:
+    return 1
+  0
+
+proc append_opaque_draw_item(item: OpaqueDrawItem; command_box, current_clip: Rect;
+    depth: float32): bool =
+  let source_box = Rect(
+    x: command_box.x + float32(item.origin.x),
+    y: command_box.y + float32(item.origin.y),
+    w: float32(item.size.width),
+    h: float32(item.size.height),
+  )
+  var visible_box = source_box
+  clip_rect(visible_box, current_clip)
+  if visible_box.is_empty():
+    return true
+
+  let pixel_box = to_pixel_rect(visible_box, display_scale)
+  if pixel_box.is_empty():
+    return true
+
+  var shape_data = [0'f32, 0'f32, 0'f32, 0'f32]
+  if item.kind == opaque_draw_circle:
+    shape_data = [
+      (source_box.x + source_box.w / 2'f32) * display_scale,
+      (source_box.y + source_box.h / 2'f32) * display_scale,
+      min(source_box.w, source_box.h) * display_scale / 2'f32,
+      0'f32,
+    ]
+
+  append_opaque_instance(pixel_box, item.color, item.kind, shape_data, depth)
 
 proc scaled_font_pixel_size(pixel_size: uint16; scale: float32): uint16 =
   checked_pixel_value(max(
@@ -847,6 +975,18 @@ proc init_renderer*(renderer: Renderer; target_window: ptr SdlWindow;
     SdlGpuVertexAttribute(
       location: 4,
       buffer_slot: 1,
+      format: sdl_gpu_vertex_element_format_uint,
+      offset: uint32(offsetOf(SpriteInstance, kind)),
+    ),
+    SdlGpuVertexAttribute(
+      location: 5,
+      buffer_slot: 1,
+      format: sdl_gpu_vertex_element_format_float4,
+      offset: uint32(offsetOf(SpriteInstance, shape_data)),
+    ),
+    SdlGpuVertexAttribute(
+      location: 6,
+      buffer_slot: 1,
       format: sdl_gpu_vertex_element_format_float,
       offset: uint32(offsetOf(SpriteInstance, depth)),
     ),
@@ -919,7 +1059,7 @@ proc init_renderer*(renderer: Renderer; target_window: ptr SdlWindow;
     target_info: SdlGpuGraphicsPipelineTargetInfo(
       color_target_descriptions: addr opaque_color_target_description,
       num_color_targets: 1,
-      depth_stencil_format: sdl_gpu_texture_format_d16_unorm,
+      depth_stencil_format: sdl_gpu_texture_format_d32_float,
       has_depth_stencil_target: true,
     ),
   )
@@ -1011,9 +1151,11 @@ proc init_renderer*(renderer: Renderer; target_window: ptr SdlWindow;
     addr coverage_pipeline_create_info,
   )
 
-  instance_buffer_capacity = uint32(clay_get_max_element_count())
+  let clay_element_capacity = uint32(clay_get_max_element_count())
+  # Leave room for border segments plus custom items.
+  instance_buffer_capacity = clay_element_capacity * 8
   instance_data = newSeqOfCap[SpriteInstance](int(instance_buffer_capacity))
-  text_instance_buffer_capacity = instance_buffer_capacity * 4
+  text_instance_buffer_capacity = clay_element_capacity * 4
   text_instance_data = newSeqOfCap[TextInstance](int(text_instance_buffer_capacity))
 
   var quad_vertex_buffer_create_info = SdlGpuBufferCreateInfo(
@@ -1125,7 +1267,7 @@ proc render_frame*(renderer: Renderer; clay_context: ptr ClayContext;
 
     var depth_texture_create_info = SdlGpuTextureCreateInfo(
       `type`: sdl_gpu_texture_type_2d,
-      format: sdl_gpu_texture_format_d16_unorm,
+      format: sdl_gpu_texture_format_d32_float,
       usage: sdl_gpu_texture_usage_depth_stencil_target,
       width: width,
       height: height,
@@ -1180,19 +1322,13 @@ proc render_frame*(renderer: Renderer; clay_context: ptr ClayContext;
       if box.is_empty(): continue
       let pixel_box = to_pixel_rect(box, display_scale)
       if pixel_box.is_empty(): continue
-      if instance_data.len >= int(instance_buffer_capacity):
+      if not append_opaque_instance(
+          pixel_box,
+          color,
+          opaque_draw_rectangle,
+          [0'f32, 0'f32, 0'f32, 0'f32],
+          depth):
         return false
-      instance_data.add(SpriteInstance(
-        origin: pixel_box.origin,
-        size: pixel_box.size,
-        color: [
-          uint8(color.r),
-          uint8(color.g),
-          uint8(color.b),
-          uint8(color.a),
-        ],
-        depth: depth,
-      ))
     of clay_render_command_type_border:
       let box: Rect = command.bounding_box
       let color = command.render_data.border.color
@@ -1229,19 +1365,13 @@ proc render_frame*(renderer: Renderer; clay_context: ptr ClayContext;
         if segment.is_empty(): continue
         let pixel_segment = to_pixel_rect(segment, display_scale)
         if pixel_segment.is_empty(): continue
-        if instance_data.len >= int(instance_buffer_capacity):
+        if not append_opaque_instance(
+            pixel_segment,
+            color,
+            opaque_draw_rectangle,
+            [0'f32, 0'f32, 0'f32, 0'f32],
+            depth):
           return false
-        instance_data.add(SpriteInstance(
-          origin: pixel_segment.origin,
-          size: pixel_segment.size,
-          color: [
-            uint8(color.r),
-            uint8(color.g),
-            uint8(color.b),
-            uint8(color.a),
-          ],
-          depth: depth,
-        ))
     of clay_render_command_type_text:
       let text_data = command.render_data.text
       let text_layout = get_text_layout(
@@ -1293,7 +1423,28 @@ proc render_frame*(renderer: Renderer; clay_context: ptr ClayContext;
       clip_stack.setLen(clip_stack.len - 1)
     of clay_render_command_type_overlay_color_start: discard
     of clay_render_command_type_overlay_color_end: discard
-    of clay_render_command_type_custom: discard
+    of clay_render_command_type_custom:
+      let draw_list = cast[OpaqueDrawList](
+        command.render_data.custom.custom_data)
+      if draw_list == nil:
+        return false
+      draw_list.items.sort(compare_opaque_draw_items)
+      let item_count = draw_list.items.len
+      if item_count == 0:
+        continue
+
+      var custom_clip = clip_stack[^1]
+      clip_rect(custom_clip, command.bounding_box)
+      let command_span = 1'f32 / float32(commands.length + 1)
+      for item_index, item in draw_list.items:
+        let item_depth = depth - command_span *
+          float32(item_index + 1) / float32(item_count + 1)
+        if not append_opaque_draw_item(
+            item,
+            command.bounding_box,
+            custom_clip,
+            item_depth):
+          return false
     else: return false
 
   if not stage_glyph_atlas_uploads():
