@@ -644,6 +644,7 @@ var sdl_button_right* {.importc: "SDL_BUTTON_RIGHT", header: "SDL3/SDL_mouse.h".
 var sdl_button_left_mask* {.importc: "SDL_BUTTON_LMASK", header: "SDL3/SDL_mouse.h".}: uint32
 var sdl_mousewheel_flipped* {.importc: "SDL_MOUSEWHEEL_FLIPPED", header: "SDL3/SDL_mouse.h".}: uint32
 var sdl_key_return* {.importc: "SDLK_RETURN", header: "SDL3/SDL_keycode.h".}: uint32
+var sdl_key_kp_enter* {.importc: "SDLK_KP_ENTER", header: "SDL3/SDL_keycode.h".}: uint32
 var sdl_key_escape* {.importc: "SDLK_ESCAPE", header: "SDL3/SDL_keycode.h".}: uint32
 var sdl_key_backspace* {.importc: "SDLK_BACKSPACE", header: "SDL3/SDL_keycode.h".}: uint32
 var sdl_key_delete* {.importc: "SDLK_DELETE", header: "SDL3/SDL_keycode.h".}: uint32

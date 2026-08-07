@@ -29,8 +29,8 @@ var graph = GraphView(
       z_index: -1)],
   arrows: @[
     GraphArrow(
-      start_node_index: 0,
-      end_node_index: 1,
+      start_node_id: 1,
+      end_node_id: 2,
       padding: 4,
       color: rgba(255, 255, 255, 255),
       shaft_width: 3,

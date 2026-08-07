@@ -46,10 +46,12 @@ type
 
   UiActionKind* = enum
     ui_action_button_clicked
+    ui_action_text_field_submitted
 
   UiAction* = object
     kind*: UiActionKind
     button_id*: ButtonId
+    text_field_id*: TextFieldId
 
   InteractiveField = object
     id: TextFieldId
@@ -74,8 +76,12 @@ type
     pressed_button: ButtonId
     pointer_position: ClayVector2
     pointer_down: bool
+    scroll_delta_y: float32
+    scroll_pointer: ClayVector2
+    scroll_pointer_valid: bool
     window: ptr SdlWindow
     text_input_active: bool
+    scroll_focused_field_to_end: bool
 
 const
   text_field_search* = "search"
@@ -147,6 +153,26 @@ proc text_field_display*(state: UiState; id: TextFieldId): string =
   let prefix = if cursor > 0: field.value[0 ..< cursor] else: ""
   let suffix = if cursor < field.value.len: field.value[cursor ..< field.value.len] else: ""
   result = prefix & field.composition & "|" & suffix
+
+proc clear_text_field*(state: UiState; id: TextFieldId) =
+  if not state.text_fields.hasKey(id):
+    return
+  let field = state.text_field_state_pointer(id)
+  field[].value.setLen(0)
+  field[].cursor = 0
+  field[].selection_anchor = 0
+  field[].composition.setLen(0)
+  field[].composition_start = 0
+  field[].composition_length = 0
+  for interactive_field in state.previous_fields:
+    if interactive_field.id != id:
+      continue
+    let scroll_data = clay_get_scroll_container_data(interactive_field.element_id)
+    if scroll_data.found and scroll_data.scroll_position != nil:
+      scroll_data.scroll_position[].y = 0
+    break
+  if state.focused_field == id:
+    state.scroll_focused_field_to_end = true
 
 proc copy_sdl_text(text: cstring): string =
   if text != nil:
@@ -292,6 +318,8 @@ proc set_focus(state: UiState; id: TextFieldId) =
   if id.len == 0:
     return
 
+  state.scroll_focused_field_to_end = true
+
   let field = state.text_field_state_pointer(id)
   field[].cursor = max(0, min(field[].cursor, field[].value.len))
   field[].selection_anchor = field[].cursor
@@ -342,6 +370,13 @@ proc handle_key_down(state: UiState; event: UiEvent) =
   if state.focused_field.len == 0:
     return
   let field = state.text_field_state_pointer(state.focused_field)
+  if (event.key == sdl_key_return or event.key == sdl_key_kp_enter) and
+      not event.repeat:
+    state.action_queue.addLast(UiAction(
+      kind: ui_action_text_field_submitted,
+      text_field_id: state.focused_field))
+    return
+  state.scroll_focused_field_to_end = true
   let control = modifier_set(event.modifiers, sdl_kmod_ctrl) or
     modifier_set(event.modifiers, sdl_kmod_gui)
   let extend_selection = modifier_set(event.modifiers, sdl_kmod_shift)
@@ -427,17 +462,26 @@ proc handle_event(state: UiState; event: UiEvent) =
   of ui_event_mouse_wheel:
     state.pointer_position = clay_vector2(event.x, event.y)
     clay_set_pointer_state(state.pointer_position, state.pointer_down)
+    if not state.scroll_pointer_valid or
+        state.scroll_pointer.x != state.pointer_position.x or
+        state.scroll_pointer.y != state.pointer_position.y:
+      state.scroll_delta_y = 0
+    state.scroll_pointer = state.pointer_position
+    state.scroll_pointer_valid = true
+    state.scroll_delta_y -= event.wheel_y
   of ui_event_mouse_leave:
     discard
   of ui_event_key_down:
     handle_key_down(state, event)
   of ui_event_text_editing:
+    state.scroll_focused_field_to_end = true
     if state.focused_field.len > 0:
       let field = state.text_field_state_pointer(state.focused_field)
       field[].composition = event.text
       field[].composition_start = event.composition_start
       field[].composition_length = event.composition_length
   of ui_event_text_input:
+    state.scroll_focused_field_to_end = true
     if state.focused_field.len > 0:
       replace_selection(state.text_field_state_pointer(state.focused_field)[], event.text)
   of ui_event_window_focus_lost:
@@ -446,7 +490,8 @@ proc handle_event(state: UiState; event: UiEvent) =
   of ui_event_none:
     discard
 
-proc prepare_frame*(state: UiState; event_handler: UiEventHandler = nil) =
+proc prepare_frame*(state: UiState; event_handler: UiEventHandler = nil;
+    delta_time: float32 = 0'f32) =
   state.previous_fields = state.current_fields
   state.current_fields = @[]
   state.previous_buttons = state.current_buttons
@@ -456,8 +501,29 @@ proc prepare_frame*(state: UiState; event_handler: UiEventHandler = nil) =
     handle_event(state, event)
     if event_handler != nil:
       event_handler(event)
+  clay_update_scroll_containers(
+    false, clay_vector2(0'f32, state.scroll_delta_y), delta_time)
+  state.scroll_delta_y = 0
+  state.scroll_pointer_valid = false
 
 proc finish_frame*(state: UiState) =
+  if state.scroll_focused_field_to_end and state.focused_field.len > 0:
+    for field in state.current_fields:
+      if field.id != state.focused_field:
+        continue
+      let scroll_data = clay_get_scroll_container_data(field.element_id)
+      if scroll_data.found and scroll_data.scroll_position != nil:
+        let overflow = max(
+          float32(scroll_data.content_dimensions.height) -
+          float32(scroll_data.scroll_container_dimensions.height),
+          0'f32)
+        scroll_data.scroll_position[].y =
+          if state.text_fields[state.focused_field].value.len == 0:
+            0'f32
+          else:
+            -overflow
+        state.scroll_focused_field_to_end = false
+      break
   if state.window == nil or state.focused_field.len == 0:
     return
   for field in state.current_fields:

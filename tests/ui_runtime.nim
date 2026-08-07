@@ -63,5 +63,67 @@ state.enqueue_event(UiEvent(kind: ui_event_key_down, key: sdl_key_backspace))
 state.prepare_frame()
 doAssert state.text_field_value("test") == "abx"
 
+state.enqueue_event(UiEvent(kind: ui_event_key_down, key: sdl_key_return))
+state.prepare_frame()
+var action: UiAction
+doAssert state.next_action(action)
+doAssert action.kind == ui_action_text_field_submitted
+doAssert action.text_field_id == "test"
+state.clear_text_field("test")
+doAssert state.text_field_value("test") == ""
+state.enqueue_event(UiEvent(kind: ui_event_key_down, key: sdl_key_kp_enter))
+state.prepare_frame()
+doAssert state.next_action(action)
+doAssert action.kind == ui_action_text_field_submitted
+doAssert action.text_field_id == "test"
+
+let scroll_id = clay_id("ui_scroll_test")
+state.enqueue_event(UiEvent(
+  kind: ui_event_mouse_move,
+  x: 5,
+  y: 5,
+  pointer_down: false))
+state.prepare_frame()
+clay_begin_layout()
+clay_open_element_with_id(scroll_id)
+var scroll_declaration = declaration(
+  layout = layout(
+    sizing = sizing(fixed(80), fixed(20)),
+    layout_direction = clay_top_to_bottom),
+  clip = ClayClipElementConfig(
+    vertical: true,
+    child_offset: clay_get_scroll_offset()))
+clay_configure_open_element(scroll_declaration)
+for child_index in 0 ..< 3:
+  element(clay_id_with_index("ui_scroll_child", uint32(child_index))):
+    layout:
+      sizing:
+        width = fixed(80)
+        height = fixed(20)
+clay_close_element()
+discard clay_end_layout(0)
+
+state.enqueue_event(UiEvent(
+  kind: ui_event_mouse_wheel,
+  x: 5,
+  y: 5,
+  wheel_y: 1))
+state.prepare_frame()
+clay_begin_layout()
+clay_open_element_with_id(scroll_id)
+scroll_declaration.clip.child_offset = clay_get_scroll_offset()
+clay_configure_open_element(scroll_declaration)
+for child_index in 0 ..< 3:
+  element(clay_id_with_index("ui_scroll_child", uint32(child_index))):
+    layout:
+      sizing:
+        width = fixed(80)
+        height = fixed(20)
+clay_close_element()
+discard clay_end_layout(0)
+let scroll_data = clay_get_scroll_container_data(scroll_id)
+doAssert scroll_data.found
+doAssert scroll_data.scroll_position[].y < 0
+
 clay_deinitialize()
 dealloc(arena_memory)

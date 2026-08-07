@@ -1327,6 +1327,8 @@ typedef struct {
     int32_t next;
 } Clay__GraphemeBoundaryData;
 
+#define CLAY__GRAPHEME_BOUNDARY_STREAMING_INDEX (-2)
+
 CLAY__ARRAY_DEFINE(Clay__GraphemeBoundaryData, Clay__GraphemeBoundaryArray)
 
 typedef struct {
@@ -1996,6 +1998,9 @@ Clay__MeasuredWord *Clay__AddMeasuredWord(Clay__MeasuredWord word, Clay__Measure
 
 void Clay__FreeGraphemeBoundaries(int32_t startIndex) {
     Clay_Context* context = Clay_GetCurrentContext();
+    if (startIndex < 0) {
+        return;
+    }
     while (startIndex != -1) {
         Clay__GraphemeBoundaryData *boundary = Clay__GraphemeBoundaryArray_Get(&context->graphemeBoundaries, startIndex);
         int32_t nextIndex = boundary->next;
@@ -2026,6 +2031,12 @@ int32_t Clay__AddGraphemeBoundary(Clay__GraphemeBoundaryData boundary) {
     return context->graphemeBoundaries.length - 1;
 }
 
+int32_t Clay__AvailableGraphemeBoundaryCount(void) {
+    Clay_Context* context = Clay_GetCurrentContext();
+    int32_t unusedCapacity = context->graphemeBoundaries.capacity - context->graphemeBoundaries.length - 1;
+    return context->graphemeBoundariesFreeList.length + CLAY__MAX(unusedCapacity, 0);
+}
+
 void Clay__ReportMissingGraphemeBoundaryFunction(void) {
     Clay_Context* context = Clay_GetCurrentContext();
     if (context->booleanWarnings.graphemeBoundaryFunctionNotSet) {
@@ -2048,6 +2059,22 @@ void Clay__ReportInvalidGraphemeBoundaryFunction(void) {
         .errorType = CLAY_ERROR_TYPE_GRAPHEME_BOUNDARY_FUNCTION_INVALID,
         .errorText = CLAY_STRING("Clay's grapheme boundary function returned an invalid byte offset."),
         .userData = context->errorHandler.userData });
+}
+
+bool Clay__NextGraphemeBoundary(Clay_StringSlice text, int32_t *offset, int32_t *length) {
+    Clay_Context* context = Clay_GetCurrentContext();
+    if (!Clay__GraphemeBoundaryFunction) {
+        Clay__ReportMissingGraphemeBoundaryFunction();
+        return false;
+    }
+    int32_t nextOffset = Clay__GraphemeBoundaryFunction(text, *offset, context->graphemeBoundaryUserData);
+    if (nextOffset <= *offset || nextOffset > text.length) {
+        Clay__ReportInvalidGraphemeBoundaryFunction();
+        return false;
+    }
+    *length = nextOffset - *offset;
+    *offset = nextOffset;
+    return true;
 }
 
 bool Clay__MeasureWordGraphemes(Clay_String *text, Clay_TextElementConfig *config,
@@ -2074,34 +2101,40 @@ bool Clay__MeasureWordGraphemes(Clay_String *text, Clay_TextElementConfig *confi
     };
     int32_t offset = 0;
     int32_t previousIndex = -1;
+    bool cacheBoundaries = length <= Clay__AvailableGraphemeBoundaryCount();
+    if (!cacheBoundaries) {
+        *graphemeStartIndex = CLAY__GRAPHEME_BOUNDARY_STREAMING_INDEX;
+    }
     while (offset < length) {
-        int32_t nextOffset = Clay__GraphemeBoundaryFunction(word, offset, context->graphemeBoundaryUserData);
-        if (nextOffset <= offset || nextOffset > length) {
-            Clay__ReportInvalidGraphemeBoundaryFunction();
+        int32_t graphemeLength = 0;
+        int32_t nextOffset = offset;
+        if (!Clay__NextGraphemeBoundary(word, &nextOffset, &graphemeLength)) {
             Clay__FreeGraphemeBoundaries(*graphemeStartIndex);
             *graphemeStartIndex = -1;
             return false;
         }
-        Clay__GraphemeBoundaryData boundary = CLAY__INIT(Clay__GraphemeBoundaryData) {
-            .startOffset = startOffset + offset,
-            .length = nextOffset - offset,
-            .next = -1
-        };
-        int32_t boundaryIndex = Clay__AddGraphemeBoundary(boundary);
-        if (boundaryIndex < 0) {
-            Clay__FreeGraphemeBoundaries(*graphemeStartIndex);
-            *graphemeStartIndex = -1;
-            return false;
+        if (cacheBoundaries) {
+            Clay__GraphemeBoundaryData boundary = CLAY__INIT(Clay__GraphemeBoundaryData) {
+                .startOffset = startOffset + offset,
+                .length = graphemeLength,
+                .next = -1
+            };
+            int32_t boundaryIndex = Clay__AddGraphemeBoundary(boundary);
+            if (boundaryIndex < 0) {
+                Clay__FreeGraphemeBoundaries(*graphemeStartIndex);
+                *graphemeStartIndex = CLAY__GRAPHEME_BOUNDARY_STREAMING_INDEX;
+                cacheBoundaries = false;
+            } else if (*graphemeStartIndex == -1) {
+                *graphemeStartIndex = boundaryIndex;
+                previousIndex = boundaryIndex;
+            } else {
+                Clay__GraphemeBoundaryArray_Get(&context->graphemeBoundaries, previousIndex)->next = boundaryIndex;
+                previousIndex = boundaryIndex;
+            }
         }
-        if (*graphemeStartIndex == -1) {
-            *graphemeStartIndex = boundaryIndex;
-        } else {
-            Clay__GraphemeBoundaryArray_Get(&context->graphemeBoundaries, previousIndex)->next = boundaryIndex;
-        }
-        previousIndex = boundaryIndex;
 
         Clay_Dimensions dimensions = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) {
-            .length = nextOffset - offset,
+            .length = graphemeLength,
             .chars = &word.chars[offset],
             .baseChars = word.baseChars
         }, config, context->measureTextUserData);
@@ -3082,7 +3115,8 @@ bool Clay__ElementIsOffscreen(Clay_BoundingBox *boundingBox) {
 int32_t Clay__WrapWordByGraphemes(Clay_String *text, Clay_TextElementConfig *config,
     Clay__MeasuredWord *measuredWord, float maxWidth, float lineHeight) {
     Clay_Context* context = Clay_GetCurrentContext();
-    if (measuredWord->graphemeStartIndex < 0) {
+    if (measuredWord->graphemeStartIndex < 0 &&
+        measuredWord->graphemeStartIndex != CLAY__GRAPHEME_BOUNDARY_STREAMING_INDEX) {
         return 0;
     }
 
@@ -3090,11 +3124,63 @@ int32_t Clay__WrapWordByGraphemes(Clay_String *text, Clay_TextElementConfig *con
     int32_t lineStartOffset = measuredWord->startOffset;
     int32_t lineEndOffset = lineStartOffset;
     float lineWidth = 0;
-    int32_t graphemeIndex = measuredWord->graphemeStartIndex;
-    while (graphemeIndex != -1) {
-        Clay__GraphemeBoundaryData *grapheme = Clay__GraphemeBoundaryArray_Get(
-            &context->graphemeBoundaries, graphemeIndex);
-        int32_t candidateEndOffset = grapheme->startOffset + grapheme->length;
+    bool streamGraphemes = measuredWord->graphemeStartIndex == CLAY__GRAPHEME_BOUNDARY_STREAMING_INDEX;
+    int32_t graphemeIndex = streamGraphemes ? -1 : measuredWord->graphemeStartIndex;
+    int32_t streamOffset = 0;
+    int32_t streamNextOffset = 0;
+    int32_t streamLength = measuredWord->length;
+    if (streamLength > 0 && text->chars[measuredWord->startOffset + streamLength - 1] == ' ') {
+        streamLength--;
+    }
+    bool hasPendingStreamGrapheme = false;
+    while (graphemeIndex != -1 || streamGraphemes) {
+        int32_t candidateEndOffset;
+        if (streamGraphemes) {
+            if (!hasPendingStreamGrapheme) {
+                if (streamOffset >= streamLength) {
+                    break;
+                }
+                Clay_StringSlice word = CLAY__INIT(Clay_StringSlice) {
+                    .length = streamLength,
+                    .chars = &text->chars[measuredWord->startOffset],
+                    .baseChars = text->chars
+                };
+                streamNextOffset = streamOffset;
+                int32_t graphemeLength = 0;
+                if (!Clay__NextGraphemeBoundary(word, &streamNextOffset, &graphemeLength)) {
+                    int32_t contentEndOffset = measuredWord->startOffset + streamLength;
+                    if (lineEndOffset > lineStartOffset &&
+                        context->wrappedTextLines.length < context->wrappedTextLines.capacity - 1) {
+                        Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) {
+                            { lineWidth, lineHeight },
+                            { .length = lineEndOffset - lineStartOffset, .chars = &text->chars[lineStartOffset] }
+                        });
+                        lineCount++;
+                        lineStartOffset = lineEndOffset;
+                    }
+                    if (contentEndOffset > lineStartOffset &&
+                        context->wrappedTextLines.length < context->wrappedTextLines.capacity - 1) {
+                        Clay_Dimensions remainingDimensions = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) {
+                            .length = contentEndOffset - lineStartOffset,
+                            .chars = &text->chars[lineStartOffset],
+                            .baseChars = text->chars
+                        }, config, context->measureTextUserData);
+                        Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) {
+                            { remainingDimensions.width, lineHeight },
+                            { .length = contentEndOffset - lineStartOffset, .chars = &text->chars[lineStartOffset] }
+                        });
+                        lineCount++;
+                    }
+                    return lineCount;
+                }
+                hasPendingStreamGrapheme = true;
+            }
+            candidateEndOffset = measuredWord->startOffset + streamNextOffset;
+        } else {
+            Clay__GraphemeBoundaryData *grapheme = Clay__GraphemeBoundaryArray_Get(
+                &context->graphemeBoundaries, graphemeIndex);
+            candidateEndOffset = grapheme->startOffset + grapheme->length;
+        }
         Clay_Dimensions candidateDimensions = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) {
             .length = candidateEndOffset - lineStartOffset,
             .chars = &text->chars[lineStartOffset],
@@ -3117,7 +3203,14 @@ int32_t Clay__WrapWordByGraphemes(Clay_String *text, Clay_TextElementConfig *con
 
         lineEndOffset = candidateEndOffset;
         lineWidth = candidateDimensions.width;
-        graphemeIndex = grapheme->next;
+        if (streamGraphemes) {
+            streamOffset = streamNextOffset;
+            hasPendingStreamGrapheme = false;
+        } else {
+            Clay__GraphemeBoundaryData *grapheme = Clay__GraphemeBoundaryArray_Get(
+                &context->graphemeBoundaries, graphemeIndex);
+            graphemeIndex = grapheme->next;
+        }
         if (lineWidth > maxWidth) {
             if (context->wrappedTextLines.length >= context->wrappedTextLines.capacity - 1) {
                 return lineCount;
@@ -3180,7 +3273,8 @@ void Clay__CalculateFinalLayout(float deltaTime, bool useStoredBoundingBoxes, bo
             // Split an oversized word only in the opt-in grapheme mode.
             if (lineLengthChars == 0 && lineWidth + measuredWord->width > containerElement->dimensions.width &&
                 containerElement->textConfig.wrapMode == CLAY_TEXT_WRAP_WORDS_AND_GRAPHEMES &&
-                measuredWord->graphemeStartIndex >= 0) {
+                (measuredWord->graphemeStartIndex >= 0 ||
+                 measuredWord->graphemeStartIndex == CLAY__GRAPHEME_BOUNDARY_STREAMING_INDEX)) {
                 textElementData->wrappedLines.length += Clay__WrapWordByGraphemes(
                     &textElementData->text,
                     &containerElement->textConfig,

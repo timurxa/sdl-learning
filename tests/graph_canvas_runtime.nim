@@ -20,7 +20,7 @@ discard clay_initialize(
 var graph = GraphView(
   nodes: @[
     GraphNode(
-      stable_id: 1,
+      stable_id: 0,
       screen_position: vector2(20, 20),
       size: dimensions(24, 24),
       circle_color: rgba(255, 0, 0, 255))],
@@ -36,7 +36,119 @@ element("root"):
     discard
 discard clay_end_layout(0)
 
+let node_pointer = vector2(32, 32)
+clay_set_pointer_state(node_pointer, true)
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_button_down,
+  x: node_pointer.x,
+  y: node_pointer.y,
+  button: sdl_button_left))
+clay_set_pointer_state(node_pointer, false)
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_button_up,
+  x: node_pointer.x,
+  y: node_pointer.y,
+  button: sdl_button_left))
+doAssert graph.selected_node_valid
+doAssert graph.selected_node_id == 0
+
+clay_begin_layout()
+element("root"):
+  layout:
+    sizing:
+      width = grow()
+      height = grow()
+  graph_window(graph, node):
+    discard
+discard clay_end_layout(0)
+let surface_data = clay_get_element_data(clay_id("graph_surface"))
+let panel_data = clay_get_element_data(clay_id("graph_panel"))
+doAssert surface_data.found
+doAssert panel_data.found
+doAssert panel_data.bounding_box.x > surface_data.bounding_box.x
+doAssert panel_data.bounding_box.y > surface_data.bounding_box.y
+doAssert panel_data.bounding_box.x + panel_data.bounding_box.width <
+  surface_data.bounding_box.x + surface_data.bounding_box.width
+doAssert panel_data.bounding_box.y + panel_data.bounding_box.height <
+  surface_data.bounding_box.y + surface_data.bounding_box.height
+doAssert abs(float32(panel_data.bounding_box.width) -
+  (float32(surface_data.bounding_box.width) - 16'f32) / 3'f32) < 0.1
+
+let panel_pointer = vector2(
+  panel_data.bounding_box.x + panel_data.bounding_box.width / 2,
+  panel_data.bounding_box.y + panel_data.bounding_box.height / 2)
+let pan_before_panel = graph.pan
+clay_set_pointer_state(panel_pointer, true)
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_button_down,
+  x: panel_pointer.x,
+  y: panel_pointer.y,
+  button: sdl_button_left))
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_move,
+  x: panel_pointer.x + 10,
+  y: panel_pointer.y + 10))
+doAssert graph.pan == pan_before_panel
+clay_set_pointer_state(panel_pointer, false)
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_button_up,
+  x: panel_pointer.x + 10,
+  y: panel_pointer.y + 10,
+  button: sdl_button_left))
+let zoom_before_panel = graph.zoom
+clay_set_pointer_state(panel_pointer, false)
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_wheel,
+  x: panel_pointer.x,
+  y: panel_pointer.y,
+  wheel_y: 1))
+doAssert graph.zoom == zoom_before_panel
+
+clay_set_pointer_state(node_pointer, true)
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_button_down,
+  x: node_pointer.x,
+  y: node_pointer.y,
+  button: sdl_button_left))
+clay_set_pointer_state(node_pointer, false)
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_button_up,
+  x: node_pointer.x,
+  y: node_pointer.y,
+  button: sdl_button_left))
+doAssert not graph.selected_node_valid
+
+let retained_node = graph.nodes[0]
+clay_set_pointer_state(node_pointer, true)
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_button_down,
+  x: node_pointer.x,
+  y: node_pointer.y,
+  button: sdl_button_left))
+clay_set_pointer_state(node_pointer, false)
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_button_up,
+  x: node_pointer.x,
+  y: node_pointer.y,
+  button: sdl_button_left))
+doAssert graph.selected_node_valid
+
+graph.nodes.setLen(0)
+clay_begin_layout()
+element("root"):
+  layout:
+    sizing:
+      width = grow()
+      height = grow()
+  graph_window(graph, node):
+    discard
+discard clay_end_layout(0)
+doAssert not graph.selected_node_valid
+doAssert not clay_get_element_data(clay_id("graph_panel")).found
+graph.nodes.add(retained_node)
+
 let pointer = vector2(100, 60)
+clay_set_pointer_state(pointer, false)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_wheel,
   x: pointer.x,
@@ -60,7 +172,7 @@ element("root"):
 discard clay_end_layout(0)
 doAssert abs(
   float32(graph.draw_list.items[0].size.width) - 24'f32 * graph.zoom) < 0.001
-let popup_data = clay_get_element_data(clay_id_with_index("graph_node", 1))
+let popup_data = clay_get_element_data(clay_id_with_index("graph_node", 0))
 doAssert popup_data.found
 doAssert popup_data.bounding_box.width == 24
 doAssert popup_data.bounding_box.height == 24

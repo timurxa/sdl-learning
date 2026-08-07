@@ -1,3 +1,4 @@
+import std/[random, strutils]
 import clay
 import sdl
 import ui
@@ -27,8 +28,20 @@ type
     debug_cycle_frame: uint64
     debug_last_phase: int
 
+  ConversationSpeaker = enum
+    conversation_node
+    conversation_user
+
+  ConversationMessage = object
+    speaker: ConversationSpeaker
+    content: string
+
   GraphTab = ref object
     graph_view: GraphView
+    layout_edges: seq[GraphLayoutEdge]
+    conversation_messages: seq[ConversationMessage]
+    mutation_elapsed: float32
+    mutation_count: int
 
   MainWindow* = ref object
     palette: Palette
@@ -37,10 +50,126 @@ type
     workspace_tab: WorkspaceTab
     graph_tab: GraphTab
 
+# DEBUG GRAPH DEMO: remove this block to remove random graph activity.
+proc debug_graph_color(index: int): ClayColor =
+  case index mod 4
+  of 0: rgba(255, 210, 63, 255)
+  of 1: rgba(83, 220, 169, 255)
+  of 2: rgba(169, 126, 255, 255)
+  else: rgba(255, 103, 174, 255)
+
+proc debug_refresh_arrows(tab: GraphTab) =
+  tab.graph_view.arrows = newSeq[GraphArrow](tab.layout_edges.len)
+  for index, edge in tab.layout_edges:
+    tab.graph_view.arrows[index] = GraphArrow(
+      start_node_id: edge.start_node_id,
+      end_node_id: edge.end_node_id,
+      padding: 8,
+      color: rgba(20, 18, 15, 255),
+      shaft_width: 3,
+      head_length: 10,
+      head_width: 10)
+
+proc debug_randomize_graph(tab: GraphTab; node_count: int) =
+  while tab.graph_view.nodes.len < node_count:
+    let node_index = tab.graph_view.nodes.len
+    tab.graph_view.nodes.add(GraphNode(
+      stable_id: uint32(node_index + 1),
+      screen_position: vector2(80 + node_index * 70, 70 + rand(250)),
+      size: dimensions(32, 32),
+      circle_color: debug_graph_color(node_index),
+      z_index: int16(node_index)))
+  if tab.graph_view.nodes.len > node_count:
+    tab.graph_view.nodes.setLen(node_count)
+
+  tab.layout_edges = newSeq[GraphLayoutEdge](0)
+  for start_index in 0 ..< node_count - 1:
+    tab.layout_edges.add(GraphLayoutEdge(
+      start_node_id: uint32(start_index + 1),
+      end_node_id: uint32(start_index + 2)))
+  for start_index in 0 ..< node_count:
+    for end_index in start_index + 2 ..< node_count:
+      if rand(3) == 0:
+        tab.layout_edges.add(GraphLayoutEdge(
+          start_node_id: uint32(start_index + 1),
+          end_node_id: uint32(end_index + 1)))
+
+proc new_debug_graph_tab(): GraphTab =
+  randomize()
+  new(result)
+  result.graph_view.node_pointer_capture_mode = clay_pointer_capture_mode_passthrough
+  result.conversation_messages = @[
+    ConversationMessage(
+      speaker: conversation_node,
+      content: "Graph node ready. I can inspect this branch."),
+    ConversationMessage(
+      speaker: conversation_user,
+      content: "Show me what changed in this node."),
+    ConversationMessage(
+      speaker: conversation_node,
+      content: "Three upstream links found. One is still waiting."),
+    ConversationMessage(
+      speaker: conversation_user,
+      content: "Keep waiting state visible in the graph."),
+    ConversationMessage(
+      speaker: conversation_node,
+      content: "Waiting state retained. Downstream output remains quiet."),
+    ConversationMessage(
+      speaker: conversation_user,
+      content: "Add a longer note so this log can be scrolled independently."),
+    ConversationMessage(
+      speaker: conversation_node,
+      content: "Long notes stay inside the conversation log while composer stays docked below."),
+    ConversationMessage(
+      speaker: conversation_user,
+      content: "The graph remains interactive behind this panel."),
+    ConversationMessage(
+      speaker: conversation_node,
+      content: "Correct. Panel captures its own pointer and wheel input."),
+    ConversationMessage(
+      speaker: conversation_user,
+      content: "Ready for another message." )]
+  result.debug_randomize_graph(8 + rand(5))
+  result.debug_refresh_arrows()
+  var layout_config = default_graph_layout_config()
+  layout_config.layer_gap = 96
+  layout_config.node_gap = 56
+  discard result.graph_view.begin_graph_layout(result.layout_edges, layout_config)
+
+proc debug_mutate_graph(tab: GraphTab) =
+  tab.debug_randomize_graph(6 + rand(8))
+  inc tab.mutation_count
+  tab.debug_refresh_arrows()
+  var layout_config = default_graph_layout_config()
+  layout_config.layer_gap = 96
+  layout_config.node_gap = 56
+  discard tab.graph_view.begin_graph_layout(tab.layout_edges, layout_config)
+
+proc update_debug_graph(view: MainWindow; delta_time: float32) =
+  let tab = view.graph_tab
+  tab.mutation_elapsed += max(delta_time, 0'f32)
+  if tab.mutation_elapsed >= 5'f32:
+    tab.mutation_elapsed -= 5'f32
+    tab.debug_mutate_graph()
+  discard tab.graph_view.step_graph_layout(delta_time)
+
 const
   nav_labels = ["Overview", "Activity", "Analytics", "Deployments", "Alerts", "Settings", "Team", "Archive"]
   workspace_tab_button_id = "tab_workspace"
   graph_tab_button_id = "tab_graph"
+  graph_conversation_input_id = "graph_conversation_input"
+  graph_conversation_log_id = "graph_conversation_log"
+  graph_conversation_composer_id = "graph_conversation_composer"
+
+template scrollable_declaration(element_declaration: untyped): ClayElementDeclaration =
+  var scroll_declaration = element_declaration
+  scroll_declaration.clip.child_offset = clay_get_scroll_offset()
+  scroll_declaration
+
+template scrollable_element(element_id: untyped; element_declaration: untyped;
+    body: untyped) =
+  clay_element_scope(element_id, scrollable_declaration(element_declaration)):
+    body
 
 proc palette_color(color: ClayColor): ClayColor =
   color
@@ -74,45 +203,7 @@ proc new_main_window*(): MainWindow =
           circle_color: rgba(83, 220, 169, 255),
           title: "OUTPUT NODE",
           detail: "SINK / WAITING")])),
-    graph_tab: GraphTab(
-      graph_view: GraphView(
-        nodes: @[
-          GraphNode(
-            stable_id: 1,
-            screen_position: vector2(96, 90),
-            size: dimensions(32, 32),
-            circle_color: rgba(255, 210, 63, 255),
-            z_index: 1),
-          GraphNode(
-            stable_id: 2,
-            screen_position: vector2(264, 190),
-            size: dimensions(32, 32),
-            circle_color: rgba(83, 220, 169, 255),
-            z_index: 2),
-          GraphNode(
-            stable_id: 3,
-            screen_position: vector2(438, 104),
-            size: dimensions(32, 32),
-            circle_color: rgba(169, 126, 255, 255),
-            z_index: 3)],
-        arrows: @[
-          GraphArrow(
-            start_node_index: 0,
-            end_node_index: 1,
-            padding: 8,
-            color: rgba(20, 18, 15, 255),
-            shaft_width: 3,
-            head_length: 12,
-            head_width: 12),
-          GraphArrow(
-            start_node_index: 1,
-            end_node_index: 2,
-            padding: 8,
-            color: rgba(20, 18, 15, 255),
-            shaft_width: 3,
-            head_length: 12,
-            head_width: 12)],
-        node_pointer_capture_mode: clay_pointer_capture_mode_passthrough)))
+    graph_tab: new_debug_graph_tab())
 
 proc background_color*(view: MainWindow): ClayColor =
   view.palette.background
@@ -131,6 +222,7 @@ proc build_tab_bar(view: MainWindow)
 
 proc render*(view: MainWindow; renderer: Renderer; clay_context: ptr ClayContext;
     string_cache: var ClayStringCache; delta_time: float32): bool =
+  view.update_debug_graph(delta_time)
   renderer.render_frame(
     clay_context,
     string_cache,
@@ -138,7 +230,8 @@ proc render*(view: MainWindow; renderer: Renderer; clay_context: ptr ClayContext
       view.ui_state.prepare_frame(
         proc(event: UiEvent) =
           if view.tab_manager.active_tab == main_tab_graph:
-            view.graph_tab.graph_view.handle_event(event))
+            view.graph_tab.graph_view.handle_event(event),
+        delta_time)
       view.apply_ui_actions(),
     proc(frame: ViewFrame) = view.build_elements(frame),
     proc() = view.ui_state.finish_frame(),
@@ -179,6 +272,16 @@ proc apply_ui_actions(view: MainWindow) =
         view.select_tab(main_tab_graph)
       else:
         discard
+    of ui_action_text_field_submitted:
+      if action.text_field_id != graph_conversation_input_id:
+        continue
+      let content = view.ui_state.text_field_value(graph_conversation_input_id)
+      if content.strip.len == 0:
+        continue
+      view.graph_tab.conversation_messages.add(ConversationMessage(
+        speaker: conversation_user,
+        content: content))
+      view.ui_state.clear_text_field(graph_conversation_input_id)
 
 proc build_tab_bar(view: MainWindow) =
   let workspace_button_element_id = clay_id(workspace_tab_button_id)
@@ -816,6 +919,110 @@ proc build_workspace_tab(view: MainWindow; frame: ViewFrame) =
           text_color = palette_color(view.palette.ink)
           wrap_mode = clay_text_wrap_words_and_graphemes
 
+proc build_graph_conversation_panel(view: MainWindow) =
+  let input_element_id = clay_id(graph_conversation_input_id)
+  view.ui_state.register_text_field(
+    graph_conversation_input_id, input_element_id)
+
+  element("graph_conversation_content"):
+    layout:
+      sizing:
+        width = grow()
+        height = grow()
+      padding = padding_all(12)
+      child_gap = 10
+      layout_direction = clay_top_to_bottom
+    background_color = palette_color(view.palette.paper)
+
+    text("NODE CONVERSATION"):
+      font_size = 10
+      text_color = palette_color(view.palette.ink)
+      wrap_mode = clay_text_wrap_words_and_graphemes
+    text("NODE " & $view.graph_tab.graph_view.selected_node_id):
+      font_size = 8
+      text_color = palette_color(view.palette.ink)
+      wrap_mode = clay_text_wrap_words_and_graphemes
+
+    let log_element_id = clay_id(graph_conversation_log_id)
+    let log_declaration = declaration(
+      layout = layout(
+        sizing = sizing(grow(), grow()),
+        padding = padding_all(8),
+        child_gap = 8,
+        layout_direction = clay_top_to_bottom),
+      background_color = palette_color(view.palette.background),
+      border = ClayBorderElementConfig(
+        color: palette_color(view.palette.ink), width: border_outside(2)),
+      clip = ClayClipElementConfig(vertical: true))
+    scrollable_element(log_element_id, log_declaration):
+      for message_index, message in view.graph_tab.conversation_messages:
+        let is_user = message.speaker == conversation_user
+        let row_id = clay_id_with_index(
+          "graph_conversation_message", uint32(message_index))
+        let row_declaration = declaration(
+          layout = layout(
+            sizing = sizing(grow(), fit()),
+            child_alignment = child_alignment(
+              if is_user:
+                clay_align_x_right
+              else:
+                clay_align_x_left,
+              clay_align_y_top)))
+        let bubble_declaration = declaration(
+          layout = layout(
+            sizing = sizing(fit(0, 260), fit()),
+            padding = padding_all(8)),
+          background_color = if is_user:
+            palette_color(view.palette.blue)
+          else:
+            palette_color(view.palette.yellow),
+          border = ClayBorderElementConfig(
+            color: palette_color(view.palette.ink), width: border_outside(2)))
+        element(row_id, row_declaration):
+          element(clay_id_with_index(
+              "graph_conversation_bubble", uint32(message_index)),
+              bubble_declaration):
+            text(message.content):
+              font_size = 10
+              text_color = if is_user:
+                palette_color(view.palette.paper)
+              else:
+                palette_color(view.palette.ink)
+              wrap_mode = clay_text_wrap_words_and_graphemes
+
+    element(graph_conversation_composer_id):
+      layout:
+        sizing:
+          width = grow()
+          height = fit(52, 156)
+        padding = padding_all(8)
+        child_gap = 5
+        layout_direction = clay_top_to_bottom
+      background_color = if view.ui_state.text_field_focused(
+          graph_conversation_input_id):
+        palette_color(view.palette.yellow)
+      else:
+        palette_color(view.palette.background)
+      border:
+        color = palette_color(view.palette.ink)
+        width = border_outside(2)
+      text("MESSAGE / ENTER TO SEND"):
+        font_size = 8
+        text_color = palette_color(view.palette.ink)
+        wrap_mode = clay_text_wrap_words_and_graphemes
+
+      let input_declaration = declaration(
+        layout = layout(
+          sizing = sizing(grow(), fit(20, 124)),
+          padding = padding_all(4)),
+        background_color = palette_color(view.palette.paper),
+        clip = ClayClipElementConfig(vertical: true))
+      scrollable_element(input_element_id, input_declaration):
+        text(view.ui_state.text_field_display(graph_conversation_input_id)):
+          font_size = 11
+          text_color = palette_color(view.palette.ink)
+          wrap_mode = clay_text_wrap_words_and_graphemes
+
 proc build_graph_tab(view: MainWindow) =
   element("root"):
     layout:
@@ -847,7 +1054,7 @@ proc build_graph_tab(view: MainWindow) =
         color = palette_color(view.palette.ink)
         width = border_outside(4)
 
-      text("GRAPH / CIRCLE DEBUG"):
+      text("GRAPH / RANDOM LIVE / MUT " & $view.graph_tab.mutation_count):
         font_size = 13
         text_color = palette_color(view.palette.paper)
         wrap_mode = clay_text_wrap_words_and_graphemes
@@ -865,8 +1072,13 @@ proc build_graph_tab(view: MainWindow) =
           color = palette_color(view.palette.purple)
           width = border_outside(4)
 
-        graph_window(view.graph_tab.graph_view, node):
+        graph_window_with_panel(
+            view.graph_tab.graph_view, node,
+            view.build_graph_conversation_panel()):
           discard
+        if not view.graph_tab.graph_view.selected_node_valid and
+            view.ui_state.text_field_focused(graph_conversation_input_id):
+          view.ui_state.clear_focus()
 
 proc build_elements*(view: MainWindow; frame: ViewFrame) =
   case view.tab_manager.active_tab
