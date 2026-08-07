@@ -41,6 +41,8 @@ type
 
 const
   default_graph_zoom_factor = 1.1'f32
+  graph_node_border_width = 3'f32
+  graph_node_highlight_width = 4'f32
 
 proc ensure_graph_canvas_state(graph: var GraphView) {.inline.} =
   if graph.canvas_config.pan_button == 0:
@@ -183,6 +185,8 @@ proc graph_node_z_index*(node: GraphNode): int16 {.inline.} =
 
 template graph_node*(graph: GraphView; graph_id: ClayElementId;
     node: GraphNode; body: untyped) =
+  let node_id = clay_id_with_index("graph_node", node.stable_id)
+  let highlighted = clay_pointer_over(node_id)
   let circle_diameter_world = min(node.size.width, node.size.height)
   let circle_origin_world = vector2(
     node.screen_position.x + (node.size.width - circle_diameter_world) / 2,
@@ -193,14 +197,35 @@ template graph_node*(graph: GraphView; graph_id: ClayElementId;
     node.circle_color
   else:
     rgba(255, 255, 255, 255)
+  let border_color = rgba(20, 18, 15, 255)
+  let inner_circle_diameter_world = max(
+    circle_diameter_world - graph_node_border_width * 2'f32,
+    0'f32)
+  let inner_circle_origin_world = vector2(
+    circle_origin_world.x + graph_node_border_width,
+    circle_origin_world.y + graph_node_border_width)
   let node_z_index = graph_node_z_index(node)
+  if highlighted:
+    let highlight_origin_world = vector2(
+      circle_origin_world.x - graph_node_highlight_width,
+      circle_origin_world.y - graph_node_highlight_width)
+    graph.draw_list.add_opaque_circle(
+      graph.graph_transform_point(highlight_origin_world),
+      (circle_diameter_world + graph_node_highlight_width * 2'f32) * graph.zoom,
+      rgba(70, 145, 255, 255),
+      node_z_index)
   graph.draw_list.add_opaque_circle(
     circle_origin,
     circle_diameter,
-    circle_color,
+    border_color,
     node_z_index)
+  if inner_circle_diameter_world > 0:
+    graph.draw_list.add_opaque_circle(
+      graph.graph_transform_point(inner_circle_origin_world),
+      inner_circle_diameter_world * graph.zoom,
+      circle_color,
+      node_z_index)
 
-  let node_id = clay_id_with_index("graph_node", node.stable_id)
   let node_declaration = declaration(
     layout = layout(
       sizing = sizing(fixed(node.size.width), fixed(node.size.height))),
@@ -215,31 +240,6 @@ template graph_node*(graph: GraphView; graph_id: ClayElementId;
       clip_to: clay_clip_to_attached_parent,
       z_index: node_z_index))
   element(node_id, node_declaration):
-    body
-
-template graph_node_panel*(node: GraphNode; panel_background: ClayColor;
-    border_color: ClayColor; body: untyped) =
-  let node_id = clay_id_with_index("graph_node", node.stable_id)
-  let panel_declaration = declaration(
-    layout = layout(
-      sizing = sizing(fixed(node.size.width), fixed(node.size.height)),
-      padding = padding_all(8),
-      child_gap = 4,
-      layout_direction = clay_top_to_bottom),
-    background_color = panel_background,
-    border = ClayBorderElementConfig(
-      color: border_color,
-      width: border_outside(3)),
-    floating = ClayFloatingElementConfig(
-      parent_id: node_id.id,
-      offset: vector2(0, 0),
-      attach_points: ClayFloatingAttachPoints(
-        element: clay_attach_point_left_top,
-        parent: clay_attach_point_left_top),
-      attach_to: clay_attach_to_element_with_id,
-      clip_to: clay_clip_to_attached_parent,
-      z_index: int16(graph_node_z_index(node) + 1)))
-  element(clay_id_with_index("graph_node_panel", node.stable_id), panel_declaration):
     body
 
 template graph_window*(graph: var GraphView; node_name: untyped; body: untyped) =
