@@ -36,14 +36,16 @@ element("root"):
     discard
 discard clay_end_layout(0)
 
+let initial_surface_data = clay_get_element_data(clay_id("graph_surface"))
+doAssert initial_surface_data.found
+graph.set_graph_viewport(initial_surface_data.bounding_box)
+
 let node_pointer = vector2(32, 32)
-clay_set_pointer_state(node_pointer, true)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_button_down,
   x: node_pointer.x,
   y: node_pointer.y,
   button: sdl_button_left))
-clay_set_pointer_state(node_pointer, false)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_button_up,
   x: node_pointer.x,
@@ -77,8 +79,11 @@ doAssert abs(float32(panel_data.bounding_box.width) -
 let panel_pointer = vector2(
   panel_data.bounding_box.x + panel_data.bounding_box.width / 2,
   panel_data.bounding_box.y + panel_data.bounding_box.height / 2)
+graph.set_graph_viewport(
+  surface_data.bounding_box,
+  panel_data.bounding_box,
+  panel_data.found)
 let pan_before_panel = graph.pan
-clay_set_pointer_state(panel_pointer, true)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_button_down,
   x: panel_pointer.x,
@@ -89,14 +94,12 @@ graph.handle_event(UiEvent(
   x: panel_pointer.x + 10,
   y: panel_pointer.y + 10))
 doAssert graph.pan == pan_before_panel
-clay_set_pointer_state(panel_pointer, false)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_button_up,
   x: panel_pointer.x + 10,
   y: panel_pointer.y + 10,
   button: sdl_button_left))
 let zoom_before_panel = graph.zoom
-clay_set_pointer_state(panel_pointer, false)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_wheel,
   x: panel_pointer.x,
@@ -104,13 +107,11 @@ graph.handle_event(UiEvent(
   wheel_y: 1))
 doAssert graph.zoom == zoom_before_panel
 
-clay_set_pointer_state(node_pointer, true)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_button_down,
   x: node_pointer.x,
   y: node_pointer.y,
   button: sdl_button_left))
-clay_set_pointer_state(node_pointer, false)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_button_up,
   x: node_pointer.x,
@@ -119,13 +120,11 @@ graph.handle_event(UiEvent(
 doAssert not graph.selected_node_valid
 
 let retained_node = graph.nodes[0]
-clay_set_pointer_state(node_pointer, true)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_button_down,
   x: node_pointer.x,
   y: node_pointer.y,
   button: sdl_button_left))
-clay_set_pointer_state(node_pointer, false)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_button_up,
   x: node_pointer.x,
@@ -148,7 +147,6 @@ doAssert not clay_get_element_data(clay_id("graph_panel")).found
 graph.nodes.add(retained_node)
 
 let pointer = vector2(100, 60)
-clay_set_pointer_state(pointer, false)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_wheel,
   x: pointer.x,
@@ -174,11 +172,20 @@ doAssert abs(
   float32(graph.draw_list.items[0].size.width) - 24'f32 * graph.zoom) < 0.001
 let popup_data = clay_get_element_data(clay_id_with_index("graph_node", 0))
 doAssert popup_data.found
-doAssert popup_data.bounding_box.width == 24
-doAssert popup_data.bounding_box.height == 24
+doAssert abs(float32(popup_data.bounding_box.width) - 24'f32 * graph.zoom) < 0.001
+doAssert abs(float32(popup_data.bounding_box.height) - 24'f32 * graph.zoom) < 0.001
+
+graph.zoom = 2.1'f32
+graph.pan = vector2(pointer.x - 32'f32 * graph.zoom,
+  pointer.y - 32'f32 * graph.zoom)
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_move,
+  x: pointer.x,
+  y: pointer.y))
+doAssert graph.hovered_node_valid
+doAssert graph.hovered_node_id == 0
 
 let pan_before = graph.pan
-clay_set_pointer_state(pointer, false)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_button_down,
   x: 20,
@@ -195,6 +202,28 @@ graph.handle_event(UiEvent(
   x: 35,
   y: 40,
   button: sdl_button_left))
+
+graph.zoom = 1'f32
+graph.pan = vector2(0, 0)
+graph.nodes[0].size = dimensions(40, 20)
+graph.set_graph_viewport(initial_surface_data.bounding_box)
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_move,
+  x: 38,
+  y: 30))
+doAssert graph.hovered_node_valid
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_move,
+  x: 55,
+  y: 35))
+doAssert not graph.hovered_node_valid
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_move,
+  x: 38,
+  y: 30))
+doAssert graph.hovered_node_valid
+graph.handle_event(UiEvent(kind: ui_event_window_focus_lost))
+doAssert not graph.hovered_node_valid
 
 var raw_wheel = SdlMouseWheelEvent(
   kind: sdl_event_mouse_wheel,

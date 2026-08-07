@@ -1,6 +1,7 @@
 import ../src/clay
 import ../src/graph_ui
 import ../src/renderer
+import ../src/ui
 
 proc handle_error(error_data: ClayErrorData) {.cdecl.} =
   doAssert false, $error_data.error_type
@@ -47,6 +48,9 @@ element("root"):
   graph_window(graph, node):
     discard
 let commands = clay_end_layout(0)
+let surface_data = clay_get_element_data(clay_id("graph_surface"))
+doAssert surface_data.found
+graph.set_graph_viewport(surface_data.bounding_box)
 
 doAssert graph.draw_list.items.len == 6
 doAssert graph.draw_list.items[0].kind == opaque_draw_quad
@@ -66,7 +70,10 @@ doAssert graph.draw_list.items[5].z_index == 9
 doAssert graph.draw_list.items[2].size.width == 24
 doAssert graph.draw_list.items[3].size.width == 18
 
-clay_set_pointer_state(vector2(24, 28), false)
+graph.handle_event(UiEvent(
+  kind: ui_event_mouse_move,
+  x: 24,
+  y: 28))
 clay_begin_layout()
 element("root"):
   layout:

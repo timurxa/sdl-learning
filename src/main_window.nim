@@ -1,9 +1,10 @@
-import std/[random, strutils]
+import std/[random, strutils, tables]
 import clay
 import sdl
 import ui
 import renderer
 import graph_ui
+import codex_bridge
 
 type
   MainTabKind = enum
@@ -30,18 +31,32 @@ type
 
   ConversationSpeaker = enum
     conversation_node
-    conversation_user
+    conversation_user,
+    conversation_system
+
+  ConversationState = enum
+    conversation_starting,
+    conversation_ready,
+    conversation_working,
+    conversation_error
 
   ConversationMessage = object
     speaker: ConversationSpeaker
     content: string
 
+  NodeConversation = object
+    messages: seq[ConversationMessage]
+    state: ConversationState
+    thread_requested: bool
+
   GraphTab = ref object
     graph_view: GraphView
     layout_edges: seq[GraphLayoutEdge]
-    conversation_messages: seq[ConversationMessage]
-    mutation_elapsed: float32
-    mutation_count: int
+    node_conversations: Table[uint32, NodeConversation]
+    global_log_messages: seq[string]
+    previous_selected_node_id: uint32
+    previous_selected_node_valid: bool
+    scroll_conversation_to_end: bool
 
   MainWindow* = ref object
     palette: Palette
@@ -49,8 +64,10 @@ type
     tab_manager: TabManager
     workspace_tab: WorkspaceTab
     graph_tab: GraphTab
+    codex_bridge: CodexBridge
+    pending_graph_events: seq[UiEvent]
 
-# DEBUG GRAPH DEMO: remove this block to remove random graph activity.
+# Initial graph remains randomized once per application start.
 proc debug_graph_color(index: int): ClayColor =
   case index mod 4
   of 0: rgba(255, 210, 63, 255)
@@ -97,38 +114,7 @@ proc debug_randomize_graph(tab: GraphTab; node_count: int) =
 proc new_debug_graph_tab(): GraphTab =
   randomize()
   new(result)
-  result.graph_view.node_pointer_capture_mode = clay_pointer_capture_mode_passthrough
-  result.conversation_messages = @[
-    ConversationMessage(
-      speaker: conversation_node,
-      content: "Graph node ready. I can inspect this branch."),
-    ConversationMessage(
-      speaker: conversation_user,
-      content: "Show me what changed in this node."),
-    ConversationMessage(
-      speaker: conversation_node,
-      content: "Three upstream links found. One is still waiting."),
-    ConversationMessage(
-      speaker: conversation_user,
-      content: "Keep waiting state visible in the graph."),
-    ConversationMessage(
-      speaker: conversation_node,
-      content: "Waiting state retained. Downstream output remains quiet."),
-    ConversationMessage(
-      speaker: conversation_user,
-      content: "Add a longer note so this log can be scrolled independently."),
-    ConversationMessage(
-      speaker: conversation_node,
-      content: "Long notes stay inside the conversation log while composer stays docked below."),
-    ConversationMessage(
-      speaker: conversation_user,
-      content: "The graph remains interactive behind this panel."),
-    ConversationMessage(
-      speaker: conversation_node,
-      content: "Correct. Panel captures its own pointer and wheel input."),
-    ConversationMessage(
-      speaker: conversation_user,
-      content: "Ready for another message." )]
+  result.node_conversations = initTable[uint32, NodeConversation]()
   result.debug_randomize_graph(8 + rand(5))
   result.debug_refresh_arrows()
   var layout_config = default_graph_layout_config()
@@ -136,29 +122,13 @@ proc new_debug_graph_tab(): GraphTab =
   layout_config.node_gap = 56
   discard result.graph_view.begin_graph_layout(result.layout_edges, layout_config)
 
-proc debug_mutate_graph(tab: GraphTab) =
-  tab.debug_randomize_graph(6 + rand(8))
-  inc tab.mutation_count
-  tab.debug_refresh_arrows()
-  var layout_config = default_graph_layout_config()
-  layout_config.layer_gap = 96
-  layout_config.node_gap = 56
-  discard tab.graph_view.begin_graph_layout(tab.layout_edges, layout_config)
-
-proc update_debug_graph(view: MainWindow; delta_time: float32) =
-  let tab = view.graph_tab
-  tab.mutation_elapsed += max(delta_time, 0'f32)
-  if tab.mutation_elapsed >= 5'f32:
-    tab.mutation_elapsed -= 5'f32
-    tab.debug_mutate_graph()
-  discard tab.graph_view.step_graph_layout(delta_time)
-
 const
   nav_labels = ["Overview", "Activity", "Analytics", "Deployments", "Alerts", "Settings", "Team", "Archive"]
   workspace_tab_button_id = "tab_workspace"
   graph_tab_button_id = "tab_graph"
   graph_conversation_input_id = "graph_conversation_input"
   graph_conversation_log_id = "graph_conversation_log"
+  graph_global_log_id = "graph_global_log"
   graph_conversation_composer_id = "graph_conversation_composer"
 
 template scrollable_declaration(element_declaration: untyped): ClayElementDeclaration =
@@ -203,7 +173,8 @@ proc new_main_window*(): MainWindow =
           circle_color: rgba(83, 220, 169, 255),
           title: "OUTPUT NODE",
           detail: "SINK / WAITING")])),
-    graph_tab: new_debug_graph_tab())
+    graph_tab: new_debug_graph_tab(),
+    codex_bridge: new_codex_bridge())
 
 proc background_color*(view: MainWindow): ClayColor =
   view.palette.background
@@ -214,15 +185,137 @@ proc set_window*(view: MainWindow; window: ptr SdlWindow) =
 proc handle_event*(view: MainWindow; event: UiEvent) =
   view.ui_state.enqueue_event(event)
 
+proc deinit*(view: MainWindow) =
+  if view == nil:
+    return
+  deinit_codex_bridge(view.codex_bridge)
+
 proc build_elements*(view: MainWindow; frame: ViewFrame)
 proc build_workspace_tab(view: MainWindow; frame: ViewFrame)
 proc build_graph_tab(view: MainWindow)
 proc apply_ui_actions(view: MainWindow)
 proc build_tab_bar(view: MainWindow)
+proc sync_selected_node(view: MainWindow)
+proc poll_codex_events(view: MainWindow)
+
+proc node_conversation(tab: GraphTab; node_id: uint32): var NodeConversation =
+  tab.node_conversations.mgetOrPut(node_id, NodeConversation(
+    state: conversation_starting))
+
+proc add_node_message(tab: GraphTab; node_id: uint32;
+    speaker: ConversationSpeaker; content: string) =
+  tab.node_conversation(node_id).messages.add(ConversationMessage(
+    speaker: speaker,
+    content: content))
+
+proc add_global_message(tab: GraphTab; content: string) =
+  tab.global_log_messages.add(content)
+  tab.scroll_conversation_to_end = true
+
+proc append_agent_delta(tab: GraphTab; node_id: uint32; delta: string) =
+  var conversation = tab.node_conversation(node_id)
+  conversation.state = conversation_working
+  if conversation.messages.len == 0 or
+      conversation.messages[^1].speaker != conversation_node:
+    conversation.messages.add(ConversationMessage(
+      speaker: conversation_node,
+      content: delta))
+  else:
+    conversation.messages[^1].content.add(delta)
+  tab.node_conversations[node_id] = conversation
+  tab.scroll_conversation_to_end = true
+
+proc apply_codex_event(view: MainWindow; event: CodexRuntimeEvent) =
+  case event.kind
+  of cre_thread_ready:
+    var conversation = view.graph_tab.node_conversation(event.node_id)
+    conversation.thread_requested = true
+    conversation.state = conversation_ready
+    view.graph_tab.node_conversations[event.node_id] = conversation
+  of cre_thread_error:
+    var conversation = view.graph_tab.node_conversation(event.node_id)
+    conversation.thread_requested = false
+    conversation.state = conversation_error
+    conversation.messages.add(ConversationMessage(
+      speaker: conversation_system,
+      content: "THREAD ERROR: " & event.text))
+    view.graph_tab.node_conversations[event.node_id] = conversation
+    view.graph_tab.scroll_conversation_to_end = true
+  of cre_agent_message_delta:
+    view.graph_tab.append_agent_delta(event.node_id, event.text)
+  of cre_turn_completed:
+    view.graph_tab.node_conversation(event.node_id).state = conversation_ready
+  of cre_node_error:
+    var conversation = view.graph_tab.node_conversation(event.node_id)
+    conversation.state = conversation_error
+    conversation.messages.add(ConversationMessage(
+      speaker: conversation_system,
+      content: "ERROR: " & event.text))
+    view.graph_tab.node_conversations[event.node_id] = conversation
+    view.graph_tab.scroll_conversation_to_end = true
+  of cre_global_notification:
+    view.graph_tab.add_global_message(event.text)
+  of cre_runtime_error:
+    view.graph_tab.add_global_message("RUNTIME ERROR: " & event.text)
+  of cre_runtime_closed:
+    view.graph_tab.add_global_message("CODEX RUNTIME CLOSED")
+
+proc poll_codex_events(view: MainWindow) =
+  var event: CodexRuntimeEvent
+  while view.codex_bridge.try_receive(event):
+    view.apply_codex_event(event)
+
+proc sync_graph_viewport(view: MainWindow) =
+  let surface_data = clay_get_element_data(clay_id("graph_surface"))
+  if not surface_data.found:
+    case view.tab_manager.active_tab
+    of main_tab_workspace:
+      view.workspace_tab.graph_view.clear_graph_viewport()
+    of main_tab_graph:
+      view.graph_tab.graph_view.clear_graph_viewport()
+    return
+
+  let panel_data = clay_get_element_data(clay_id("graph_panel"))
+  case view.tab_manager.active_tab
+  of main_tab_workspace:
+    view.workspace_tab.graph_view.set_graph_viewport(
+      surface_data.bounding_box)
+  of main_tab_graph:
+    view.graph_tab.graph_view.set_graph_viewport(
+      surface_data.bounding_box,
+      panel_data.bounding_box,
+      panel_data.found)
+
+proc finish_frame(view: MainWindow) =
+  view.sync_graph_viewport()
+  if view.tab_manager.active_tab == main_tab_graph:
+    for event in view.pending_graph_events:
+      view.graph_tab.graph_view.handle_event(event)
+    view.graph_tab.graph_view.rebuild_graph_draw_list()
+    view.sync_selected_node()
+  view.pending_graph_events.setLen(0)
+  view.ui_state.finish_frame()
+  if not view.graph_tab.scroll_conversation_to_end:
+    return
+  let log_id = if view.graph_tab.graph_view.selected_node_valid:
+    graph_conversation_log_id
+  else:
+    graph_global_log_id
+  let scroll_data = clay_get_scroll_container_data(
+    clay_id(log_id))
+  if not scroll_data.found or scroll_data.scroll_position == nil:
+    return
+  let overflow = max(
+    float32(scroll_data.content_dimensions.height) -
+    float32(scroll_data.scroll_container_dimensions.height),
+    0'f32)
+  scroll_data.scroll_position[].y = -overflow
+  view.graph_tab.scroll_conversation_to_end = false
 
 proc render*(view: MainWindow; renderer: Renderer; clay_context: ptr ClayContext;
     string_cache: var ClayStringCache; delta_time: float32): bool =
-  view.update_debug_graph(delta_time)
+  discard view.graph_tab.graph_view.step_graph_layout(delta_time)
+  view.poll_codex_events()
   renderer.render_frame(
     clay_context,
     string_cache,
@@ -230,11 +323,17 @@ proc render*(view: MainWindow; renderer: Renderer; clay_context: ptr ClayContext
       view.ui_state.prepare_frame(
         proc(event: UiEvent) =
           if view.tab_manager.active_tab == main_tab_graph:
-            view.graph_tab.graph_view.handle_event(event),
+            case event.kind
+            of ui_event_mouse_button_down, ui_event_mouse_button_up,
+                ui_event_mouse_move, ui_event_mouse_wheel,
+                ui_event_mouse_leave, ui_event_window_focus_lost:
+              view.pending_graph_events.add(event)
+            else:
+              discard,
         delta_time)
       view.apply_ui_actions(),
     proc(frame: ViewFrame) = view.build_elements(frame),
-    proc() = view.ui_state.finish_frame(),
+    proc() = view.finish_frame(),
     delta_time)
 
 proc debug_transition_set_initial_state(target_state: ClayTransitionData;
@@ -256,11 +355,13 @@ proc debug_transition_set_final_state(initial_state: ClayTransitionData;
 proc select_tab(view: MainWindow; tab_kind: MainTabKind) =
   if view.tab_manager.active_tab == tab_kind:
     return
-  view.graph_tab.graph_view.cancel_pan()
+  view.graph_tab.graph_view.clear_graph_pointer()
+  view.pending_graph_events.setLen(0)
   view.ui_state.clear_focus()
   view.tab_manager.active_tab = tab_kind
 
 proc apply_ui_actions(view: MainWindow) =
+  view.sync_selected_node()
   var action: UiAction
   while view.ui_state.next_action(action):
     case action.kind
@@ -278,10 +379,34 @@ proc apply_ui_actions(view: MainWindow) =
       let content = view.ui_state.text_field_value(graph_conversation_input_id)
       if content.strip.len == 0:
         continue
-      view.graph_tab.conversation_messages.add(ConversationMessage(
-        speaker: conversation_user,
-        content: content))
+      if not view.graph_tab.graph_view.selected_node_valid:
+        continue
+      let node_id = view.graph_tab.graph_view.selected_node_id
+      let message = content.strip
+      view.graph_tab.add_node_message(node_id, conversation_user, message)
+      view.graph_tab.scroll_conversation_to_end = true
+      view.codex_bridge.send_node_message(node_id, message)
       view.ui_state.clear_text_field(graph_conversation_input_id)
+
+proc sync_selected_node(view: MainWindow) =
+  let graph = view.graph_tab.graph_view
+  if graph.selected_node_valid == view.graph_tab.previous_selected_node_valid and
+      (not graph.selected_node_valid or
+        graph.selected_node_id == view.graph_tab.previous_selected_node_id):
+    return
+
+  view.graph_tab.previous_selected_node_valid = graph.selected_node_valid
+  view.graph_tab.previous_selected_node_id = graph.selected_node_id
+  if not graph.selected_node_valid:
+    return
+
+  let node_id = graph.selected_node_id
+  var conversation = view.graph_tab.node_conversation(node_id)
+  if not conversation.thread_requested:
+    conversation.thread_requested = true
+    conversation.state = conversation_starting
+    view.graph_tab.node_conversations[node_id] = conversation
+    view.codex_bridge.request_node_thread(node_id)
 
 proc build_tab_bar(view: MainWindow) =
   let workspace_button_element_id = clay_id(workspace_tab_button_id)
@@ -923,6 +1048,8 @@ proc build_graph_conversation_panel(view: MainWindow) =
   let input_element_id = clay_id(graph_conversation_input_id)
   view.ui_state.register_text_field(
     graph_conversation_input_id, input_element_id)
+  let node_id = view.graph_tab.graph_view.selected_node_id
+  let conversation = view.graph_tab.node_conversations[node_id]
 
   element("graph_conversation_content"):
     layout:
@@ -938,7 +1065,11 @@ proc build_graph_conversation_panel(view: MainWindow) =
       font_size = 10
       text_color = palette_color(view.palette.ink)
       wrap_mode = clay_text_wrap_words_and_graphemes
-    text("NODE " & $view.graph_tab.graph_view.selected_node_id):
+    text("NODE " & $node_id):
+      font_size = 8
+      text_color = palette_color(view.palette.ink)
+      wrap_mode = clay_text_wrap_words_and_graphemes
+    text("STATUS / " & $conversation.state):
       font_size = 8
       text_color = palette_color(view.palette.ink)
       wrap_mode = clay_text_wrap_words_and_graphemes
@@ -955,7 +1086,7 @@ proc build_graph_conversation_panel(view: MainWindow) =
         color: palette_color(view.palette.ink), width: border_outside(2)),
       clip = ClayClipElementConfig(vertical: true))
     scrollable_element(log_element_id, log_declaration):
-      for message_index, message in view.graph_tab.conversation_messages:
+      for message_index, message in conversation.messages:
         let is_user = message.speaker == conversation_user
         let row_id = clay_id_with_index(
           "graph_conversation_message", uint32(message_index))
@@ -1054,10 +1185,41 @@ proc build_graph_tab(view: MainWindow) =
         color = palette_color(view.palette.ink)
         width = border_outside(4)
 
-      text("GRAPH / RANDOM LIVE / MUT " & $view.graph_tab.mutation_count):
+      text("GRAPH / RANDOM INITIAL / CODEX CHAT"):
         font_size = 13
         text_color = palette_color(view.palette.paper)
         wrap_mode = clay_text_wrap_words_and_graphemes
+
+      if view.graph_tab.global_log_messages.len > 0:
+        element("graph_global_log_panel"):
+          layout:
+            sizing:
+              width = grow()
+              height = fit(28, 128)
+            padding = padding_all(8)
+            child_gap = 5
+            layout_direction = clay_top_to_bottom
+          background_color = palette_color(view.palette.paper)
+          border:
+            color = palette_color(view.palette.ink)
+            width = border_outside(3)
+          text("GLOBAL LOG"):
+            font_size = 8
+            text_color = palette_color(view.palette.ink)
+            wrap_mode = clay_text_wrap_words_and_graphemes
+          let global_log_element_id = clay_id(graph_global_log_id)
+          let global_log_declaration = declaration(
+            layout = layout(
+              sizing = sizing(grow(), grow()),
+              child_gap = 3,
+              layout_direction = clay_top_to_bottom),
+            clip = ClayClipElementConfig(vertical: true))
+          scrollable_element(global_log_element_id, global_log_declaration):
+            for message in view.graph_tab.global_log_messages:
+              text(message):
+                font_size = 8
+                text_color = palette_color(view.palette.ink)
+                wrap_mode = clay_text_wrap_words_and_graphemes
 
       element("graph_stage"):
         layout:

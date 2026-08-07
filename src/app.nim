@@ -138,6 +138,7 @@ proc sdl_app_init(appstate: ptr pointer; argc: cint;
 
   var window_state: WindowState
   if not init_window_state(window_state, main_window, config, 0):
+    main_window.deinit()
     deinitLock(app_state_root.event_lock)
     app_state_root = nil
     return app_failure
@@ -188,6 +189,9 @@ proc sdl_app_quit(appstate: pointer; result: SdlAppResult) {.cdecl.} =
     return
 
   for window in state.windows:
+    case window.kind:
+    of window_kind_main:
+      window.main_window.deinit()
     deinit_window_state(window)
   state.windows.setLen(0)
   state.event_queue.clear()

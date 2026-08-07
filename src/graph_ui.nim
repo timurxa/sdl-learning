@@ -80,13 +80,19 @@ type
     pan_button*: uint8
     zoom_factor*: float32
 
+  GraphNodeGeometry = object
+    screen_bounds: ClayBoundingBox
+    circle_origin: ClayVector2
+    circle_diameter: float32
+
   GraphView* = object
     nodes*: seq[GraphNode]
     arrows*: seq[GraphArrow]
     draw_list*: OpaqueDrawList
-    node_pointer_capture_mode*: ClayPointerCaptureMode
     selected_node_id*: uint32
     selected_node_valid*: bool
+    hovered_node_id*: uint32
+    hovered_node_valid*: bool
     canvas_config*: GraphCanvasConfig
     pan*: ClayVector2
     zoom*: float32
@@ -95,6 +101,12 @@ type
     pressed_node_id: uint32
     pressed_node_pointer: ClayVector2
     pressed_node_valid: bool
+    viewport_bounds: ClayBoundingBox
+    panel_bounds: ClayBoundingBox
+    viewport_valid: bool
+    panel_valid: bool
+    pointer_position: ClayVector2
+    pointer_valid: bool
     layout_solver*: GraphLayoutSolver
 
 const
@@ -769,8 +781,10 @@ proc ensure_graph_canvas_state(graph: var GraphView) {.inline.} =
   if graph.zoom <= 0 or graph.zoom != graph.zoom:
     graph.zoom = 1'f32
 
-proc graph_surface_id(): ClayElementId {.inline.} =
-  clay_id("graph_surface")
+proc graph_transform_point(graph: GraphView; point: ClayVector2): ClayVector2 {.inline.} =
+  vector2(
+    graph.pan.x + point.x * graph.zoom,
+    graph.pan.y + point.y * graph.zoom)
 
 proc pointer_inside_canvas(bounds: ClayBoundingBox; pointer: ClayVector2): bool {.inline.} =
   pointer.x >= bounds.x and
@@ -778,13 +792,79 @@ proc pointer_inside_canvas(bounds: ClayBoundingBox; pointer: ClayVector2): bool 
     pointer.x < bounds.x + bounds.width and
     pointer.y < bounds.y + bounds.height
 
-proc hovered_graph_node(graph: GraphView): tuple[found: bool; stable_id: uint32] =
+proc graph_node_geometry(graph: GraphView; node: GraphNode): GraphNodeGeometry =
+  let circle_diameter_world = min(node.size.width, node.size.height)
+  let circle_origin_world = vector2(
+    node.screen_position.x + (node.size.width - circle_diameter_world) / 2,
+    node.screen_position.y + (node.size.height - circle_diameter_world) / 2)
+  result.screen_bounds = ClayBoundingBox(
+    x: graph.graph_transform_point(node.screen_position).x,
+    y: graph.graph_transform_point(node.screen_position).y,
+    width: float32(node.size.width) * graph.zoom,
+    height: float32(node.size.height) * graph.zoom)
+  result.circle_origin = graph.graph_transform_point(circle_origin_world)
+  result.circle_diameter = circle_diameter_world * graph.zoom
+
+proc graph_local_pointer(graph: GraphView; pointer: ClayVector2): ClayVector2 {.inline.} =
+  vector2(
+    pointer.x - graph.viewport_bounds.x,
+    pointer.y - graph.viewport_bounds.y)
+
+proc pointer_inside_graph(graph: GraphView; pointer: ClayVector2): bool {.inline.} =
+  graph.viewport_valid and
+    pointer_inside_canvas(graph.viewport_bounds, pointer) and
+    (not graph.panel_valid or not pointer_inside_canvas(graph.panel_bounds, pointer))
+
+proc graph_pointer_inside*(graph: GraphView; pointer: ClayVector2): bool {.inline.} =
+  graph.pointer_inside_graph(pointer)
+
+proc hovered_graph_node(graph: GraphView; pointer: ClayVector2): tuple[found: bool; stable_id: uint32] =
   var best_z_index = low(int16)
   for node in graph.nodes:
-    if clay_pointer_over(clay_id_with_index("graph_node", node.stable_id)) and
+    let geometry = graph.graph_node_geometry(node)
+    let radius = geometry.circle_diameter / 2'f32
+    let center = vector2(
+      geometry.circle_origin.x + radius,
+      geometry.circle_origin.y + radius)
+    let delta_x = pointer.x - center.x
+    let delta_y = pointer.y - center.y
+    if delta_x * delta_x + delta_y * delta_y <= radius * radius and
         (not result.found or node.z_index >= best_z_index):
       result = (true, node.stable_id)
       best_z_index = node.z_index
+
+proc graph_node_at_pointer(graph: GraphView; pointer: ClayVector2): tuple[found: bool; stable_id: uint32] =
+  if graph.pointer_inside_graph(pointer):
+    result = graph.hovered_graph_node(graph.graph_local_pointer(pointer))
+
+proc refresh_graph_hover(graph: var GraphView) =
+  graph.hovered_node_valid = false
+  if not graph.pointer_valid:
+    return
+  let hovered_node = graph.graph_node_at_pointer(graph.pointer_position)
+  if hovered_node.found:
+    graph.hovered_node_id = hovered_node.stable_id
+    graph.hovered_node_valid = true
+
+proc set_graph_viewport*(graph: var GraphView; viewport_bounds: ClayBoundingBox;
+    panel_bounds: ClayBoundingBox = ClayBoundingBox(); panel_valid = false) =
+  graph.viewport_bounds = viewport_bounds
+  graph.panel_bounds = panel_bounds
+  graph.viewport_valid = viewport_bounds.width > 0 and viewport_bounds.height > 0
+  graph.panel_valid = panel_valid
+  graph.refresh_graph_hover()
+
+proc clear_graph_viewport*(graph: var GraphView) =
+  graph.viewport_valid = false
+  graph.panel_valid = false
+  graph.pointer_valid = false
+  graph.refresh_graph_hover()
+
+proc clear_graph_pointer*(graph: var GraphView) =
+  graph.pressed_node_valid = false
+  graph.pan_active = false
+  graph.pointer_valid = false
+  graph.refresh_graph_hover()
 
 proc valid_graph_float(value: float32): bool {.inline.} =
   value == value and value >= -high(float32) and value <= high(float32)
@@ -793,15 +873,11 @@ proc cancel_pan*(graph: var GraphView) {.inline.} =
   graph.pan_active = false
 
 proc zoom_at_pointer(graph: var GraphView; pointer: ClayVector2; wheel_delta: float32) =
-  let element_data = clay_get_element_data(graph_surface_id())
-  if wheel_delta == 0 or not element_data.found or
-      not pointer_inside_canvas(element_data.bounding_box, pointer):
+  if wheel_delta == 0 or not graph.pointer_inside_graph(pointer):
     return
 
   let old_zoom = graph.zoom
-  let local_pointer = vector2(
-    pointer.x - element_data.bounding_box.x,
-    pointer.y - element_data.bounding_box.y)
+  let local_pointer = graph.graph_local_pointer(pointer)
   let world_pointer = vector2(
     (local_pointer.x - graph.pan.x) / old_zoom,
     (local_pointer.y - graph.pan.y) / old_zoom)
@@ -821,24 +897,33 @@ proc zoom_at_pointer(graph: var GraphView; pointer: ClayVector2; wheel_delta: fl
   graph.zoom = next_zoom
   graph.pan = next_pan
 
+proc update_graph_pointer(graph: var GraphView; event: UiEvent) =
+  case event.kind
+  of ui_event_mouse_move,
+      ui_event_mouse_button_down,
+      ui_event_mouse_button_up,
+      ui_event_mouse_wheel:
+    graph.pointer_position = vector2(event.x, event.y)
+    graph.pointer_valid = true
+  else:
+    discard
+
 proc handle_event*(graph: var GraphView; event: UiEvent) =
   graph.ensure_graph_canvas_state()
+  graph.update_graph_pointer(event)
   case event.kind
   of ui_event_mouse_button_down:
     let pointer = vector2(event.x, event.y)
-    let element_data = clay_get_element_data(graph_surface_id())
     graph.pressed_node_valid = false
     if event.button == graph.canvas_config.pan_button and
-        element_data.found and
-        pointer_inside_canvas(element_data.bounding_box, pointer):
-      let hovered_node = graph.hovered_graph_node()
+        graph.pointer_inside_graph(pointer):
+      let hovered_node = graph.graph_node_at_pointer(pointer)
       if hovered_node.found:
         graph.pressed_node_id = hovered_node.stable_id
         graph.pressed_node_pointer = pointer
         graph.pressed_node_valid = true
-      if hovered_node.found or clay_pointer_over(graph_surface_id()):
-        graph.pan_active = true
-        graph.pan_pointer = pointer
+      graph.pan_active = true
+      graph.pan_pointer = pointer
   of ui_event_mouse_move:
     if graph.pressed_node_valid:
       let delta_x = event.x - graph.pressed_node_pointer.x
@@ -851,10 +936,11 @@ proc handle_event*(graph: var GraphView; event: UiEvent) =
         graph.pan.x + event.x - graph.pan_pointer.x,
         graph.pan.y + event.y - graph.pan_pointer.y)
       graph.pan_pointer = vector2(event.x, event.y)
+    graph.refresh_graph_hover()
   of ui_event_mouse_button_up:
     if graph.pressed_node_valid and
         (event.button == graph.canvas_config.pan_button or event.button == 0):
-      let hovered_node = graph.hovered_graph_node()
+      let hovered_node = graph.graph_node_at_pointer(graph.pointer_position)
       if hovered_node.found and hovered_node.stable_id == graph.pressed_node_id:
         if graph.selected_node_valid and
             graph.selected_node_id == hovered_node.stable_id:
@@ -866,22 +952,14 @@ proc handle_event*(graph: var GraphView; event: UiEvent) =
     if graph.pan_active and
         (event.button == graph.canvas_config.pan_button or event.button == 0):
       graph.cancel_pan()
+    graph.refresh_graph_hover()
   of ui_event_mouse_wheel:
-    if not clay_pointer_over(clay_id("graph_panel")):
-      graph.zoom_at_pointer(vector2(event.x, event.y), event.wheel_y)
-  of ui_event_window_focus_lost:
-    graph.pressed_node_valid = false
-    graph.cancel_pan()
-  of ui_event_mouse_leave:
-    graph.pressed_node_valid = false
-    graph.cancel_pan()
+    graph.zoom_at_pointer(vector2(event.x, event.y), event.wheel_y)
+    graph.refresh_graph_hover()
+  of ui_event_window_focus_lost, ui_event_mouse_leave:
+    graph.clear_graph_pointer()
   else:
     discard
-
-proc graph_transform_point(graph: GraphView; point: ClayVector2): ClayVector2 {.inline.} =
-  vector2(
-    graph.pan.x + point.x * graph.zoom,
-    graph.pan.y + point.y * graph.zoom)
 
 proc graph_node_center(node: GraphNode): ClayVector2 {.inline.} =
   vector2(
@@ -944,76 +1022,91 @@ proc add_graph_arrow(graph: var GraphView; arrow: GraphArrow) =
 proc graph_node_z_index*(node: GraphNode): int16 {.inline.} =
   int16(10 + int(node.z_index))
 
-template graph_node*(graph: GraphView; graph_id: ClayElementId;
-    node: GraphNode; body: untyped) =
-  let node_id = clay_id_with_index("graph_node", node.stable_id)
-  let highlighted = clay_pointer_over(node_id)
-  let circle_diameter_world = min(node.size.width, node.size.height)
-  let circle_origin_world = vector2(
-    node.screen_position.x + (node.size.width - circle_diameter_world) / 2,
-    node.screen_position.y + (node.size.height - circle_diameter_world) / 2)
-  let circle_origin = graph.graph_transform_point(circle_origin_world)
-  let circle_diameter = circle_diameter_world * graph.zoom
+proc add_graph_node_draw_items(graph: GraphView; node: GraphNode) =
+  let geometry = graph.graph_node_geometry(node)
+  let highlighted = graph.hovered_node_valid and
+    graph.hovered_node_id == node.stable_id
   let circle_color = if node.circle_color.a > 0:
     node.circle_color
   else:
     rgba(255, 255, 255, 255)
   let border_color = rgba(20, 18, 15, 255)
   let inner_circle_diameter_world = max(
-    circle_diameter_world - graph_node_border_width * 2'f32,
+    min(node.size.width, node.size.height) - graph_node_border_width * 2'f32,
     0'f32)
-  let inner_circle_origin_world = vector2(
-    circle_origin_world.x + graph_node_border_width,
-    circle_origin_world.y + graph_node_border_width)
+  let inner_circle_origin = vector2(
+    geometry.circle_origin.x + graph_node_border_width * graph.zoom,
+    geometry.circle_origin.y + graph_node_border_width * graph.zoom)
   let node_z_index = graph_node_z_index(node)
   if highlighted:
-    let highlight_origin_world = vector2(
-      circle_origin_world.x - graph_node_highlight_width,
-      circle_origin_world.y - graph_node_highlight_width)
+    let highlight_origin = vector2(
+      geometry.circle_origin.x - graph_node_highlight_width * graph.zoom,
+      geometry.circle_origin.y - graph_node_highlight_width * graph.zoom)
     graph.draw_list.add_opaque_circle(
-      graph.graph_transform_point(highlight_origin_world),
-      (circle_diameter_world + graph_node_highlight_width * 2'f32) * graph.zoom,
+      highlight_origin,
+      geometry.circle_diameter + graph_node_highlight_width * 2'f32 * graph.zoom,
       rgba(70, 145, 255, 255),
       node_z_index)
   graph.draw_list.add_opaque_circle(
-    circle_origin,
-    circle_diameter,
+    geometry.circle_origin,
+    geometry.circle_diameter,
     border_color,
     node_z_index)
   if inner_circle_diameter_world > 0:
     graph.draw_list.add_opaque_circle(
-      graph.graph_transform_point(inner_circle_origin_world),
+      inner_circle_origin,
       inner_circle_diameter_world * graph.zoom,
       circle_color,
       node_z_index)
 
+proc rebuild_graph_draw_list*(graph: var GraphView) =
+  graph.ensure_graph_canvas_state()
+  if graph.draw_list == nil:
+    graph.draw_list = new_opaque_draw_list()
+  clear_opaque_draw_list(graph.draw_list)
+  for arrow in graph.arrows:
+    graph.add_graph_arrow(arrow)
+  for node in graph.nodes:
+    graph.add_graph_node_draw_items(node)
+
+template graph_node_element(graph: GraphView; graph_id: ClayElementId;
+    node: GraphNode; body: untyped) =
+  let node_id = clay_id_with_index("graph_node", node.stable_id)
+  let geometry = graph.graph_node_geometry(node)
+  let node_z_index = graph_node_z_index(node)
+
   let node_declaration = declaration(
     layout = layout(
-      sizing = sizing(fixed(node.size.width), fixed(node.size.height))),
+      sizing = sizing(
+        fixed(geometry.screen_bounds.width),
+        fixed(geometry.screen_bounds.height))),
     floating = ClayFloatingElementConfig(
       parent_id: graph_id.id,
-      offset: graph.graph_transform_point(node.screen_position),
+      offset: vector2(geometry.screen_bounds.x, geometry.screen_bounds.y),
       attach_points: ClayFloatingAttachPoints(
         element: clay_attach_point_left_top,
         parent: clay_attach_point_left_top),
-      pointer_capture_mode: graph.node_pointer_capture_mode,
+      pointer_capture_mode: clay_pointer_capture_mode_passthrough,
       attach_to: clay_attach_to_element_with_id,
       clip_to: clay_clip_to_attached_parent,
       z_index: node_z_index))
   element(node_id, node_declaration):
     body
 
+template graph_node*(graph: GraphView; graph_id: ClayElementId;
+    node: GraphNode; body: untyped) =
+  graph.add_graph_node_draw_items(node)
+  graph_node_element(graph, graph_id, node):
+    body
+
 template graph_window_with_panel*(graph: var GraphView; node_name: untyped;
     panel_body: untyped; body: untyped) =
   graph.ensure_graph_canvas_state()
+  graph.refresh_graph_hover()
   if graph.selected_node_valid and
       graph.graph_node_index_by_id(graph.selected_node_id) < 0:
     graph.selected_node_valid = false
-  if graph.draw_list == nil:
-    graph.draw_list = new_opaque_draw_list()
-  clear_opaque_draw_list(graph.draw_list)
-  for arrow in graph.arrows:
-    graph.add_graph_arrow(arrow)
+  graph.rebuild_graph_draw_list()
   let graph_id = clay_id("graph_surface")
   let graph_declaration = declaration(
     layout = layout(sizing = sizing(grow(), grow())),
@@ -1027,7 +1120,7 @@ template graph_window_with_panel*(graph: var GraphView; node_name: untyped;
       discard
     for graph_node_value in graph.nodes:
       let node_name = graph_node_value
-      graph_node(graph, graph_id, node_name):
+      graph_node_element(graph, graph_id, node_name):
         body
     if graph.selected_node_valid:
       let panel_host_declaration = declaration(
