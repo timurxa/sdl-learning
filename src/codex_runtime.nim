@@ -139,7 +139,7 @@ proc request_for_turn(state: var RuntimeState; turn_id: string): Option[string] 
       return some(request_key)
   none(string)
 
-proc server_request_thread_id(request: ServerRequest): Option[string] =
+proc server_request_thread_id*(request: ServerRequest): Option[string] =
   case request.params.kind:
   of sr_command_execution_approval:
     some(request.params.command_execution_approval.thread_id)
@@ -149,19 +149,34 @@ proc server_request_thread_id(request: ServerRequest): Option[string] =
     some(request.params.tool_user_input.thread_id)
   of sr_tool_call:
     some(request.params.tool_call.thread_id)
-  of sr_auth_tokens_refresh:
+  of sr_auth_tokens_refresh, sr_apply_patch_approval, sr_exec_command_approval,
+      sr_unknown:
     none(string)
-  of sr_apply_patch_approval:
-    some(request.params.apply_patch_approval.conversation_id)
-  of sr_exec_command_approval:
-    some(request.params.exec_command_approval.conversation_id)
-  of sr_unknown:
-    if request.params.unknown.kind != JObject:
-      return none(string)
-    if request.params.unknown.contains("threadId"):
-      return some(request.params.unknown["threadId"].getStr)
-    if request.params.unknown.contains("conversationId"):
-      return some(request.params.unknown["conversationId"].getStr)
+
+proc server_request_turn_id*(request: ServerRequest): Option[string] =
+  case request.params.kind:
+  of sr_command_execution_approval:
+    some(request.params.command_execution_approval.turn_id)
+  of sr_file_change_approval:
+    some(request.params.file_change_approval.turn_id)
+  of sr_tool_user_input:
+    some(request.params.tool_user_input.turn_id)
+  of sr_tool_call:
+    some(request.params.tool_call.turn_id)
+  of sr_auth_tokens_refresh, sr_apply_patch_approval, sr_exec_command_approval,
+      sr_unknown:
+    none(string)
+
+proc server_request_item_id*(request: ServerRequest): Option[string] =
+  case request.params.kind:
+  of sr_command_execution_approval:
+    some(request.params.command_execution_approval.item_id)
+  of sr_file_change_approval:
+    some(request.params.file_change_approval.item_id)
+  of sr_tool_user_input:
+    some(request.params.tool_user_input.item_id)
+  of sr_tool_call, sr_auth_tokens_refresh, sr_apply_patch_approval,
+      sr_exec_command_approval, sr_unknown:
     none(string)
 
 proc apply_server_request*(state: var RuntimeState; request: ServerRequest) =
@@ -204,6 +219,15 @@ proc remove_server_request*(state: var RuntimeState; id: RequestId): Option[Serv
   some(request)
 
 proc apply_notification*(state: var RuntimeState; notification: Notification) =
+  if notification.kind notin {
+      nk_thread_started,
+      nk_turn_started,
+      nk_turn_completed,
+      nk_thread_status_changed,
+      nk_thread_closed,
+      nk_error}:
+    return
+
   let params = notification.params
   if not params.thread_id.has_value:
     return
@@ -242,8 +266,6 @@ proc apply_notification*(state: var RuntimeState; notification: Notification) =
         set_agent_error(agent, "turn failed")
     else:
       agent.state = as_idle
-  of nk_agent_message_delta:
-    discard
   of nk_thread_status_changed:
     if params.thread_status.isSome:
       case params.thread_status.get:
@@ -265,9 +287,12 @@ proc apply_notification*(state: var RuntimeState; notification: Notification) =
     agent.state = as_closed
     agent.turn_id = none(string)
   of nk_error:
-    if params.error_message.isSome:
+    if params.will_retry.isSome and params.will_retry.get:
+      agent.state = as_working
+      clear_agent_error(agent)
+    elif params.error_message.isSome:
       set_agent_error(agent, params.error_message.get)
-  of nk_initialized, nk_unknown:
+  else:
     discard
 
   state.agents[id] = agent
@@ -287,15 +312,7 @@ proc send_initialized(runtime: ptr CodexRuntime) =
     kind: mk_notification,
     notification: Notification(
       kind: nk_initialized,
-      params: NotificationParams(
-        thread_id: Nullable[string](has_value: false),
-        turn_id: none(string),
-        turn_status: none(TurnStatus),
-        thread_status: none(ThreadStatusKind),
-        raw_params: newJObject(),
-        active_flags: {},
-        error_message: none(string)
-      )
+      params: new_notification_params()
     )
   )))
 

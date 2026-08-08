@@ -39,6 +39,13 @@ type
     kind*: CodexRuntimeEventKind
     node_id*: uint32
     text*: string
+    method_name*: string
+    thread_id*: string
+    turn_id*: string
+    item_id*: string
+    request_id*: string
+    params_json*: string
+    conversation_scoped*: bool
 
   CodexReaderContext = object
     bridge: ptr CodexBridgeState
@@ -95,6 +102,69 @@ proc params_prefix(params: JsonNode): string =
   result = $params
   if result.len > 40:
     result = result[0 ..< 40]
+
+proc notification_thread_id(notification: Notification): string =
+  if notification.params.thread_id.has_value:
+    result = notification.params.thread_id.value
+
+proc notification_turn_id(notification: Notification): string =
+  if notification.params.turn_id.isSome:
+    result = notification.params.turn_id.get
+
+proc notification_item_id(notification: Notification): string =
+  if notification.params.item_id.isSome:
+    result = notification.params.item_id.get
+
+proc notification_will_retry(notification: Notification): bool =
+  notification.params.will_retry.isSome and notification.params.will_retry.get
+
+proc notification_node_id(thread_nodes: Table[string, uint32];
+    notification: Notification): uint32 =
+  let thread_id = notification_thread_id(notification)
+  if thread_id.len > 0:
+    return node_id_for_thread(thread_nodes, thread_id).get(0'u32)
+
+proc server_request_event(thread_nodes: Table[string, uint32];
+    request: ServerRequest): CodexRuntimeEvent =
+  let thread_id = server_request_thread_id(request)
+  let turn_id = server_request_turn_id(request)
+  let item_id = server_request_item_id(request)
+  CodexRuntimeEvent(
+    kind: cre_global_notification,
+    node_id: if thread_id.isSome:
+      node_id_for_thread(thread_nodes, thread_id.get).get(0'u32)
+    else:
+      0'u32,
+    text: "server request: " & request.method_name,
+    method_name: request.method_name,
+    thread_id: if thread_id.isSome: thread_id.get else: "",
+    turn_id: if turn_id.isSome: turn_id.get else: "",
+    item_id: if item_id.isSome: item_id.get else: "",
+    request_id: request_id_key(request.id),
+    params_json: request.params_json,
+    conversation_scoped: true)
+
+proc notification_event(notification: Notification; node_id: uint32;
+    kind = cre_global_notification; text = ""): CodexRuntimeEvent =
+  let event_text =
+    if text.len > 0:
+      text
+    elif notification.kind in {nk_turn_diff_updated,
+        nk_file_change_output_delta}:
+      notification.method_name & " activity"
+    else:
+      notification.method_name & " " &
+        params_prefix(notification.params.raw_params)
+  CodexRuntimeEvent(
+    kind: kind,
+    node_id: node_id,
+    text: event_text,
+    method_name: notification.method_name,
+    thread_id: notification_thread_id(notification),
+    turn_id: notification_turn_id(notification),
+    item_id: notification_item_id(notification),
+    params_json: notification_payload_json(notification),
+    conversation_scoped: notification.kind.is_conversation_notification)
 
 proc emit_unknown_notification(bridge: ptr CodexBridgeState;
     notification: Notification) =
@@ -184,10 +254,11 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
         let node_id = node_id_for_thread(
           thread_nodes, notification.params.thread_id.value)
         if node_id.isSome:
-          bridge.emit_event(CodexRuntimeEvent(
-            kind: cre_agent_message_delta,
-            node_id: node_id.get,
-            text: notification.params.delta.get))
+          bridge.emit_event(notification_event(
+            notification,
+            node_id.get,
+            cre_agent_message_delta,
+            notification.params.delta.get))
     of nk_turn_completed:
       if notification.params.thread_id.has_value:
         let node_id = node_id_for_thread(
@@ -195,15 +266,16 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
         if node_id.isSome:
           if notification.params.turn_status.isSome and
               notification.params.turn_status.get == ts_failed:
-            bridge.emit_event(CodexRuntimeEvent(
-              kind: cre_node_error,
-              node_id: node_id.get,
-              text: notification.params.error_message.get(
-                "turn failed")))
+            bridge.emit_event(notification_event(
+              notification,
+              node_id.get,
+              cre_node_error,
+              notification.params.error_message.get("turn failed")))
           else:
-            bridge.emit_event(CodexRuntimeEvent(
-              kind: cre_turn_completed,
-              node_id: node_id.get))
+            bridge.emit_event(notification_event(
+              notification,
+              node_id.get,
+              cre_turn_completed))
           send_next_queued_message(
             runtime, bridge, node_id.get, request_nodes, queued_messages)
     of nk_error:
@@ -211,14 +283,25 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
         let node_id = node_id_for_thread(
           thread_nodes, notification.params.thread_id.value)
         if node_id.isSome:
-          bridge.emit_event(CodexRuntimeEvent(
-            kind: cre_node_error,
-            node_id: node_id.get,
-            text: notification.params.error_message.get("runtime error")))
+          let event_kind = if notification.notification_will_retry:
+            cre_global_notification
+          else:
+            cre_node_error
+          bridge.emit_event(notification_event(
+            notification,
+            node_id.get,
+            event_kind,
+            notification.params.error_message.get("runtime error")))
       else:
-        bridge.emit_event(CodexRuntimeEvent(
-          kind: cre_runtime_error,
-          text: notification.params.error_message.get("runtime error")))
+        let event_kind = if notification.notification_will_retry:
+          cre_global_notification
+        else:
+          cre_runtime_error
+        bridge.emit_event(notification_event(
+          notification,
+          0,
+          event_kind,
+          notification.params.error_message.get("runtime error")))
     of nk_thread_closed:
       if notification.params.thread_id.has_value:
         let node_id = node_id_for_thread(
@@ -231,13 +314,23 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
             node_id: node_id.get,
             text: "Codex thread closed"))
     of nk_unknown:
-      emit_unknown_notification(bridge, notification)
+      if not notification.method_name.is_suppressed_notification:
+        emit_unknown_notification(bridge, notification)
     else:
-      discard
+      if notification.kind.is_conversation_notification:
+        bridge.emit_event(notification_event(
+          notification,
+          notification_node_id(thread_nodes, notification)))
   of mk_server_request:
-    bridge.emit_event(CodexRuntimeEvent(
-      kind: cre_global_notification,
-      text: "unsupported server request: " & message.server_request.method_name))
+    let request = message.server_request
+    if request.kind.is_conversation_server_request:
+      bridge.emit_event(server_request_event(thread_nodes, request))
+    else:
+      bridge.emit_event(CodexRuntimeEvent(
+        kind: cre_global_notification,
+        text: "unsupported server request: " & request.method_name,
+        method_name: request.method_name,
+        request_id: request_id_key(request.id)))
   else:
     discard
 

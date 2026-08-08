@@ -1,4 +1,4 @@
-import std/[json, options, tables]
+import std/[json, options, strutils, tables]
 
 type
   JsonObject* = Table[string, JsonNode]
@@ -331,6 +331,7 @@ type
     id*: RequestId
     kind*: ServerRequestKind
     method_name*: string
+    params_json*: string
     params*: ServerRequestParams
     extra_fields*: JsonObject
 
@@ -343,9 +344,23 @@ type
   NotificationKind* = enum
     nk_initialized,
     nk_thread_started,
+    nk_thread_token_usage_updated,
     nk_turn_started,
     nk_turn_completed,
+    nk_turn_diff_updated,
+    nk_turn_plan_updated,
+    nk_item_started,
+    nk_item_completed,
     nk_agent_message_delta,
+    nk_plan_delta,
+    nk_command_execution_output_delta,
+    nk_terminal_interaction,
+    nk_file_change_output_delta,
+    nk_mcp_tool_call_progress,
+    nk_reasoning_summary_text_delta,
+    nk_reasoning_summary_part_added,
+    nk_thread_compacted,
+    nk_model_rerouted,
     nk_thread_status_changed,
     nk_thread_closed,
     nk_error,
@@ -354,8 +369,11 @@ type
   NotificationParams* = object
     thread_id*: Nullable[string]
     turn_id*: Option[string]
+    item_id*: Option[string]
     turn_status*: Option[TurnStatus]
     delta*: Option[string]
+    summary_index*: Option[int]
+    will_retry*: Option[bool]
     raw_params*: JsonNode
     thread_status*: Option[ThreadStatusKind]
     active_flags*: set[ActiveFlag]
@@ -410,6 +428,23 @@ type
       error*: Error
     of mk_notification:
       notification*: Notification
+
+proc new_notification_params*(): NotificationParams =
+  NotificationParams(
+    thread_id: Nullable[string](has_value: false),
+    turn_id: none(string),
+    item_id: none(string),
+    turn_status: none(TurnStatus),
+    delta: none(string),
+    summary_index: none(int),
+    will_retry: none(bool),
+    raw_params: newJObject(),
+    thread_status: none(ThreadStatusKind),
+    active_flags: {},
+    error_message: none(string),
+    thread_extra_fields: initTable[string, JsonNode](),
+    turn_extra_fields: initTable[string, JsonNode](),
+    extra_fields: initTable[string, JsonNode]())
 
 proc register_dynamic_tool*(registry: var DynamicToolRegistry;
     name, description: string; input_schema: JsonNode; data: pointer;
@@ -845,6 +880,161 @@ proc server_request_method*(kind: ServerRequestKind): string =
   of sr_exec_command_approval: "execCommandApproval"
   of sr_unknown: ""
 
+proc is_conversation_server_request*(kind: ServerRequestKind): bool =
+  kind in {
+    sr_command_execution_approval,
+    sr_file_change_approval,
+    sr_tool_user_input,
+    sr_tool_call
+  }
+
+proc is_conversation_notification*(kind: NotificationKind): bool =
+  kind in {
+    nk_thread_started,
+    nk_thread_token_usage_updated,
+    nk_turn_started,
+    nk_turn_completed,
+    nk_turn_diff_updated,
+    nk_turn_plan_updated,
+    nk_item_started,
+    nk_item_completed,
+    nk_agent_message_delta,
+    nk_plan_delta,
+    nk_command_execution_output_delta,
+    nk_terminal_interaction,
+    nk_file_change_output_delta,
+    nk_mcp_tool_call_progress,
+    nk_reasoning_summary_text_delta,
+    nk_reasoning_summary_part_added,
+    nk_thread_compacted,
+    nk_model_rerouted,
+    nk_error
+  }
+
+proc is_suppressed_notification*(method_name: string): bool =
+  method_name == "item/reasoning/textDelta"
+
+proc unquote_diff_path(value: string): string =
+  result = value.strip
+  if result.len >= 2 and result[0] == '"' and result[^1] == '"':
+    try:
+      let parsed = parseJson(result)
+      if parsed.kind == JString:
+        return parsed.getStr
+    except CatchableError:
+      discard
+    result = result[1 .. ^2]
+
+proc diff_path(value: string; prefix: string): string =
+  result = unquote_diff_path(value)
+  if result == "/dev/null":
+    result.setLen(0)
+    return
+  if result.startsWith(prefix & "/"):
+    result = result[(prefix.len + 1) .. ^1]
+
+proc diff_summary*(diff: string): JsonNode =
+  var files = newJArray()
+  var current_path = ""
+  var current_added = 0
+  var current_removed = 0
+  var have_file = false
+  var have_headers = false
+  var in_hunk = false
+  var total_added = 0
+  var total_removed = 0
+
+  proc flush_file() =
+    if not have_file:
+      return
+    let file = newJObject()
+    file["path"] = %current_path
+    file["added"] = %current_added
+    file["removed"] = %current_removed
+    files.add(file)
+    total_added += current_added
+    total_removed += current_removed
+    current_path.setLen(0)
+    current_added = 0
+    current_removed = 0
+    have_file = false
+    have_headers = false
+    in_hunk = false
+
+  for line in diff.splitLines:
+    if line.startsWith("diff --git "):
+      flush_file()
+      let parts = line.splitWhitespace
+      if parts.len >= 4:
+        if not parts[3].startsWith("\"") and not parts[3].endsWith("\""):
+          current_path = diff_path(parts[3], "b")
+      have_file = true
+    elif not in_hunk and line.startsWith("rename to "):
+      current_path = diff_path(line[10 .. ^1], "b")
+      have_file = true
+    elif not in_hunk and line.startsWith("Binary files "):
+      let body = line[13 .. ^1]
+      let separator = body.rfind(" and ")
+      if separator >= 0:
+        let source = body[0 ..< separator].strip
+        var target = body[(separator + 5) .. ^1].strip
+        if target.endsWith(" differ"):
+          target = target[0 ..< target.len - 7]
+        current_path = diff_path(target, "b")
+        if current_path.len == 0:
+          current_path = diff_path(source, "a")
+        have_file = true
+    elif line.startsWith("@@ "):
+      in_hunk = true
+    elif not in_hunk and line.startsWith("--- "):
+      if have_headers:
+        flush_file()
+      current_path = diff_path(line[4 .. ^1], "a")
+      have_file = true
+      have_headers = true
+    elif not in_hunk and line.startsWith("+++ "):
+      let path = diff_path(line[4 .. ^1], "b")
+      if path.len > 0:
+        current_path = path
+      have_file = true
+      have_headers = true
+    elif in_hunk and line.startsWith("+"):
+      inc current_added
+    elif in_hunk and line.startsWith("-"):
+      inc current_removed
+  flush_file()
+
+  result = newJObject()
+  result["files"] = files
+  result["added"] = %total_added
+  result["removed"] = %total_removed
+
+proc diff_summary_json*(diff: string): string =
+  $diff_summary(diff)
+
+proc notification_payload_json*(notification: Notification): string =
+  let params = notification.params.raw_params
+  if notification.kind == nk_turn_diff_updated:
+    let sanitized = newJObject()
+    if params.contains("threadId"):
+      sanitized["threadId"] = params["threadId"]
+    if params.contains("turnId"):
+      sanitized["turnId"] = params["turnId"]
+    if params.contains("diff"):
+      sanitized["summary"] = diff_summary(params["diff"].getStr)
+    return $sanitized
+
+  if notification.kind == nk_file_change_output_delta:
+    let sanitized = newJObject()
+    for key, value in params.pairs:
+      if key != "delta":
+        sanitized[key] = value
+    if params.contains("delta"):
+      sanitized["deltaLength"] = %params["delta"].getStr.len
+    return $sanitized
+
+  $params
+
 proc parse_request_id(node: JsonNode): RequestId =
   case node.kind:
   of JString: RequestId(kind: rid_string, string_value: node.getStr)
@@ -1053,19 +1243,7 @@ proc parse_thread_status(node: JsonNode; flags: var set[ActiveFlag]): ThreadStat
 
 proc parse_notification(node: JsonNode): Notification =
   let method_name = node["method"].getStr
-  var params = NotificationParams(
-    thread_id: Nullable[string](has_value: false),
-    turn_id: none(string),
-    turn_status: none(TurnStatus),
-    delta: none(string),
-    raw_params: newJObject(),
-    thread_status: none(ThreadStatusKind),
-    active_flags: {},
-    error_message: none(string),
-    thread_extra_fields: initTable[string, JsonNode](),
-    turn_extra_fields: initTable[string, JsonNode](),
-    extra_fields: initTable[string, JsonNode]()
-  )
+  var params = new_notification_params()
   let wire_params = if node.contains("params"): node["params"] else: newJObject()
   params.raw_params = wire_params
   case method_name:
@@ -1076,6 +1254,11 @@ proc parse_notification(node: JsonNode): Notification =
     params.thread_id = Nullable[string](has_value: true, value: wire_params["thread"]["id"].getStr)
     params.thread_extra_fields = extra_fields(wire_params["thread"], "id")
     params.extra_fields = extra_fields(wire_params, "thread")
+  of "thread/tokenUsage/updated":
+    result.kind = nk_thread_token_usage_updated
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "tokenUsage")
   of "turn/started":
     result.kind = nk_turn_started
     params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
@@ -1092,12 +1275,95 @@ proc parse_notification(node: JsonNode): Notification =
       params.error_message = some(wire_params["turn"]["error"]["message"].getStr)
     params.turn_extra_fields = extra_fields(wire_params["turn"], "id", "status", "error")
     params.extra_fields = extra_fields(wire_params, "threadId", "turn")
+  of "turn/diff/updated":
+    result.kind = nk_turn_diff_updated
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "diff")
+  of "turn/plan/updated":
+    result.kind = nk_turn_plan_updated
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "explanation", "plan")
+  of "item/started":
+    result.kind = nk_item_started
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.item_id = some(wire_params["item"]["id"].getStr)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "item")
+  of "item/completed":
+    result.kind = nk_item_completed
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.item_id = some(wire_params["item"]["id"].getStr)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "item")
   of "item/agentMessage/delta":
     result.kind = nk_agent_message_delta
     params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
     params.turn_id = some(wire_params["turnId"].getStr)
+    params.item_id = some(wire_params["itemId"].getStr)
     params.delta = some(wire_params["delta"].getStr)
     params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "delta")
+  of "item/plan/delta":
+    result.kind = nk_plan_delta
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.item_id = some(wire_params["itemId"].getStr)
+    params.delta = some(wire_params["delta"].getStr)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "delta")
+  of "item/commandExecution/outputDelta":
+    result.kind = nk_command_execution_output_delta
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.item_id = some(wire_params["itemId"].getStr)
+    params.delta = some(wire_params["delta"].getStr)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "delta")
+  of "item/commandExecution/terminalInteraction":
+    result.kind = nk_terminal_interaction
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.item_id = some(wire_params["itemId"].getStr)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "processId", "stdin")
+  of "item/fileChange/outputDelta":
+    result.kind = nk_file_change_output_delta
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.item_id = some(wire_params["itemId"].getStr)
+    params.delta = some(wire_params["delta"].getStr)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "delta")
+  of "item/mcpToolCall/progress":
+    result.kind = nk_mcp_tool_call_progress
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.item_id = some(wire_params["itemId"].getStr)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "message")
+  of "item/reasoning/summaryTextDelta":
+    result.kind = nk_reasoning_summary_text_delta
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.item_id = some(wire_params["itemId"].getStr)
+    params.summary_index = some(wire_params["summaryIndex"].getInt)
+    params.delta = some(wire_params["delta"].getStr)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "summaryIndex", "delta")
+  of "item/reasoning/summaryPartAdded":
+    result.kind = nk_reasoning_summary_part_added
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.item_id = some(wire_params["itemId"].getStr)
+    params.summary_index = some(wire_params["summaryIndex"].getInt)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "summaryIndex")
+  of "item/reasoning/textDelta":
+    result.kind = nk_unknown
+  of "thread/compacted":
+    result.kind = nk_thread_compacted
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId")
+  of "model/rerouted":
+    result.kind = nk_model_rerouted
+    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    params.turn_id = some(wire_params["turnId"].getStr)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "fromModel", "toModel", "reason")
   of "thread/status/changed":
     result.kind = nk_thread_status_changed
     params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
@@ -1113,9 +1379,13 @@ proc parse_notification(node: JsonNode): Notification =
     result.kind = nk_error
     if wire_params.contains("threadId"):
       params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
+    if wire_params.contains("turnId"):
+      params.turn_id = some(wire_params["turnId"].getStr)
     if wire_params.contains("error"):
       params.error_message = some(wire_params["error"]["message"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "error")
+    if wire_params.contains("willRetry"):
+      params.will_retry = some(wire_params["willRetry"].getBool)
+    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "error", "willRetry")
   else:
     result.kind = nk_unknown
     if wire_params.kind == JObject:
@@ -1132,6 +1402,7 @@ proc parse_server_request(node: JsonNode): ServerRequest =
     id: parse_request_id(node["id"]),
     kind: kind,
     method_name: method_name,
+    params_json: $wire_params,
     params: parse_server_request_params(kind, wire_params),
     extra_fields: extra_fields(node, "id", "method", "params")
   )
