@@ -53,6 +53,7 @@ proc init_window_state(
     return false
   state.window_id = get_window_id(state.sdl_window)
 
+  clay_set_max_measure_text_cache_word_count(131072)
   let memory_size = clay_min_memory_size()
   state.clay_arena_memory = alloc0(int(memory_size))
   state.clay_arena = clay_create_arena_with_capacity_and_memory(

@@ -86,6 +86,9 @@ type
   TextLayout = object
     width, height: float32
     glyphs: seq[TextGlyph]
+  TextCacheEntry = object
+    layout: TextLayout
+    last_used: uint64
   GlyphAtlasUpload = object
     x, y, width, height: uint32
     source_offset: uint32
@@ -124,7 +127,11 @@ type
     hb_buffer: ptr HbBuffer
     font_ready: bool
     glyph_cache: Table[GlyphKey, GlyphCacheEntry]
-    text_cache: Table[TextKey, TextLayout]
+    text_cache: Table[TextKey, TextCacheEntry]
+    text_cache_usage_counter: uint64
+    text_cache_hits: uint64
+    text_cache_misses: uint64
+    text_cache_evictions: uint64
     glyph_atlas: GlyphAtlas
     clear_color: ClayColor
 
@@ -144,6 +151,7 @@ const
   default_font_path = "/Users/alex/Library/Fonts/JetBrainsMono-Regular.ttf"
   glyph_atlas_initial_size = 2048'u32
   glyph_atlas_padding = 1'u32
+  text_cache_max_entries = 1024
 
 
 doAssert sizeof(SpriteInstance) == 52
@@ -364,6 +372,10 @@ template hb_buffer: untyped = active_renderer.hb_buffer
 template font_ready: untyped = active_renderer.font_ready
 template glyph_cache: untyped = active_renderer.glyph_cache
 template text_cache: untyped = active_renderer.text_cache
+template text_cache_usage_counter: untyped = active_renderer.text_cache_usage_counter
+template text_cache_hits: untyped = active_renderer.text_cache_hits
+template text_cache_misses: untyped = active_renderer.text_cache_misses
+template text_cache_evictions: untyped = active_renderer.text_cache_evictions
 template glyph_atlas: untyped = active_renderer.glyph_atlas
 template clear_color: untyped = active_renderer.clear_color
 
@@ -519,7 +531,11 @@ proc init_font(): bool =
     return false
 
   glyph_cache = initTable[GlyphKey, GlyphCacheEntry]()
-  text_cache = initTable[TextKey, TextLayout]()
+  text_cache = initTable[TextKey, TextCacheEntry]()
+  text_cache_usage_counter = 0
+  text_cache_hits = 0
+  text_cache_misses = 0
+  text_cache_evictions = 0
   font_ready = true
   true
 
@@ -605,9 +621,33 @@ proc get_text_layout(
     line_height,
   )
   if text_cache.hasKey(key):
-    return text_cache[key]
+    inc text_cache_hits
+    inc text_cache_usage_counter
+    var entry = text_cache[key]
+    entry.last_used = text_cache_usage_counter
+    text_cache[key] = entry
+    return entry.layout
+
+  inc text_cache_misses
   result = shape_text_layout(text, key)
-  text_cache[key] = result
+  inc text_cache_usage_counter
+  if text_cache.len >= text_cache_max_entries:
+    var oldest_key: TextKey
+    var oldest_usage: uint64
+    var found_oldest = false
+    for cached_key, cached_entry in text_cache:
+      if not found_oldest or cached_entry.last_used < oldest_usage:
+        oldest_key = cached_key
+        oldest_usage = cached_entry.last_used
+        found_oldest = true
+    doAssert found_oldest
+    text_cache.del(oldest_key)
+    inc text_cache_evictions
+  text_cache[key] = TextCacheEntry(
+    layout: result,
+    last_used: text_cache_usage_counter,
+  )
+  doAssert text_cache.len <= text_cache_max_entries
 
 proc glyph_atlas_transfer_capacity(width, height: uint32): uint32 {.inline.} =
   width * height * 2
@@ -1335,7 +1375,10 @@ proc measure_text*(text: ClayStringSlice; config: ptr ClayTextElementConfig;
 
 
 proc handle_error*(error_data: ClayErrorData) {.cdecl.} =
-  echo "Clay error: ", error_data.error_type
+  echo "Clay error: ", error_data.error_type,
+    " (measurement capacity: ",
+    clay_get_max_measure_text_cache_word_count(), "): ",
+    error_data.error_text.chars
 
 
 proc render_frame*(renderer: Renderer; clay_context: ptr ClayContext;

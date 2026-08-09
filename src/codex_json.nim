@@ -908,6 +908,8 @@ proc is_conversation_notification*(kind: NotificationKind): bool =
     nk_reasoning_summary_part_added,
     nk_thread_compacted,
     nk_model_rerouted,
+    nk_thread_status_changed,
+    nk_thread_closed,
     nk_error
   }
 

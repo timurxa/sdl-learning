@@ -46,6 +46,8 @@ type
     request_id*: string
     params_json*: string
     conversation_scoped*: bool
+    notification_kind*: NotificationKind
+    server_request_kind*: ServerRequestKind
 
   CodexReaderContext = object
     bridge: ptr CodexBridgeState
@@ -126,23 +128,23 @@ proc notification_node_id(thread_nodes: Table[string, uint32];
 
 proc server_request_event(thread_nodes: Table[string, uint32];
     request: ServerRequest): CodexRuntimeEvent =
-  let thread_id = server_request_thread_id(request)
-  let turn_id = server_request_turn_id(request)
-  let item_id = server_request_item_id(request)
+  let identity = server_request_identity(request)
   CodexRuntimeEvent(
     kind: cre_global_notification,
-    node_id: if thread_id.isSome:
-      node_id_for_thread(thread_nodes, thread_id.get).get(0'u32)
+    node_id: if identity.thread_id.isSome:
+      node_id_for_thread(thread_nodes, identity.thread_id.get).get(0'u32)
     else:
       0'u32,
     text: "server request: " & request.method_name,
     method_name: request.method_name,
-    thread_id: if thread_id.isSome: thread_id.get else: "",
-    turn_id: if turn_id.isSome: turn_id.get else: "",
-    item_id: if item_id.isSome: item_id.get else: "",
+    thread_id: if identity.thread_id.isSome: identity.thread_id.get else: "",
+    turn_id: if identity.turn_id.isSome: identity.turn_id.get else: "",
+    item_id: if identity.item_id.isSome: identity.item_id.get else: "",
     request_id: request_id_key(request.id),
     params_json: request.params_json,
-    conversation_scoped: true)
+    conversation_scoped: true,
+    notification_kind: nk_unknown,
+    server_request_kind: request.kind)
 
 proc notification_event(notification: Notification; node_id: uint32;
     kind = cre_global_notification; text = ""): CodexRuntimeEvent =
@@ -164,7 +166,9 @@ proc notification_event(notification: Notification; node_id: uint32;
     turn_id: notification_turn_id(notification),
     item_id: notification_item_id(notification),
     params_json: notification_payload_json(notification),
-    conversation_scoped: notification.kind.is_conversation_notification)
+    conversation_scoped: notification.kind.is_conversation_notification,
+    notification_kind: notification.kind,
+    server_request_kind: sr_unknown)
 
 proc emit_unknown_notification(bridge: ptr CodexBridgeState;
     notification: Notification) =

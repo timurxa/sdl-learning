@@ -1,10 +1,11 @@
-import std/[random, strutils, tables]
+import std/[json, random, strutils, tables]
 import clay
 import sdl
 import ui
 import renderer
 import graph_ui
 import codex_bridge
+import codex_json
 
 type
   MainTabKind = enum
@@ -40,14 +41,61 @@ type
     conversation_working,
     conversation_error
 
-  ConversationMessage = object
+  ConversationEntryKind = enum
+    cek_message,
+    cek_activity
+
+  ConversationActivityKind = enum
+    cak_thinking,
+    cak_plan,
+    cak_command,
+    cak_tool,
+    cak_changes,
+    cak_model,
+    cak_lifecycle,
+    cak_request
+
+  ConversationActivityState = enum
+    cas_active,
+    cas_complete,
+    cas_waiting,
+    cas_error,
+    cas_notice
+
+  ConversationFileSummary = object
+    path: string
+    added: int
+    removed: int
+
+  ConversationItemDescriptor = object
+    kind: string
+    activity_kind: ConversationActivityKind
+    title: string
+    detail: string
+
+  ConversationEntry = object
+    kind: ConversationEntryKind
     speaker: ConversationSpeaker
     content: string
+    activity_kind: ConversationActivityKind
+    activity_state: ConversationActivityState
+    activity_id: string
+    turn_id: string
+    title: string
+    detail: string
+    body: string
+    expanded: bool
+    files: seq[ConversationFileSummary]
+    added: int
+    removed: int
 
   NodeConversation = object
-    messages: seq[ConversationMessage]
+    messages: seq[ConversationEntry]
     state: ConversationState
     thread_requested: bool
+    status_detail: string
+    token_usage: string
+    current_model: string
 
   GraphTab = ref object
     graph_view: GraphView
@@ -130,6 +178,7 @@ const
   graph_conversation_log_id = "graph_conversation_log"
   graph_global_log_id = "graph_global_log"
   graph_conversation_composer_id = "graph_conversation_composer"
+  graph_activity_button_prefix = "graph_conversation_activity_"
 
 template scrollable_declaration(element_declaration: untyped): ClayElementDeclaration =
   var scroll_declaration = element_declaration
@@ -202,11 +251,32 @@ proc node_conversation(tab: GraphTab; node_id: uint32): var NodeConversation =
   tab.node_conversations.mgetOrPut(node_id, NodeConversation(
     state: conversation_starting))
 
+proc message_entry(speaker: ConversationSpeaker;
+    content: string): ConversationEntry =
+  ConversationEntry(
+    kind: cek_message,
+    speaker: speaker,
+    content: content,
+    activity_kind: cak_lifecycle,
+    activity_state: cas_complete,
+    turn_id: "",
+    files: @[])
+
+proc activity_entry(kind: ConversationActivityKind; activity_id,
+    turn_id, title: string): ConversationEntry =
+  ConversationEntry(
+    kind: cek_activity,
+    activity_kind: kind,
+    activity_state: cas_active,
+    activity_id: activity_id,
+    turn_id: turn_id,
+    title: title,
+    expanded: kind != cak_thinking,
+    files: @[])
+
 proc add_node_message(tab: GraphTab; node_id: uint32;
     speaker: ConversationSpeaker; content: string) =
-  tab.node_conversation(node_id).messages.add(ConversationMessage(
-    speaker: speaker,
-    content: content))
+  tab.node_conversation(node_id).messages.add(message_entry(speaker, content))
 
 proc add_global_message(tab: GraphTab; content: string) =
   tab.global_log_messages.add(content)
@@ -216,16 +286,381 @@ proc append_agent_delta(tab: GraphTab; node_id: uint32; delta: string) =
   var conversation = tab.node_conversation(node_id)
   conversation.state = conversation_working
   if conversation.messages.len == 0 or
+      conversation.messages[^1].kind != cek_message or
       conversation.messages[^1].speaker != conversation_node:
-    conversation.messages.add(ConversationMessage(
-      speaker: conversation_node,
-      content: delta))
+    conversation.messages.add(message_entry(conversation_node, delta))
   else:
     conversation.messages[^1].content.add(delta)
   tab.node_conversations[node_id] = conversation
   tab.scroll_conversation_to_end = true
 
+proc json_string(node: JsonNode; key: string): string =
+  if node.kind == JObject and node.contains(key) and
+      node[key].kind == JString:
+    return node[key].getStr
+
+proc json_int(node: JsonNode; key: string): int =
+  if node.kind == JObject and node.contains(key) and
+      node[key].kind == JInt:
+    return int(node[key].getInt)
+
+proc json_text(node: JsonNode; key: string): string =
+  if node.kind != JObject or not node.contains(key):
+    return ""
+  let value = node[key]
+  case value.kind:
+  of JString:
+    result = value.getStr
+  of JArray:
+    for item in value:
+      if item.kind == JString:
+        if result.len > 0: result.add(" ")
+        result.add(item.getStr)
+  else:
+    discard
+
+proc event_payload(event: CodexRuntimeEvent): JsonNode =
+  if event.params_json.len == 0:
+    return newJObject()
+  try:
+    parseJson(event.params_json)
+  except CatchableError:
+    newJObject()
+
+proc activity_kind_for_notification(kind: NotificationKind): ConversationActivityKind =
+  case kind:
+  of nk_reasoning_summary_text_delta, nk_reasoning_summary_part_added:
+    cak_thinking
+  of nk_turn_plan_updated, nk_plan_delta:
+    cak_plan
+  of nk_command_execution_output_delta, nk_terminal_interaction:
+    cak_command
+  of nk_mcp_tool_call_progress:
+    cak_tool
+  of nk_turn_diff_updated, nk_file_change_output_delta:
+    cak_changes
+  of nk_model_rerouted:
+    cak_model
+  else:
+    cak_lifecycle
+
+proc activity_kind_for_request(kind: ServerRequestKind): ConversationActivityKind =
+  case kind:
+  of sr_command_execution_approval: cak_command
+  of sr_file_change_approval: cak_changes
+  of sr_tool_user_input, sr_tool_call: cak_tool
+  else: cak_request
+
+proc activity_key(event: CodexRuntimeEvent;
+    kind: ConversationActivityKind): string =
+  let prefix = $kind & ":"
+  if event.server_request_kind != sr_unknown and event.request_id.len > 0:
+    return prefix & "request:" & event.request_id
+  if kind == cak_changes and event.turn_id.len > 0:
+    return prefix & "turn:" & event.turn_id
+  if event.item_id.len > 0:
+    return prefix & "item:" & event.item_id
+  if event.turn_id.len > 0:
+    return prefix & "turn:" & event.turn_id
+  if event.request_id.len > 0:
+    return prefix & "request:" & event.request_id
+  prefix & event.method_name
+
+proc find_activity(conversation: NodeConversation; activity_id: string): int =
+  for index, entry in conversation.messages:
+    if entry.kind == cek_activity and entry.activity_id == activity_id:
+      return index
+  -1
+
+proc item_descriptor(payload: JsonNode): ConversationItemDescriptor =
+  if payload.kind != JObject or not payload.contains("item"):
+    return ConversationItemDescriptor(activity_kind: cak_lifecycle)
+  let item = payload["item"]
+  result.kind = json_string(item, "type")
+  case result.kind:
+  of "commandExecution":
+    result.activity_kind = cak_command
+    result.title = "Command"
+    result.detail = json_text(item, "command")
+  of "fileChange":
+    result.activity_kind = cak_changes
+    result.title = "Changes"
+  of "mcpToolCall":
+    result.activity_kind = cak_tool
+    result.title = "Tool"
+  of "reasoning":
+    result.activity_kind = cak_thinking
+    result.title = "Thinking"
+  of "plan":
+    result.activity_kind = cak_plan
+    result.title = "Plan"
+  of "agentMessage":
+    result.activity_kind = cak_lifecycle
+    result.title = "Response"
+  else:
+    result.activity_kind = cak_lifecycle
+    result.title = if result.kind.len > 0: result.kind else: "Activity"
+
+proc status_text(state: ConversationState): string =
+  case state:
+  of conversation_starting: "STARTING"
+  of conversation_ready: "READY"
+  of conversation_working: "WORKING"
+  of conversation_error: "ERROR"
+
+proc activity_state_text(state: ConversationActivityState): string =
+  case state:
+  of cas_active: "RUNNING"
+  of cas_complete: "DONE"
+  of cas_waiting: "WAITING"
+  of cas_error: "ERROR"
+  of cas_notice: "INFO"
+
+proc format_usage(payload: JsonNode): string =
+  if payload.kind != JObject or not payload.contains("tokenUsage"):
+    return ""
+  let usage = payload["tokenUsage"]
+  if usage.kind != JObject:
+    return ""
+  var parts: seq[string] = @[]
+  if usage.contains("last") and usage["last"].kind == JObject:
+    let last_tokens = json_int(usage["last"], "totalTokens")
+    if last_tokens > 0: parts.add("LAST " & $last_tokens)
+  if usage.contains("total") and usage["total"].kind == JObject:
+    let total_tokens = json_int(usage["total"], "totalTokens")
+    if total_tokens > 0: parts.add("TOTAL " & $total_tokens)
+  if parts.len > 0: "TOKENS / " & parts.join(" · ") else: ""
+
+proc format_diff_summary(entry: var ConversationEntry; summary: JsonNode) =
+  if summary.kind != JObject:
+    return
+  entry.added = json_int(summary, "added")
+  entry.removed = json_int(summary, "removed")
+  entry.files.setLen(0)
+  if summary.contains("files") and summary["files"].kind == JArray:
+    for file in summary["files"]:
+      entry.files.add(ConversationFileSummary(
+        path: json_string(file, "path"),
+        added: json_int(file, "added"),
+        removed: json_int(file, "removed")))
+
+proc format_plan(payload: JsonNode): string =
+  if payload.kind != JObject:
+    return ""
+  result = json_string(payload, "explanation")
+  if payload.contains("plan") and payload["plan"].kind == JArray:
+    for item in payload["plan"]:
+      let step = json_string(item, "step")
+      let status = json_string(item, "status")
+      if step.len > 0:
+        if result.len > 0: result.add("\n")
+        result.add("[" & (if status.len > 0: status else: "pending") & "] " & step)
+
+proc update_activity(conversation: var NodeConversation;
+    event: CodexRuntimeEvent; payload: JsonNode;
+    kind: ConversationActivityKind;
+    item: ConversationItemDescriptor; title = "") =
+  let key = event.activity_key(kind)
+  var index = conversation.find_activity(key)
+  if index < 0:
+    conversation.messages.add(activity_entry(
+      kind, key, event.turn_id,
+      if title.len > 0: title else: "Activity"))
+    index = conversation.messages.high
+  var entry = conversation.messages[index]
+  if title.len > 0:
+    entry.title = title
+
+  case event.notification_kind:
+  of nk_item_started:
+    entry.title = if item.title.len > 0: item.title else: "Activity"
+    entry.detail = if item.detail.len > 0: item.detail else: "Started"
+  of nk_item_completed:
+    entry.activity_state = cas_complete
+    entry.expanded = false
+    entry.detail = "Completed"
+  of nk_command_execution_output_delta:
+    entry.title = "Command"
+    entry.body.add(json_string(payload, "delta"))
+  of nk_terminal_interaction:
+    entry.title = "Command"
+    entry.detail = "Terminal interaction"
+    let stdin = json_string(payload, "stdin")
+    if stdin.len > 0: entry.body.add(stdin)
+  of nk_mcp_tool_call_progress:
+    entry.title = "Tool progress"
+    let progress = json_string(payload, "message")
+    if progress.len > 0:
+      if entry.body.len > 0: entry.body.add("\n")
+      entry.body.add(progress)
+  of nk_reasoning_summary_text_delta:
+    entry.title = "Thinking"
+    entry.body.add(json_string(payload, "delta"))
+  of nk_reasoning_summary_part_added:
+    entry.title = "Thinking"
+    entry.detail = "Summary part " & $json_int(payload, "summaryIndex")
+  of nk_turn_plan_updated:
+    entry.title = "Plan"
+    entry.body = format_plan(payload)
+  of nk_plan_delta:
+    entry.title = "Plan"
+    entry.body.add(json_string(payload, "delta"))
+  of nk_turn_diff_updated:
+    entry.title = "Changes"
+    if payload.contains("summary"):
+      entry.format_diff_summary(payload["summary"])
+  of nk_file_change_output_delta:
+    entry.title = "Changes"
+    let delta_length = json_int(payload, "deltaLength")
+    if delta_length > 0:
+      entry.detail = $delta_length & " chars of change output"
+  of nk_model_rerouted:
+    entry.title = "Model rerouted"
+    entry.detail = json_string(payload, "fromModel") & " → " &
+      json_string(payload, "toModel")
+    entry.body = json_string(payload, "reason")
+    entry.activity_state = cas_notice
+    entry.expanded = false
+  of nk_thread_compacted:
+    entry.title = "Context compacted"
+    entry.activity_state = cas_notice
+    entry.expanded = false
+  else:
+    case event.server_request_kind:
+    of sr_tool_call:
+      entry.title = "Tool call"
+      entry.activity_state = cas_waiting
+      entry.detail = json_string(payload, "tool")
+    of sr_tool_user_input:
+      entry.title = "Input requested"
+      entry.activity_state = cas_waiting
+      entry.detail = "Tool requested user input"
+    of sr_command_execution_approval:
+      entry.title = "Command approval requested"
+      entry.activity_state = cas_waiting
+      entry.detail = json_string(payload, "reason")
+    of sr_file_change_approval:
+      entry.title = "File approval requested"
+      entry.activity_state = cas_waiting
+      entry.detail = json_string(payload, "reason")
+    else:
+      discard
+  conversation.messages[index] = entry
+
+proc finalize_activities(conversation: var NodeConversation;
+    turn_id = ""; error_state = false) =
+  for index in 0 ..< conversation.messages.len:
+    if conversation.messages[index].kind != cek_activity:
+      continue
+    if turn_id.len > 0 and conversation.messages[index].turn_id != turn_id:
+      continue
+    conversation.messages[index].activity_state = if error_state:
+      cas_error else: cas_complete
+    conversation.messages[index].expanded = false
+
+proc apply_conversation_event(view: MainWindow; event: CodexRuntimeEvent) =
+  var conversation = view.graph_tab.node_conversation(event.node_id)
+  case event.kind
+  of cre_agent_message_delta:
+    view.graph_tab.append_agent_delta(event.node_id, event.text)
+    return
+  of cre_turn_completed:
+    conversation.finalize_activities(event.turn_id)
+    conversation.state = conversation_ready
+    conversation.status_detail.setLen(0)
+  of cre_node_error:
+    conversation.finalize_activities(event.turn_id, true)
+    conversation.state = conversation_error
+    conversation.status_detail.setLen(0)
+    conversation.messages.add(message_entry(
+      conversation_system, "ERROR: " & event.text))
+  of cre_global_notification:
+    let payload = event.event_payload
+    case event.notification_kind
+    of nk_thread_started:
+      conversation.state = conversation_ready
+    of nk_thread_token_usage_updated:
+      conversation.token_usage = format_usage(payload)
+    of nk_turn_started:
+      conversation.state = conversation_working
+      conversation.status_detail.setLen(0)
+    of nk_thread_status_changed:
+      let status = if payload.kind == JObject and payload.contains("status"):
+        json_string(payload["status"], "type")
+      else: ""
+      case status
+      of "idle":
+        conversation.state = conversation_ready
+        conversation.status_detail.setLen(0)
+      of "active":
+        conversation.state = conversation_working
+        var waiting = false
+        if payload["status"].kind == JObject and
+            payload["status"].contains("activeFlags") and
+            payload["status"]["activeFlags"].kind == JArray:
+          for flag in payload["status"]["activeFlags"]:
+            if flag.kind == JString and
+                flag.getStr in ["waitingOnApproval", "waitingOnUserInput"]:
+              waiting = true
+        conversation.status_detail = if waiting: "WAITING" else: "WORKING"
+      of "systemError", "notLoaded":
+        conversation.state = conversation_error
+        conversation.status_detail = if status == "systemError":
+          "SYSTEM ERROR" else: "NOT LOADED"
+        conversation.finalize_activities(error_state = true)
+      else:
+        discard
+    of nk_error:
+      let will_retry = payload.kind == JObject and payload.contains("willRetry") and
+        payload["willRetry"].kind == JBool and payload["willRetry"].getBool
+      if will_retry:
+        conversation.state = conversation_working
+        conversation.status_detail = "RETRYING"
+      else:
+        conversation.state = conversation_error
+        conversation.messages.add(message_entry(
+          conversation_system, "ERROR: " & event.text))
+    else:
+      let is_item_lifecycle = event.notification_kind in {
+        nk_item_started, nk_item_completed}
+      let item = if is_item_lifecycle:
+        item_descriptor(payload)
+      else:
+        ConversationItemDescriptor(activity_kind: cak_lifecycle)
+      let activity_kind = if event.server_request_kind != sr_unknown:
+        activity_kind_for_request(event.server_request_kind)
+      elif item.kind.len > 0:
+        item.activity_kind
+      else:
+        activity_kind_for_notification(event.notification_kind)
+      if is_item_lifecycle and
+          item.kind == "agentMessage":
+        discard
+      else:
+        conversation.update_activity(event, payload, activity_kind, item)
+      if event.server_request_kind != sr_unknown:
+        conversation.status_detail = "WAITING"
+      elif event.notification_kind == nk_model_rerouted:
+        conversation.current_model = json_string(payload, "toModel")
+  of cre_thread_ready, cre_thread_error, cre_runtime_error, cre_runtime_closed:
+    discard
+  view.graph_tab.node_conversations[event.node_id] = conversation
+  view.graph_tab.scroll_conversation_to_end = true
+
+proc apply_conversation_error(view: MainWindow; node_id: uint32;
+    prefix, message: string; close_thread = false) =
+  var conversation = view.graph_tab.node_conversation(node_id)
+  if close_thread:
+    conversation.thread_requested = false
+  conversation.state = conversation_error
+  conversation.status_detail.setLen(0)
+  conversation.finalize_activities(error_state = true)
+  conversation.messages.add(message_entry(conversation_system, prefix & message))
+  view.graph_tab.node_conversations[node_id] = conversation
+  view.graph_tab.scroll_conversation_to_end = true
+
 proc apply_codex_event(view: MainWindow; event: CodexRuntimeEvent) =
+  let conversation_event = event.conversation_scoped and event.node_id != 0
   case event.kind
   of cre_thread_ready:
     var conversation = view.graph_tab.node_conversation(event.node_id)
@@ -233,28 +668,19 @@ proc apply_codex_event(view: MainWindow; event: CodexRuntimeEvent) =
     conversation.state = conversation_ready
     view.graph_tab.node_conversations[event.node_id] = conversation
   of cre_thread_error:
-    var conversation = view.graph_tab.node_conversation(event.node_id)
-    conversation.thread_requested = false
-    conversation.state = conversation_error
-    conversation.messages.add(ConversationMessage(
-      speaker: conversation_system,
-      content: "THREAD ERROR: " & event.text))
-    view.graph_tab.node_conversations[event.node_id] = conversation
-    view.graph_tab.scroll_conversation_to_end = true
-  of cre_agent_message_delta:
-    view.graph_tab.append_agent_delta(event.node_id, event.text)
-  of cre_turn_completed:
-    view.graph_tab.node_conversation(event.node_id).state = conversation_ready
+    view.apply_conversation_error(
+      event.node_id, "THREAD ERROR: ", event.text, close_thread = true)
+  of cre_agent_message_delta, cre_turn_completed, cre_global_notification:
+    if conversation_event:
+      view.apply_conversation_event(event)
+    else:
+      view.graph_tab.add_global_message(event.text)
   of cre_node_error:
-    var conversation = view.graph_tab.node_conversation(event.node_id)
-    conversation.state = conversation_error
-    conversation.messages.add(ConversationMessage(
-      speaker: conversation_system,
-      content: "ERROR: " & event.text))
-    view.graph_tab.node_conversations[event.node_id] = conversation
-    view.graph_tab.scroll_conversation_to_end = true
-  of cre_global_notification:
-    view.graph_tab.add_global_message(event.text)
+    if conversation_event:
+      view.apply_conversation_event(event)
+    else:
+      view.apply_conversation_error(
+        event.node_id, "ERROR: ", event.text)
   of cre_runtime_error:
     view.graph_tab.add_global_message("RUNTIME ERROR: " & event.text)
   of cre_runtime_closed:
@@ -372,7 +798,20 @@ proc apply_ui_actions(view: MainWindow) =
       of graph_tab_button_id:
         view.select_tab(main_tab_graph)
       else:
-        discard
+        if action.button_id.startsWith(graph_activity_button_prefix) and
+            view.graph_tab.graph_view.selected_node_valid:
+          let suffix = action.button_id[graph_activity_button_prefix.len .. ^1]
+          try:
+            let entry_index = parseInt(suffix)
+            let node_id = view.graph_tab.graph_view.selected_node_id
+            var conversation = view.graph_tab.node_conversation(node_id)
+            if entry_index >= 0 and entry_index < conversation.messages.len and
+                conversation.messages[entry_index].kind == cek_activity:
+              conversation.messages[entry_index].expanded =
+                not conversation.messages[entry_index].expanded
+              view.graph_tab.node_conversations[node_id] = conversation
+          except ValueError:
+            discard
     of ui_action_text_field_submitted:
       if action.text_field_id != graph_conversation_input_id:
         continue
@@ -1044,6 +1483,25 @@ proc build_workspace_tab(view: MainWindow; frame: ViewFrame) =
           text_color = palette_color(view.palette.ink)
           wrap_mode = clay_text_wrap_words_and_graphemes
 
+proc activity_header(entry: ConversationEntry): string =
+  result = "[" & activity_state_text(entry.activity_state) & "] " & entry.title
+  if entry.detail.len > 0:
+    result.add(" / " & entry.detail)
+  if entry.activity_kind == cak_changes and
+      (entry.added > 0 or entry.removed > 0):
+    result.add(" / +" & $entry.added & " -" & $entry.removed)
+
+proc activity_body(entry: ConversationEntry): string =
+  result = entry.body
+  if entry.files.len == 0:
+    return
+  if result.len > 0:
+    result.add("\n")
+  for file in entry.files:
+    result.add(file.path & "  +" & $file.added & " -" & $file.removed)
+    result.add("\n")
+  result.setLen(result.len - 1)
+
 proc build_graph_conversation_panel(view: MainWindow) =
   let input_element_id = clay_id(graph_conversation_input_id)
   view.ui_state.register_text_field(
@@ -1069,10 +1527,23 @@ proc build_graph_conversation_panel(view: MainWindow) =
       font_size = 8
       text_color = palette_color(view.palette.ink)
       wrap_mode = clay_text_wrap_words_and_graphemes
-    text("STATUS / " & $conversation.state):
+    text("STATUS / " & status_text(conversation.state) &
+        (if conversation.status_detail.len > 0:
+          " / " & conversation.status_detail
+        else: "")):
       font_size = 8
       text_color = palette_color(view.palette.ink)
       wrap_mode = clay_text_wrap_words_and_graphemes
+    if conversation.token_usage.len > 0:
+      text(conversation.token_usage):
+        font_size = 8
+        text_color = palette_color(view.palette.ink)
+        wrap_mode = clay_text_wrap_words_and_graphemes
+    if conversation.current_model.len > 0:
+      text("MODEL / " & conversation.current_model):
+        font_size = 8
+        text_color = palette_color(view.palette.ink)
+        wrap_mode = clay_text_wrap_words_and_graphemes
 
     let log_element_id = clay_id(graph_conversation_log_id)
     let log_declaration = declaration(
@@ -1087,39 +1558,78 @@ proc build_graph_conversation_panel(view: MainWindow) =
       clip = ClayClipElementConfig(vertical: true))
     scrollable_element(log_element_id, log_declaration):
       for message_index, message in conversation.messages:
-        let is_user = message.speaker == conversation_user
         let row_id = clay_id_with_index(
           "graph_conversation_message", uint32(message_index))
-        let row_declaration = declaration(
-          layout = layout(
-            sizing = sizing(grow(), fit()),
-            child_alignment = child_alignment(
-              if is_user:
-                clay_align_x_right
-              else:
-                clay_align_x_left,
-              clay_align_y_top)))
-        let bubble_declaration = declaration(
-          layout = layout(
-            sizing = sizing(fit(0, 260), fit()),
-            padding = padding_all(8)),
-          background_color = if is_user:
-            palette_color(view.palette.blue)
-          else:
-            palette_color(view.palette.yellow),
-          border = ClayBorderElementConfig(
-            color: palette_color(view.palette.ink), width: border_outside(2)))
-        element(row_id, row_declaration):
-          element(clay_id_with_index(
-              "graph_conversation_bubble", uint32(message_index)),
-              bubble_declaration):
-            text(message.content):
-              font_size = 10
-              text_color = if is_user:
-                palette_color(view.palette.paper)
-              else:
-                palette_color(view.palette.ink)
-              wrap_mode = clay_text_wrap_words_and_graphemes
+        if message.kind == cek_message:
+          let is_user = message.speaker == conversation_user
+          let row_declaration = declaration(
+            layout = layout(
+              sizing = sizing(grow(), fit()),
+              child_alignment = child_alignment(
+                if is_user:
+                  clay_align_x_right
+                else:
+                  clay_align_x_left,
+                clay_align_y_top)))
+          let bubble_declaration = declaration(
+            layout = layout(
+              sizing = sizing(fit(0, 260), fit()),
+              padding = padding_all(8)),
+            background_color = if is_user:
+              palette_color(view.palette.blue)
+            else:
+              palette_color(view.palette.yellow),
+            border = ClayBorderElementConfig(
+              color: palette_color(view.palette.ink), width: border_outside(2)))
+          element(row_id, row_declaration):
+            element(clay_id_with_index(
+                "graph_conversation_bubble", uint32(message_index)),
+                bubble_declaration):
+              text(message.content):
+                font_size = 10
+                text_color = if is_user:
+                  palette_color(view.palette.paper)
+                else:
+                  palette_color(view.palette.ink)
+                wrap_mode = clay_text_wrap_words_and_graphemes
+        else:
+          let activity_button_id = graph_activity_button_prefix & $message_index
+          let activity_element_id = clay_id(activity_button_id)
+          view.ui_state.register_button(activity_button_id, activity_element_id)
+          let activity_declaration = declaration(
+            layout = layout(
+              sizing = sizing(grow(), fit()),
+              padding = padding_all(8),
+              child_gap = 5,
+              layout_direction = clay_top_to_bottom),
+            background_color = if message.activity_state == cas_waiting:
+              palette_color(view.palette.pink)
+            elif message.activity_state == cas_error:
+              palette_color(view.palette.yellow)
+            else:
+              palette_color(view.palette.background),
+            border = ClayBorderElementConfig(
+              color: palette_color(view.palette.ink), width: border_outside(2)))
+          element(row_id, declaration(
+              layout = layout(sizing = sizing(grow(), fit())))):
+            element(activity_element_id, activity_declaration):
+              text(activity_header(message)):
+                font_size = 9
+                text_color = palette_color(view.palette.ink)
+                wrap_mode = clay_text_wrap_words_and_graphemes
+              if message.expanded and
+                  (message.body.len > 0 or message.files.len > 0):
+                element(clay_id_with_index(
+                    "graph_conversation_activity_body",
+                    uint32(message_index)), declaration(
+                      layout = layout(
+                        sizing = sizing(grow(), fit()),
+                        padding = padding_all(5)),
+                      background_color = palette_color(view.palette.paper))):
+                  text(activity_body(message)):
+                    font_size = 9
+                    text_color = palette_color(view.palette.ink)
+                    wrap_mode = clay_text_wrap_words_and_graphemes
 
     element(graph_conversation_composer_id):
       layout:

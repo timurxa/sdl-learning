@@ -139,54 +139,54 @@ proc request_for_turn(state: var RuntimeState; turn_id: string): Option[string] 
       return some(request_key)
   none(string)
 
-proc server_request_thread_id*(request: ServerRequest): Option[string] =
+type
+  ServerRequestIdentity* = object
+    thread_id*: Option[string]
+    turn_id*: Option[string]
+    item_id*: Option[string]
+
+proc server_request_identity*(request: ServerRequest): ServerRequestIdentity =
+  result = ServerRequestIdentity(
+    thread_id: none(string),
+    turn_id: none(string),
+    item_id: none(string))
   case request.params.kind:
   of sr_command_execution_approval:
-    some(request.params.command_execution_approval.thread_id)
+    result.thread_id = some(request.params.command_execution_approval.thread_id)
+    result.turn_id = some(request.params.command_execution_approval.turn_id)
+    result.item_id = some(request.params.command_execution_approval.item_id)
   of sr_file_change_approval:
-    some(request.params.file_change_approval.thread_id)
+    result.thread_id = some(request.params.file_change_approval.thread_id)
+    result.turn_id = some(request.params.file_change_approval.turn_id)
+    result.item_id = some(request.params.file_change_approval.item_id)
   of sr_tool_user_input:
-    some(request.params.tool_user_input.thread_id)
+    result.thread_id = some(request.params.tool_user_input.thread_id)
+    result.turn_id = some(request.params.tool_user_input.turn_id)
+    result.item_id = some(request.params.tool_user_input.item_id)
   of sr_tool_call:
-    some(request.params.tool_call.thread_id)
+    result.thread_id = some(request.params.tool_call.thread_id)
+    result.turn_id = some(request.params.tool_call.turn_id)
   of sr_auth_tokens_refresh, sr_apply_patch_approval, sr_exec_command_approval,
       sr_unknown:
-    none(string)
+    discard
+
+proc server_request_thread_id*(request: ServerRequest): Option[string] =
+  request.server_request_identity.thread_id
 
 proc server_request_turn_id*(request: ServerRequest): Option[string] =
-  case request.params.kind:
-  of sr_command_execution_approval:
-    some(request.params.command_execution_approval.turn_id)
-  of sr_file_change_approval:
-    some(request.params.file_change_approval.turn_id)
-  of sr_tool_user_input:
-    some(request.params.tool_user_input.turn_id)
-  of sr_tool_call:
-    some(request.params.tool_call.turn_id)
-  of sr_auth_tokens_refresh, sr_apply_patch_approval, sr_exec_command_approval,
-      sr_unknown:
-    none(string)
+  request.server_request_identity.turn_id
 
 proc server_request_item_id*(request: ServerRequest): Option[string] =
-  case request.params.kind:
-  of sr_command_execution_approval:
-    some(request.params.command_execution_approval.item_id)
-  of sr_file_change_approval:
-    some(request.params.file_change_approval.item_id)
-  of sr_tool_user_input:
-    some(request.params.tool_user_input.item_id)
-  of sr_tool_call, sr_auth_tokens_refresh, sr_apply_patch_approval,
-      sr_exec_command_approval, sr_unknown:
-    none(string)
+  request.server_request_identity.item_id
 
 proc apply_server_request*(state: var RuntimeState; request: ServerRequest) =
   let key = request_id_key(request.id)
   state.server_requests[key] = request
 
-  let thread_id = server_request_thread_id(request)
-  if thread_id.isNone:
+  let identity = server_request_identity(request)
+  if identity.thread_id.isNone:
     return
-  let agent_id = find_agent_for_thread(state, thread_id.get)
+  let agent_id = find_agent_for_thread(state, identity.thread_id.get)
   if agent_id.isNone:
     return
   var agent = state.agents[agent_id.get]
@@ -201,14 +201,15 @@ proc remove_server_request*(state: var RuntimeState; id: RequestId): Option[Serv
   let request = state.server_requests[key]
   state.server_requests.del(key)
 
-  let thread_id = server_request_thread_id(request)
-  if thread_id.isSome:
-    let agent_id = find_agent_for_thread(state, thread_id.get)
+  let identity = server_request_identity(request)
+  if identity.thread_id.isSome:
+    let agent_id = find_agent_for_thread(state, identity.thread_id.get)
     if agent_id.isSome:
       var still_waiting = false
       for pending in state.server_requests.values:
-        let pending_thread_id = server_request_thread_id(pending)
-        if pending_thread_id.isSome and pending_thread_id.get == thread_id.get:
+        let pending_identity = server_request_identity(pending)
+        if pending_identity.thread_id.isSome and
+            pending_identity.thread_id.get == identity.thread_id.get:
           still_waiting = true
           break
       if not still_waiting:

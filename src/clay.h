@@ -2031,6 +2031,64 @@ int32_t Clay__AddGraphemeBoundary(Clay__GraphemeBoundaryData boundary) {
     return context->graphemeBoundaries.length - 1;
 }
 
+void Clay__release_measured_words(Clay_Context *context, int32_t startIndex) {
+    while (startIndex != -1) {
+        Clay__MeasuredWord *measuredWord = Clay__MeasuredWordArray_Get(&context->measuredWords, startIndex);
+        Clay__FreeGraphemeBoundaries(measuredWord->graphemeStartIndex);
+        Clay__int32_tArray_Add(&context->measuredWordsFreeList, startIndex);
+        startIndex = measuredWord->next;
+    }
+}
+
+void Clay__release_measured_text_cache_item(
+    Clay_Context *context, int32_t elementIndex, int32_t measuredWordsStartIndex) {
+    Clay__release_measured_words(context, measuredWordsStartIndex);
+    Clay__MeasureTextCacheItemArray_Set(
+        &context->measureTextHashMapInternal,
+        elementIndex,
+        CLAY__INIT(Clay__MeasureTextCacheItem) { .measuredWordsStartIndex = -1 });
+    Clay__int32_tArray_Add(&context->measureTextHashMapInternalFreeList, elementIndex);
+}
+
+int32_t Clay__remove_measured_text_cache_item(
+    Clay_Context *context, int32_t hashBucket, int32_t previousIndex,
+    int32_t elementIndex) {
+    Clay__MeasureTextCacheItem *hashEntry = Clay__MeasureTextCacheItemArray_Get(
+        &context->measureTextHashMapInternal, elementIndex);
+    int32_t nextIndex = hashEntry->nextIndex;
+    int32_t measuredWordsStartIndex = hashEntry->measuredWordsStartIndex;
+    Clay__release_measured_text_cache_item(
+        context, elementIndex, measuredWordsStartIndex);
+    if (previousIndex == 0) {
+        context->measureTextHashMap.internalArray[hashBucket] = nextIndex;
+    } else {
+        Clay__MeasureTextCacheItem *previousHashEntry = Clay__MeasureTextCacheItemArray_Get(
+            &context->measureTextHashMapInternal, previousIndex);
+        previousHashEntry->nextIndex = nextIndex;
+    }
+    return nextIndex;
+}
+
+void Clay__reclaim_stale_measure_text_cache(Clay_Context *context) {
+    for (int32_t hashBucket = 0;
+         hashBucket < context->measureTextHashMap.capacity;
+         ++hashBucket) {
+        int32_t previousIndex = 0;
+        int32_t elementIndex = context->measureTextHashMap.internalArray[hashBucket];
+        while (elementIndex != 0) {
+            Clay__MeasureTextCacheItem *hashEntry = Clay__MeasureTextCacheItemArray_Get(
+                &context->measureTextHashMapInternal, elementIndex);
+            if (context->generation - hashEntry->generation > 2) {
+                elementIndex = Clay__remove_measured_text_cache_item(
+                    context, hashBucket, previousIndex, elementIndex);
+            } else {
+                previousIndex = elementIndex;
+                elementIndex = hashEntry->nextIndex;
+            }
+        }
+    }
+}
+
 int32_t Clay__AvailableGraphemeBoundaryCount(void) {
     Clay_Context* context = Clay_GetCurrentContext();
     int32_t unusedCapacity = context->graphemeBoundaries.capacity - context->graphemeBoundaries.length - 1;
@@ -2184,7 +2242,7 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
     }
     #endif
     uint32_t id = Clay__HashStringContentsWithConfig(text, config);
-    uint32_t hashBucket = id % (context->maxMeasureTextCacheWordCount / 32);
+    uint32_t hashBucket = id % (uint32_t)context->measureTextHashMap.capacity;
     int32_t elementIndexPrevious = 0;
     int32_t elementIndex = context->measureTextHashMap.internalArray[hashBucket];
     while (elementIndex != 0) {
@@ -2195,25 +2253,8 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
         }
         // This element hasn't been seen in a few frames, delete the hash map item
         if (context->generation - hashEntry->generation > 2) {
-            // Add all the measured words that were included in this measurement to the freelist
-            int32_t nextWordIndex = hashEntry->measuredWordsStartIndex;
-            while (nextWordIndex != -1) {
-                Clay__MeasuredWord *measuredWord = Clay__MeasuredWordArray_Get(&context->measuredWords, nextWordIndex);
-                Clay__FreeGraphemeBoundaries(measuredWord->graphemeStartIndex);
-                Clay__int32_tArray_Add(&context->measuredWordsFreeList, nextWordIndex);
-                nextWordIndex = measuredWord->next;
-            }
-
-            int32_t nextIndex = hashEntry->nextIndex;
-            Clay__MeasureTextCacheItemArray_Set(&context->measureTextHashMapInternal, elementIndex, CLAY__INIT(Clay__MeasureTextCacheItem) { .measuredWordsStartIndex = -1 });
-            Clay__int32_tArray_Add(&context->measureTextHashMapInternalFreeList, elementIndex);
-            if (elementIndexPrevious == 0) {
-                context->measureTextHashMap.internalArray[hashBucket] = nextIndex;
-            } else {
-                Clay__MeasureTextCacheItem *previousHashEntry = Clay__MeasureTextCacheItemArray_Get(&context->measureTextHashMapInternal, elementIndexPrevious);
-                previousHashEntry->nextIndex = nextIndex;
-            }
-            elementIndex = nextIndex;
+            elementIndex = Clay__remove_measured_text_cache_item(
+                context, hashBucket, elementIndexPrevious, elementIndex);
         } else {
             elementIndexPrevious = elementIndex;
             elementIndex = hashEntry->nextIndex;
@@ -2223,6 +2264,11 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
     int32_t newItemIndex = 0;
     Clay__MeasureTextCacheItem newCacheItem = { .measuredWordsStartIndex = -1, .id = id, .generation = context->generation };
     Clay__MeasureTextCacheItem *measured = NULL;
+    if (context->measureTextHashMapInternal.length ==
+            context->measureTextHashMapInternal.capacity - 1 &&
+        context->measureTextHashMapInternalFreeList.length == 0) {
+        Clay__reclaim_stale_measure_text_cache(context);
+    }
     if (context->measureTextHashMapInternalFreeList.length > 0) {
         newItemIndex = Clay__int32_tArray_GetValue(&context->measureTextHashMapInternalFreeList, context->measureTextHashMapInternalFreeList.length - 1);
         context->measureTextHashMapInternalFreeList.length--;
@@ -2232,8 +2278,8 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
         if (context->measureTextHashMapInternal.length == context->measureTextHashMapInternal.capacity - 1) {
             if (!context->booleanWarnings.maxTextMeasureCacheExceeded) {
                 context->errorHandler.errorHandlerFunction(CLAY__INIT(Clay_ErrorData) {
-                        .errorType = CLAY_ERROR_TYPE_ELEMENTS_CAPACITY_EXCEEDED,
-                        .errorText = CLAY_STRING("Clay ran out of capacity while attempting to measure text elements. Try using Clay_SetMaxElementCount() with a higher value."),
+                        .errorType = CLAY_ERROR_TYPE_TEXT_MEASUREMENT_CAPACITY_EXCEEDED,
+                        .errorText = CLAY_STRING("Clay ran out of capacity in its internal text measurement cache entries. Try using Clay_SetMaxElementCount() with a higher value."),
                         .userData = context->errorHandler.userData });
                 context->booleanWarnings.maxTextMeasureCacheExceeded = true;
             }
@@ -2252,7 +2298,12 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
     Clay__MeasuredWord tempWord = { .next = -1, .graphemeStartIndex = -1 };
     Clay__MeasuredWord *previousWord = &tempWord;
     while (end < text->length) {
-        if (context->measuredWords.length == context->measuredWords.capacity - 1) {
+        if (context->measuredWords.length == context->measuredWords.capacity - 1 &&
+            context->measuredWordsFreeList.length == 0) {
+            Clay__reclaim_stale_measure_text_cache(context);
+        }
+        if (context->measuredWords.length == context->measuredWords.capacity - 1 &&
+            context->measuredWordsFreeList.length == 0) {
             if (!context->booleanWarnings.maxTextMeasureCacheExceeded) {
                 context->errorHandler.errorHandlerFunction(CLAY__INIT(Clay_ErrorData) {
                     .errorType = CLAY_ERROR_TYPE_TEXT_MEASUREMENT_CAPACITY_EXCEEDED,
@@ -2260,6 +2311,8 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
                     .userData = context->errorHandler.userData });
                 context->booleanWarnings.maxTextMeasureCacheExceeded = true;
             }
+            Clay__release_measured_text_cache_item(
+                context, newItemIndex, tempWord.next);
             return &Clay__MeasureTextCacheItem_DEFAULT;
         }
         char current = text->chars[end];
