@@ -3,6 +3,7 @@ import ../src/graph_ui
 import ../src/renderer
 import ../src/sdl
 import ../src/ui
+import ../src/orchestration
 
 proc handle_error(error_data: ClayErrorData) {.cdecl.} =
   doAssert false, $error_data.error_type
@@ -18,12 +19,11 @@ discard clay_initialize(
   ClayErrorHandler(error_handler_function: handle_error, user_data: nil))
 
 var graph = GraphView(
-  nodes: @[
-    GraphNode(
-      stable_id: 0,
-      screen_position: vector2(20, 20),
-      size: dimensions(24, 24),
-      circle_color: rgba(255, 0, 0, 255))],
+  work_graph: WorkGraph(nodes: @[
+    WorkNode(
+      id: 0,
+      state: pending,
+      execution_plan: ExecutionPlan(`type`: llm_worker))]),
   draw_list: new_opaque_draw_list())
 
 clay_begin_layout()
@@ -32,7 +32,7 @@ element("root"):
     sizing:
       width = grow()
       height = grow()
-  graph_window(graph, node):
+  graph_window(graph):
     discard
 discard clay_end_layout(0)
 
@@ -40,7 +40,7 @@ let initial_surface_data = clay_get_element_data(clay_id("graph_surface"))
 doAssert initial_surface_data.found
 graph.set_graph_viewport(initial_surface_data.bounding_box)
 
-let node_pointer = vector2(32, 32)
+let node_pointer = vector2(96, 86)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_button_down,
   x: node_pointer.x,
@@ -60,7 +60,7 @@ element("root"):
     sizing:
       width = grow()
       height = grow()
-  graph_window(graph, node):
+  graph_window(graph):
     discard
 discard clay_end_layout(0)
 let surface_data = clay_get_element_data(clay_id("graph_surface"))
@@ -119,7 +119,7 @@ graph.handle_event(UiEvent(
   button: sdl_button_left))
 doAssert not graph.selected_node_valid
 
-let retained_node = graph.nodes[0]
+let retained_node = graph.work_graph.nodes[0]
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_button_down,
   x: node_pointer.x,
@@ -132,19 +132,19 @@ graph.handle_event(UiEvent(
   button: sdl_button_left))
 doAssert graph.selected_node_valid
 
-graph.nodes.setLen(0)
+graph.work_graph.nodes.setLen(0)
 clay_begin_layout()
 element("root"):
   layout:
     sizing:
       width = grow()
       height = grow()
-  graph_window(graph, node):
+  graph_window(graph):
     discard
 discard clay_end_layout(0)
 doAssert not graph.selected_node_valid
 doAssert not clay_get_element_data(clay_id("graph_panel")).found
-graph.nodes.add(retained_node)
+graph.work_graph.nodes.add(retained_node)
 
 let pointer = vector2(100, 60)
 graph.handle_event(UiEvent(
@@ -165,19 +165,19 @@ element("root"):
     sizing:
       width = grow()
       height = grow()
-  graph_window(graph, node):
+  graph_window(graph):
     discard
 discard clay_end_layout(0)
 doAssert abs(
-  float32(graph.draw_list.items[0].size.width) - 24'f32 * graph.zoom) < 0.001
+  float32(graph.draw_list.items[0].size.width) - 32'f32 * graph.zoom) < 0.001
 let popup_data = clay_get_element_data(clay_id_with_index("graph_node", 0))
 doAssert popup_data.found
-doAssert abs(float32(popup_data.bounding_box.width) - 24'f32 * graph.zoom) < 0.001
-doAssert abs(float32(popup_data.bounding_box.height) - 24'f32 * graph.zoom) < 0.001
+doAssert abs(float32(popup_data.bounding_box.width) - 32'f32 * graph.zoom) < 0.001
+doAssert abs(float32(popup_data.bounding_box.height) - 32'f32 * graph.zoom) < 0.001
 
 graph.zoom = 2.1'f32
-graph.pan = vector2(pointer.x - 32'f32 * graph.zoom,
-  pointer.y - 32'f32 * graph.zoom)
+graph.pan = vector2(pointer.x - 96'f32 * graph.zoom,
+  pointer.y - 86'f32 * graph.zoom)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_move,
   x: pointer.x,
@@ -204,8 +204,7 @@ graph.handle_event(UiEvent(
   button: sdl_button_left))
 
 graph.zoom = 1'f32
-graph.pan = vector2(0, 0)
-graph.nodes[0].size = dimensions(40, 20)
+graph.pan = vector2(-60, -50)
 graph.set_graph_viewport(initial_surface_data.bounding_box)
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_move,

@@ -3,29 +3,13 @@ import clay
 import renderer
 import sdl
 import ui
+import orchestration
 
 type
-  GraphArrow* = object
-    start_node_index*: int
-    end_node_index*: int
-    use_stable_ids*: bool
-    start_node_id*: uint32
-    end_node_id*: uint32
-    padding*: float32
-    color*: ClayColor
-    shaft_width*: float32
-    head_length*: float32
-    head_width*: float32
-    z_index*: int16
-
   GraphNode* = object
     stable_id*: uint32
     screen_position*: ClayVector2
     size*: ClayDimensions
-    circle_color*: ClayColor
-    z_index*: int16
-    title*: string
-    detail*: string
 
   GraphLayoutEdge* = object
     start_node_id*: uint32
@@ -86,8 +70,7 @@ type
     circle_diameter: float32
 
   GraphView* = object
-    nodes*: seq[GraphNode]
-    arrows*: seq[GraphArrow]
+    work_graph*: WorkGraph
     draw_list*: OpaqueDrawList
     selected_node_id*: uint32
     selected_node_valid*: bool
@@ -120,6 +103,7 @@ const
   graph_panel_bottom_padding = 16
   graph_panel_host_z_index = 32766'i16
   graph_panel_z_index = 32767'i16
+  work_node_size = 32
 
 proc default_graph_layout_config*(): GraphLayoutConfig =
   GraphLayoutConfig(
@@ -132,6 +116,24 @@ proc valid_graph_float(value: float32): bool {.inline.}
 
 proc graph_layout_edge_key(edge: GraphLayoutEdge): uint64 {.inline.} =
   (uint64(edge.start_node_id) shl 32) or uint64(edge.end_node_id)
+
+proc work_node_default_position(index: int): ClayVector2 {.inline.} =
+  vector2(80 + index * 70, 70)
+
+proc work_graph_edges(work_graph: WorkGraph): seq[GraphLayoutEdge] =
+  for node in work_graph.nodes:
+    for dependency_id in node.wait_for:
+      result.add(GraphLayoutEdge(
+        start_node_id: dependency_id,
+        end_node_id: node.id))
+
+proc work_graph_layout_nodes(work_graph: WorkGraph): seq[GraphNode] =
+  result = newSeq[GraphNode](work_graph.nodes.len)
+  for index, node in work_graph.nodes:
+    result[index] = GraphNode(
+      stable_id: node.id,
+      screen_position: work_node_default_position(index),
+      size: dimensions(work_node_size, work_node_size))
 
 proc graph_layout_center(position: ClayVector2; size: ClayDimensions): ClayVector2 {.inline.} =
   vector2(
@@ -718,6 +720,12 @@ proc begin_graph_layout*(solver: var GraphLayoutSolver;
     nodes: openArray[GraphNode]; edges: openArray[GraphLayoutEdge]): bool =
   solver.begin_graph_layout(nodes, edges, default_graph_layout_config())
 
+proc begin_graph_layout*(solver: var GraphLayoutSolver;
+    work_graph: WorkGraph; config: GraphLayoutConfig): bool =
+  let layout_nodes = work_graph.work_graph_layout_nodes()
+  let layout_edges = work_graph.work_graph_edges()
+  solver.begin_graph_layout(layout_nodes, layout_edges, config)
+
 proc step_graph_layout*(solver: var GraphLayoutSolver; delta_time: float32): bool =
   if solver.status in {graph_layout_idle, graph_layout_complete}:
     return false
@@ -761,16 +769,12 @@ proc apply_graph_layout*(solver: GraphLayoutSolver; nodes: var seq[GraphNode]) =
       node.screen_position = positions[node.stable_id]
 
 proc begin_graph_layout*(graph: var GraphView;
-    edges: openArray[GraphLayoutEdge]; config: GraphLayoutConfig): bool =
-  graph.layout_solver.begin_graph_layout(graph.nodes, edges, config)
-
-proc begin_graph_layout*(graph: var GraphView;
-    edges: openArray[GraphLayoutEdge]): bool =
-  graph.layout_solver.begin_graph_layout(graph.nodes, edges)
+    config: GraphLayoutConfig): bool =
+  graph.layout_solver.begin_graph_layout(
+    graph.work_graph, config)
 
 proc step_graph_layout*(graph: var GraphView; delta_time: float32): bool =
-  result = graph.layout_solver.step_graph_layout(delta_time)
-  graph.layout_solver.apply_graph_layout(graph.nodes)
+  graph.layout_solver.step_graph_layout(delta_time)
 
 proc ensure_graph_canvas_state(graph: var GraphView) {.inline.} =
   if graph.canvas_config.pan_button == 0:
@@ -792,18 +796,36 @@ proc pointer_inside_canvas(bounds: ClayBoundingBox; pointer: ClayVector2): bool 
     pointer.x < bounds.x + bounds.width and
     pointer.y < bounds.y + bounds.height
 
-proc graph_node_geometry(graph: GraphView; node: GraphNode): GraphNodeGeometry =
-  let circle_diameter_world = min(node.size.width, node.size.height)
+proc graph_node_geometry(graph: GraphView; position: ClayVector2;
+    size: ClayDimensions): GraphNodeGeometry =
+  let circle_diameter_world = min(size.width, size.height)
   let circle_origin_world = vector2(
-    node.screen_position.x + (node.size.width - circle_diameter_world) / 2,
-    node.screen_position.y + (node.size.height - circle_diameter_world) / 2)
+    position.x + (size.width - circle_diameter_world) / 2,
+    position.y + (size.height - circle_diameter_world) / 2)
   result.screen_bounds = ClayBoundingBox(
-    x: graph.graph_transform_point(node.screen_position).x,
-    y: graph.graph_transform_point(node.screen_position).y,
-    width: float32(node.size.width) * graph.zoom,
-    height: float32(node.size.height) * graph.zoom)
+    x: graph.graph_transform_point(position).x,
+    y: graph.graph_transform_point(position).y,
+    width: float32(size.width) * graph.zoom,
+    height: float32(size.height) * graph.zoom)
   result.circle_origin = graph.graph_transform_point(circle_origin_world)
   result.circle_diameter = circle_diameter_world * graph.zoom
+
+proc work_node_index_by_id(graph: GraphView; node_id: uint32): int {.inline.} =
+  for index, node in graph.work_graph.nodes:
+    if node.id == node_id:
+      return index
+  -1
+
+proc work_node_position(graph: GraphView; node_id: uint32): ClayVector2 =
+  for index, current_id in graph.layout_solver.node_ids:
+    if current_id == node_id and index < graph.layout_solver.positions.len:
+      return graph.layout_solver.positions[index]
+  let node_index = graph.work_node_index_by_id(node_id)
+  work_node_default_position(max(node_index, 0))
+
+proc work_node_geometry(graph: GraphView; node: WorkNode): GraphNodeGeometry =
+  let size = dimensions(work_node_size, work_node_size)
+  graph.graph_node_geometry(graph.work_node_position(node.id), size)
 
 proc graph_local_pointer(graph: GraphView; pointer: ClayVector2): ClayVector2 {.inline.} =
   vector2(
@@ -818,24 +840,46 @@ proc pointer_inside_graph(graph: GraphView; pointer: ClayVector2): bool {.inline
 proc graph_pointer_inside*(graph: GraphView; pointer: ClayVector2): bool {.inline.} =
   graph.pointer_inside_graph(pointer)
 
-proc hovered_graph_node(graph: GraphView; pointer: ClayVector2): tuple[found: bool; stable_id: uint32] =
+proc graph_tooltip_axis(pointer, window_size, tooltip_size, gap: float32): float32 =
+  var position = pointer + gap
+  if position + tooltip_size > window_size:
+    position = pointer - gap - tooltip_size
+  max(0'f32, min(position, max(window_size - tooltip_size, 0'f32)))
+
+proc graph_node_tooltip_position*(graph: GraphView;
+    window_size, tooltip_size: ClayDimensions; gap: float32): ClayVector2 =
+  result = vector2(
+    graph_tooltip_axis(
+      graph.pointer_position.x,
+      float32(window_size.width),
+      float32(tooltip_size.width),
+      gap),
+    graph_tooltip_axis(
+      graph.pointer_position.y,
+      float32(window_size.height),
+      float32(tooltip_size.height),
+      gap))
+
+proc hovered_work_graph_node(graph: GraphView; pointer: ClayVector2):
+    tuple[found: bool; stable_id: uint32] =
   var best_z_index = low(int16)
-  for node in graph.nodes:
-    let geometry = graph.graph_node_geometry(node)
+  for index, node in graph.work_graph.nodes:
+    let geometry = graph.work_node_geometry(node)
     let radius = geometry.circle_diameter / 2'f32
     let center = vector2(
       geometry.circle_origin.x + radius,
       geometry.circle_origin.y + radius)
     let delta_x = pointer.x - center.x
     let delta_y = pointer.y - center.y
+    let z_index = int16(index)
     if delta_x * delta_x + delta_y * delta_y <= radius * radius and
-        (not result.found or node.z_index >= best_z_index):
-      result = (true, node.stable_id)
-      best_z_index = node.z_index
+        (not result.found or z_index >= best_z_index):
+      result = (true, node.id)
+      best_z_index = z_index
 
 proc graph_node_at_pointer(graph: GraphView; pointer: ClayVector2): tuple[found: bool; stable_id: uint32] =
   if graph.pointer_inside_graph(pointer):
-    result = graph.hovered_graph_node(graph.graph_local_pointer(pointer))
+    result = graph.hovered_work_graph_node(graph.graph_local_pointer(pointer))
 
 proc refresh_graph_hover(graph: var GraphView) =
   graph.hovered_node_valid = false
@@ -845,6 +889,18 @@ proc refresh_graph_hover(graph: var GraphView) =
   if hovered_node.found:
     graph.hovered_node_id = hovered_node.stable_id
     graph.hovered_node_valid = true
+
+proc set_graph_pointer*(graph: var GraphView; pointer: ClayVector2) =
+  graph.pointer_position = pointer
+  graph.pointer_valid = true
+  graph.refresh_graph_hover()
+
+proc hovered_work_node*(graph: GraphView): WorkNode =
+  if not graph.hovered_node_valid:
+    return
+  for node in graph.work_graph.nodes:
+    if node.id == graph.hovered_node_id:
+      return node
 
 proc set_graph_viewport*(graph: var GraphView; viewport_bounds: ClayBoundingBox;
     panel_bounds: ClayBoundingBox = ClayBoundingBox(); panel_valid = false) =
@@ -961,42 +1017,18 @@ proc handle_event*(graph: var GraphView; event: UiEvent) =
   else:
     discard
 
-proc graph_node_center(node: GraphNode): ClayVector2 {.inline.} =
-  vector2(
-    float32(node.screen_position.x) + float32(node.size.width) / 2'f32,
-    float32(node.screen_position.y) + float32(node.size.height) / 2'f32)
+proc graph_contains_node(graph: GraphView; node_id: uint32): bool {.inline.} =
+  graph.work_node_index_by_id(node_id) >= 0
 
-proc graph_node_radius(node: GraphNode): float32 {.inline.} =
-  min(float32(node.size.width), float32(node.size.height)) / 2'f32
-
-proc graph_node_index_by_id(graph: GraphView; stable_id: uint32): int {.inline.} =
-  for index, node in graph.nodes:
-    if node.stable_id == stable_id:
-      return index
-  -1
-
-proc add_graph_arrow(graph: var GraphView; arrow: GraphArrow) =
-  var start_node_index = arrow.start_node_index
-  var end_node_index = arrow.end_node_index
-  if arrow.use_stable_ids or arrow.start_node_id != 0 or arrow.end_node_id != 0:
-    start_node_index = graph.graph_node_index_by_id(arrow.start_node_id)
-    end_node_index = graph.graph_node_index_by_id(arrow.end_node_id)
-  if start_node_index < 0 or
-      start_node_index >= graph.nodes.len or
-      end_node_index < 0 or
-      end_node_index >= graph.nodes.len:
-    return
-
-  let start_node = graph.nodes[start_node_index]
-  let end_node = graph.nodes[end_node_index]
-  let start_center = graph_node_center(start_node)
-  let end_center = graph_node_center(end_node)
+proc add_graph_arrow_between(graph: var GraphView;
+    start_center, end_center: ClayVector2;
+    start_radius, end_radius: float32) =
   let delta_x = float32(end_center.x - start_center.x)
   let delta_y = float32(end_center.y - start_center.y)
   let center_distance = sqrt(delta_x * delta_x + delta_y * delta_y)
-  let padding = max(arrow.padding, 0'f32)
-  let start_offset = graph_node_radius(start_node) + padding
-  let end_offset = graph_node_radius(end_node) + padding
+  let padding = 8'f32
+  let start_offset = start_radius + padding
+  let end_offset = end_radius + padding
   if center_distance <= start_offset + end_offset:
     return
 
@@ -1013,31 +1045,51 @@ proc add_graph_arrow(graph: var GraphView; arrow: GraphArrow) =
   graph.draw_list.add_opaque_arrow(
     start_point,
     end_point,
-    arrow.color,
-    arrow.shaft_width * graph.zoom,
-    arrow.head_length * graph.zoom,
-    arrow.head_width * graph.zoom,
-    arrow.z_index)
+    rgba(20, 18, 15, 255),
+    3'f32 * graph.zoom,
+    10'f32 * graph.zoom,
+    10'f32 * graph.zoom,
+    0)
 
-proc graph_node_z_index*(node: GraphNode): int16 {.inline.} =
-  int16(10 + int(node.z_index))
+proc add_work_graph_arrow(graph: var GraphView;
+    start_node_id, end_node_id: uint32) =
+  if not graph.graph_contains_node(start_node_id) or
+      not graph.graph_contains_node(end_node_id):
+    return
+  let start_position = graph.work_node_position(start_node_id)
+  let end_position = graph.work_node_position(end_node_id)
+  let radius = float32(work_node_size) / 2'f32
+  graph.add_graph_arrow_between(
+    vector2(start_position.x + radius, start_position.y + radius),
+    vector2(end_position.x + radius, end_position.y + radius),
+    radius,
+    radius)
 
-proc add_graph_node_draw_items(graph: GraphView; node: GraphNode) =
-  let geometry = graph.graph_node_geometry(node)
-  let highlighted = graph.hovered_node_valid and
-    graph.hovered_node_id == node.stable_id
-  let circle_color = if node.circle_color.a > 0:
-    node.circle_color
-  else:
-    rgba(255, 255, 255, 255)
-  let border_color = rgba(20, 18, 15, 255)
+proc work_node_z_index(graph: GraphView; node_id: uint32): int16 {.inline.} =
+  int16(10 + max(graph.work_node_index_by_id(node_id), 0))
+
+proc execution_plan_color(plan_type: ExecutionPlanType): ClayColor =
+  case plan_type
+  of llm_worker: rgba(255, 210, 63, 255)
+  of graph_creation: rgba(169, 126, 255, 255)
+  of human_input: rgba(83, 220, 169, 255)
+
+proc node_state_color(state: NodeState): ClayColor =
+  case state
+  of pending: rgba(20, 18, 15, 255)
+  of running: rgba(70, 145, 255, 255)
+  of completed: rgba(83, 220, 169, 255)
+  of failed: rgba(255, 103, 174, 255)
+
+proc add_graph_circle_draw_items(graph: GraphView; geometry: GraphNodeGeometry;
+    size: ClayDimensions; inner_color, border_color: ClayColor;
+    highlighted: bool; node_z_index: int16) =
   let inner_circle_diameter_world = max(
-    min(node.size.width, node.size.height) - graph_node_border_width * 2'f32,
+    min(size.width, size.height) - graph_node_border_width * 2'f32,
     0'f32)
   let inner_circle_origin = vector2(
     geometry.circle_origin.x + graph_node_border_width * graph.zoom,
     geometry.circle_origin.y + graph_node_border_width * graph.zoom)
-  let node_z_index = graph_node_z_index(node)
   if highlighted:
     let highlight_origin = vector2(
       geometry.circle_origin.x - graph_node_highlight_width * graph.zoom,
@@ -1056,24 +1108,34 @@ proc add_graph_node_draw_items(graph: GraphView; node: GraphNode) =
     graph.draw_list.add_opaque_circle(
       inner_circle_origin,
       inner_circle_diameter_world * graph.zoom,
-      circle_color,
+      inner_color,
       node_z_index)
+
+proc add_work_node_draw_items(graph: GraphView; node: WorkNode) =
+  graph.add_graph_circle_draw_items(
+    graph.work_node_geometry(node),
+    dimensions(work_node_size, work_node_size),
+    execution_plan_color(node.execution_plan.`type`),
+    node_state_color(node.state),
+    graph.hovered_node_valid and graph.hovered_node_id == node.id,
+    graph.work_node_z_index(node.id))
 
 proc rebuild_graph_draw_list*(graph: var GraphView) =
   graph.ensure_graph_canvas_state()
   if graph.draw_list == nil:
     graph.draw_list = new_opaque_draw_list()
   clear_opaque_draw_list(graph.draw_list)
-  for arrow in graph.arrows:
-    graph.add_graph_arrow(arrow)
-  for node in graph.nodes:
-    graph.add_graph_node_draw_items(node)
+  for node in graph.work_graph.nodes:
+    for dependency_id in node.wait_for:
+      graph.add_work_graph_arrow(dependency_id, node.id)
+  for node in graph.work_graph.nodes:
+    graph.add_work_node_draw_items(node)
 
 template graph_node_element(graph: GraphView; graph_id: ClayElementId;
-    node: GraphNode; body: untyped) =
-  let node_id = clay_id_with_index("graph_node", node.stable_id)
-  let geometry = graph.graph_node_geometry(node)
-  let node_z_index = graph_node_z_index(node)
+    node: WorkNode; body: untyped) =
+  let node_id = clay_id_with_index("graph_node", node.id)
+  let geometry = graph.work_node_geometry(node)
+  let node_z_index = graph.work_node_z_index(node.id)
 
   let node_declaration = declaration(
     layout = layout(
@@ -1093,18 +1155,12 @@ template graph_node_element(graph: GraphView; graph_id: ClayElementId;
   element(node_id, node_declaration):
     body
 
-template graph_node*(graph: GraphView; graph_id: ClayElementId;
-    node: GraphNode; body: untyped) =
-  graph.add_graph_node_draw_items(node)
-  graph_node_element(graph, graph_id, node):
-    body
-
-template graph_window_with_panel*(graph: var GraphView; node_name: untyped;
+template graph_window_with_panel*(graph: var GraphView;
     panel_body: untyped; body: untyped) =
   graph.ensure_graph_canvas_state()
   graph.refresh_graph_hover()
   if graph.selected_node_valid and
-      graph.graph_node_index_by_id(graph.selected_node_id) < 0:
+      not graph.graph_contains_node(graph.selected_node_id):
     graph.selected_node_valid = false
   graph.rebuild_graph_draw_list()
   let graph_id = clay_id("graph_surface")
@@ -1118,9 +1174,8 @@ template graph_window_with_panel*(graph: var GraphView; node_name: untyped;
   element(graph_id, graph_declaration):
     element("graph_paint", paint_declaration):
       discard
-    for graph_node_value in graph.nodes:
-      let node_name = graph_node_value
-      graph_node_element(graph, graph_id, node_name):
+    for work_node_value in graph.work_graph.nodes:
+      graph_node_element(graph, graph_id, work_node_value):
         body
     if graph.selected_node_valid:
       let panel_host_declaration = declaration(
@@ -1156,9 +1211,7 @@ template graph_window_with_panel*(graph: var GraphView; node_name: untyped;
           element("graph_panel", panel_declaration):
             panel_body
 
-proc graph_no_panel() =
-  discard
-
-template graph_window*(graph: var GraphView; node_name: untyped; body: untyped) =
-  graph_window_with_panel(graph, node_name, graph_no_panel()):
+template graph_window*(graph: var GraphView; body: untyped) =
+  graph_window_with_panel(graph, (block:
+    discard)):
     body

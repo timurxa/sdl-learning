@@ -2,6 +2,7 @@ import ../src/clay
 import ../src/graph_ui
 import ../src/renderer
 import ../src/ui
+import ../src/orchestration
 
 proc handle_error(error_data: ClayErrorData) {.cdecl.} =
   doAssert false, $error_data.error_type
@@ -15,29 +16,34 @@ discard clay_initialize(
   ClayErrorHandler(error_handler_function: handle_error, user_data: nil))
 
 var graph = GraphView(
-  nodes: @[
-    GraphNode(
-      stable_id: 1,
-      screen_position: vector2(12, 16),
-      size: dimensions(24, 24),
-      circle_color: rgba(255, 0, 0, 255),
-      z_index: 2),
-    GraphNode(
-      stable_id: 2,
-      screen_position: vector2(56, 16),
-      size: dimensions(24, 24),
-      circle_color: rgba(0, 255, 0, 255),
-      z_index: -1)],
-  arrows: @[
-    GraphArrow(
-      start_node_id: 1,
-      end_node_id: 2,
-      padding: 4,
-      color: rgba(255, 255, 255, 255),
-      shaft_width: 3,
-      head_length: 6,
-      head_width: 8)],
+  work_graph: WorkGraph(nodes: @[
+    WorkNode(
+      id: 1,
+      state: pending,
+      execution_plan: ExecutionPlan(`type`: llm_worker)),
+    WorkNode(
+      id: 2,
+      wait_for: @[1],
+      state: running,
+      execution_plan: ExecutionPlan(`type`: graph_creation))]),
   draw_list: new_opaque_draw_list())
+
+let tooltip_size = dimensions(96, 28)
+let window_size = dimensions(200, 120)
+graph.handle_event(UiEvent(kind: ui_event_mouse_move, x: 40, y: 40))
+let top_left_tooltip = graph.graph_node_tooltip_position(
+  window_size, tooltip_size, 10)
+doAssert top_left_tooltip.x == 50
+doAssert top_left_tooltip.y == 50
+graph.handle_event(UiEvent(kind: ui_event_mouse_move, x: 190, y: 110))
+let bottom_right_tooltip = graph.graph_node_tooltip_position(
+  window_size, tooltip_size, 10)
+doAssert bottom_right_tooltip.x == 84
+doAssert bottom_right_tooltip.y == 72
+let oversized_tooltip = graph.graph_node_tooltip_position(
+  dimensions(200, 120), dimensions(240, 140), 10)
+doAssert oversized_tooltip.x == 0
+doAssert oversized_tooltip.y == 0
 
 clay_begin_layout()
 element("root"):
@@ -45,7 +51,7 @@ element("root"):
     sizing:
       width = grow()
       height = grow()
-  graph_window(graph, node):
+  graph_window(graph):
     discard
 let commands = clay_end_layout(0)
 let surface_data = clay_get_element_data(clay_id("graph_surface"))
@@ -61,26 +67,26 @@ doAssert graph.draw_list.items[4].kind == opaque_draw_circle
 doAssert graph.draw_list.items[5].kind == opaque_draw_circle
 doAssert graph.draw_list.items[0].z_index == 0
 doAssert graph.draw_list.items[1].z_index == 0
-doAssert graph.draw_list.items[0].shape_data[0] == 40
-doAssert graph.draw_list.items[0].shape_data[2] == 46
-doAssert graph.draw_list.items[2].z_index == 12
-doAssert graph.draw_list.items[3].z_index == 12
-doAssert graph.draw_list.items[4].z_index == 9
-doAssert graph.draw_list.items[5].z_index == 9
-doAssert graph.draw_list.items[2].size.width == 24
-doAssert graph.draw_list.items[3].size.width == 18
+doAssert graph.draw_list.items[0].shape_data[0] == 120
+doAssert graph.draw_list.items[0].shape_data[2] == 132
+doAssert graph.draw_list.items[2].z_index == 10
+doAssert graph.draw_list.items[3].z_index == 10
+doAssert graph.draw_list.items[4].z_index == 11
+doAssert graph.draw_list.items[5].z_index == 11
+doAssert graph.draw_list.items[2].size.width == 32
+doAssert graph.draw_list.items[3].size.width == 26
 
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_move,
-  x: 24,
-  y: 28))
+  x: 96,
+  y: 86))
 clay_begin_layout()
 element("root"):
   layout:
     sizing:
       width = grow()
       height = grow()
-  graph_window(graph, node):
+  graph_window(graph):
     discard
 discard clay_end_layout(0)
 
@@ -90,7 +96,7 @@ element("root"):
     sizing:
       width = grow()
       height = grow()
-  graph_window(graph, node):
+  graph_window(graph):
     discard
 discard clay_end_layout(0)
 
@@ -98,12 +104,12 @@ doAssert graph.draw_list.items.len == 7
 doAssert graph.draw_list.items[2].kind == opaque_draw_circle
 doAssert graph.draw_list.items[3].kind == opaque_draw_circle
 doAssert graph.draw_list.items[4].kind == opaque_draw_circle
-doAssert graph.draw_list.items[2].size.width == 32
-doAssert graph.draw_list.items[3].size.width == 24
-doAssert graph.draw_list.items[4].size.width == 18
-doAssert graph.draw_list.items[2].z_index == 12
-doAssert graph.draw_list.items[3].z_index == 12
-doAssert graph.draw_list.items[4].z_index == 12
+doAssert graph.draw_list.items[2].size.width == 40
+doAssert graph.draw_list.items[3].size.width == 32
+doAssert graph.draw_list.items[4].size.width == 26
+doAssert graph.draw_list.items[2].z_index == 10
+doAssert graph.draw_list.items[3].z_index == 10
+doAssert graph.draw_list.items[4].z_index == 10
 
 var custom_command_count: int
 for command in commands:
