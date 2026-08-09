@@ -4,8 +4,8 @@ import codex_runtime
 
 type
   CodexRuntimeInputKind* = enum
-    cri_create_node_thread,
     cri_send_node_message,
+    cri_reply_server_request,
     cri_shutdown,
     cri_stdout_line,
     cri_stderr_line,
@@ -13,11 +13,13 @@ type
 
   CodexRuntimeInput* = object
     case kind*: CodexRuntimeInputKind
-    of cri_create_node_thread:
-      node_id*: uint32
     of cri_send_node_message:
       message_node_id*: uint32
       message_text*: string
+    of cri_reply_server_request:
+      server_request_id*: RequestId
+      server_request_node_id*: uint32
+      server_response*: DynamicToolCallResponse
     of cri_shutdown:
       discard
     of cri_stdout_line, cri_stderr_line:
@@ -31,6 +33,7 @@ type
     cre_agent_message_delta,
     cre_turn_completed,
     cre_node_error,
+    cre_tool_response_sent,
     cre_global_notification,
     cre_runtime_error,
     cre_runtime_closed
@@ -44,6 +47,8 @@ type
     turn_id*: string
     item_id*: string
     request_id*: string
+    request_id_value*: RequestId
+    tool_name*: string
     params_json*: string
     conversation_scoped*: bool
     notification_kind*: NotificationKind
@@ -66,6 +71,21 @@ type
     stderr_thread_started: bool
 
   CodexBridge* = ptr CodexBridgeState
+
+const
+  finish_node_name* = "finish_node"
+
+proc finish_node_tool*(): DynamicTool =
+  var input_schema = newJObject()
+  input_schema["type"] = %"object"
+  input_schema["properties"] = newJObject()
+  input_schema["additionalProperties"] = %false
+  DynamicTool(
+    name: finish_node_name,
+    description: "Mark the current orchestration node complete.",
+    input_schema: input_schema,
+    data: nil,
+    callback: nil)
 
 proc emit_event(bridge: ptr CodexBridgeState; event: CodexRuntimeEvent) =
   bridge[].event_channel.send(event)
@@ -141,6 +161,10 @@ proc server_request_event(thread_nodes: Table[string, uint32];
     turn_id: if identity.turn_id.isSome: identity.turn_id.get else: "",
     item_id: if identity.item_id.isSome: identity.item_id.get else: "",
     request_id: request_id_key(request.id),
+    request_id_value: request.id,
+    tool_name: if request.kind == sr_tool_call:
+      request.params.tool_call.tool
+    else: "",
     params_json: request.params_json,
     conversation_scoped: true,
     notification_kind: nk_unknown,
@@ -177,18 +201,21 @@ proc emit_unknown_notification(bridge: ptr CodexBridgeState;
     text: notification.method_name & " " &
       params_prefix(notification.params.raw_params)))
 
+proc clear_queued_messages(queued_messages: var Table[uint32, seq[string]];
+    node_id: uint32) =
+  queued_messages.del(node_id)
+
 proc send_next_queued_message(runtime: ptr CodexRuntime;
     bridge: ptr CodexBridgeState; node_id: uint32;
     request_nodes: var Table[string, uint32];
     queued_messages: var Table[uint32, seq[string]]) =
   let agent_id = agent_id_for_node(node_id)
-  if not queued_messages.hasKey(node_id) or queued_messages[node_id].len == 0:
+  if not queued_messages.hasKey(node_id):
     return
   if not runtime.agents.hasKey(agent_id):
     return
   let agent = runtime.agents[agent_id]
-  if not agent.thread_id.has_value or
-      agent.state in {as_starting, as_working, as_waiting, as_closed}:
+  if not agent.thread_id.has_value or agent.state != as_idle:
     return
   let message = queued_messages[node_id][0]
   try:
@@ -196,11 +223,12 @@ proc send_next_queued_message(runtime: ptr CodexRuntime;
     request_nodes[request_id_key(request_id)] = node_id
     queued_messages[node_id].delete(0)
     if queued_messages[node_id].len == 0:
-      queued_messages.del(node_id)
+      queued_messages.clear_queued_messages(node_id)
   except CatchableError as error:
     var failed_agent = runtime.agents[agent_id]
-    failed_agent.state = as_idle
+    failed_agent.state = as_error
     runtime.agents[agent_id] = failed_agent
+    queued_messages.clear_queued_messages(node_id)
     bridge.emit_event(CodexRuntimeEvent(
       kind: cre_node_error,
       node_id: node_id,
@@ -238,13 +266,10 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
         event_kind = cre_thread_error
         if request.agent_id.isSome:
           runtime.agents.del(request.agent_id.get)
+          queued_messages.clear_queued_messages(node_id)
       elif request.request.kind == mk_turn_start and request.agent_id.isSome:
-        send_next_queued_message(
-          runtime,
-          bridge,
-          request_nodes.getOrDefault(request_key, node_id),
-          request_nodes,
-          queued_messages)
+        queued_messages.clear_queued_messages(
+          request_nodes.getOrDefault(request_key, node_id))
     bridge.emit_event(CodexRuntimeEvent(
       kind: event_kind,
       node_id: node_id,
@@ -268,8 +293,10 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
         let node_id = node_id_for_thread(
           thread_nodes, notification.params.thread_id.value)
         if node_id.isSome:
-          if notification.params.turn_status.isSome and
-              notification.params.turn_status.get == ts_failed:
+          let turn_succeeded = notification.params.turn_status.isSome and
+            notification.params.turn_status.get == ts_completed
+          queued_messages.clear_queued_messages(node_id.get)
+          if not turn_succeeded:
             bridge.emit_event(notification_event(
               notification,
               node_id.get,
@@ -280,8 +307,6 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
               notification,
               node_id.get,
               cre_turn_completed))
-          send_next_queued_message(
-            runtime, bridge, node_id.get, request_nodes, queued_messages)
     of nk_error:
       if notification.params.thread_id.has_value:
         let node_id = node_id_for_thread(
@@ -291,6 +316,8 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
             cre_global_notification
           else:
             cre_node_error
+          if event_kind == cre_node_error:
+            queued_messages.clear_queued_messages(node_id.get)
           bridge.emit_event(notification_event(
             notification,
             node_id.get,
@@ -313,6 +340,7 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
         if node_id.isSome:
           runtime.agents.del(agent_id_for_node(node_id.get))
           thread_nodes.del(notification.params.thread_id.value)
+          queued_messages.clear_queued_messages(node_id.get)
           bridge.emit_event(CodexRuntimeEvent(
             kind: cre_thread_error,
             node_id: node_id.get,
@@ -359,7 +387,11 @@ proc handle_create_node_thread(runtime: ptr CodexRuntime;
   if runtime.agents.hasKey(agent_id):
     return
   try:
-    let request_id = runtime.create_agent(agent_id, "")
+    let request_id = runtime.create_agent(
+      agent_id,
+      "gpt-5.6-luna",
+      @[finish_node_tool()],
+      default_effort = re_low)
     request_nodes[request_id_key(request_id)] = node_id
   except CatchableError as error:
     bridge.emit_event(CodexRuntimeEvent(
@@ -373,46 +405,48 @@ proc handle_send_node_message(runtime: ptr CodexRuntime;
     queued_messages: var Table[uint32, seq[string]]) =
   let node_id = input.message_node_id
   let agent_id = agent_id_for_node(node_id)
+  queued_messages.mgetOrPut(node_id, @[]).add(input.message_text)
   if not runtime.agents.hasKey(agent_id):
-    queued_messages.mgetOrPut(node_id, @[]).add(input.message_text)
     handle_create_node_thread(runtime, bridge, node_id, request_nodes)
     return
-  let agent = runtime.agents[agent_id]
-  queued_messages.mgetOrPut(node_id, @[]).add(input.message_text)
-  if agent.thread_id.has_value and agent.state notin {as_starting, as_working, as_waiting}:
-    send_next_queued_message(
-      runtime, bridge, node_id, request_nodes, queued_messages)
+  send_next_queued_message(
+    runtime, bridge, node_id, request_nodes, queued_messages)
 
 proc handle_command(runtime: ptr CodexRuntime; bridge: ptr CodexBridgeState;
     input: CodexRuntimeInput; request_nodes: var Table[string, uint32];
     queued_messages: var Table[uint32, seq[string]]) =
   case input.kind
-  of cri_create_node_thread:
-    handle_create_node_thread(runtime, bridge, input.node_id, request_nodes)
   of cri_send_node_message:
     handle_send_node_message(runtime, bridge, input, request_nodes, queued_messages)
+  of cri_reply_server_request:
+    queued_messages.clear_queued_messages(input.server_request_node_id)
+    try:
+      runtime.reply_server_request(
+        input.server_request_id,
+        serialize_dynamic_tool_call_response(input.server_response))
+      bridge.emit_event(CodexRuntimeEvent(
+        kind: cre_tool_response_sent,
+        node_id: input.server_request_node_id))
+    except CatchableError as error:
+      bridge.emit_event(CodexRuntimeEvent(
+        kind: cre_node_error,
+        node_id: input.server_request_node_id,
+        text: "Codex tool response error: " & error.msg))
   else:
     discard
 
-proc input_node_id(input: CodexRuntimeInput): uint32 =
-  case input.kind
-  of cri_create_node_thread:
-    input.node_id
-  of cri_send_node_message:
-    input.message_node_id
-  else:
-    0
-
 proc fail_pending_input(bridge: ptr CodexBridgeState;
     input: CodexRuntimeInput; error_message: string) =
-  let event_kind = if input.kind == cri_create_node_thread:
-    cre_thread_error
+  var event = CodexRuntimeEvent(
+    kind: cre_runtime_error,
+    text: error_message)
+  case input.kind
+  of cri_send_node_message:
+    event.kind = cre_node_error
+    event.node_id = input.message_node_id
   else:
-    cre_node_error
-  bridge.emit_event(CodexRuntimeEvent(
-    kind: event_kind,
-    node_id: input_node_id(input),
-    text: error_message))
+    discard
+  bridge.emit_event(event)
 
 proc fail_pending_inputs(bridge: ptr CodexBridgeState;
     pending_inputs: var seq[CodexRuntimeInput]; error_message: string) =
@@ -452,11 +486,11 @@ proc codex_worker(state: ptr CodexBridgeState) {.thread.} =
   while not should_stop:
     let input = state[].input_channel.recv()
     if runtime != nil and not runtime.initialized and
-        input.kind in {cri_create_node_thread, cri_send_node_message}:
+        input.kind == cri_send_node_message:
       pending_inputs.add(input)
       continue
     case input.kind
-    of cri_create_node_thread, cri_send_node_message:
+    of cri_send_node_message, cri_reply_server_request:
       if runtime != nil:
         handle_command(runtime, state, input, request_nodes, queued_messages)
       else:
@@ -500,16 +534,25 @@ proc new_codex_bridge*(): CodexBridge =
   result[].event_channel.open()
   createThread(result[].worker_thread, codex_worker, result)
 
-proc request_node_thread*(bridge: CodexBridge; node_id: uint32) =
-  bridge[].input_channel.send(CodexRuntimeInput(
-    kind: cri_create_node_thread,
-    node_id: node_id))
-
 proc send_node_message*(bridge: CodexBridge; node_id: uint32; text: string) =
   bridge[].input_channel.send(CodexRuntimeInput(
     kind: cri_send_node_message,
     message_node_id: node_id,
     message_text: text))
+
+proc reply_server_request*(bridge: CodexBridge; request_id: RequestId;
+    node_id: uint32; response: DynamicToolCallResponse): bool =
+  if bridge == nil:
+    return false
+  try:
+    bridge[].input_channel.send(CodexRuntimeInput(
+    kind: cri_reply_server_request,
+    server_request_id: request_id,
+    server_request_node_id: node_id,
+    server_response: response))
+    true
+  except CatchableError:
+    false
 
 proc try_receive*(bridge: CodexBridge; event: var CodexRuntimeEvent): bool =
   let received = bridge[].event_channel.tryRecv()

@@ -1,3 +1,6 @@
+import codex_bridge
+import codex_json
+
 type
   ExecutionPlanType* = enum
     llm_worker
@@ -19,5 +22,146 @@ type
     state*: NodeState
     execution_plan*: ExecutionPlan
 
+  WorkGraphMessage* = object
+    node_id*: uint32
+    text*: string
+
   WorkGraph* = object
     nodes*: seq[WorkNode]
+    log_messages*: seq[string]
+    outgoing_messages*: seq[WorkGraphMessage]
+
+proc new_work_graph*(): WorkGraph =
+  WorkGraph(nodes: @[
+    WorkNode(
+      id: 1,
+      state: pending,
+      execution_plan: ExecutionPlan(`type`: llm_worker)),
+    WorkNode(
+      id: 2,
+      wait_for: @[1],
+      state: pending,
+      execution_plan: ExecutionPlan(`type`: human_input))
+  ])
+
+proc node_index(graph: WorkGraph; node_id: uint32): int =
+  for index, node in graph.nodes:
+    if node.id == node_id:
+      return index
+  -1
+
+proc node_runnable(graph: WorkGraph; node: WorkNode): bool =
+  if node.state != pending:
+    return false
+  for dependency_id in node.wait_for:
+    let dependency_index = graph.node_index(dependency_id)
+    if dependency_index < 0 or
+        graph.nodes[dependency_index].state != completed:
+      return false
+  true
+
+proc runnable_node_ids*(graph: WorkGraph): seq[uint32] =
+  for node in graph.nodes:
+    if graph.node_runnable(node):
+      result.add(node.id)
+
+proc node_prompt(node: WorkNode): string =
+  "Your execution type is " & $node.execution_plan.`type` & ". Do nothing."
+
+proc log_node_failure(graph: var WorkGraph; node_id: uint32; reason: string) =
+  graph.log_messages.add("NODE " & $node_id & " FAILED: " & reason)
+
+proc fail_node*(graph: var WorkGraph; node_id: uint32; reason: string): bool =
+  let index = graph.node_index(node_id)
+  if index < 0:
+    graph.log_node_failure(node_id, reason)
+    return false
+  let can_fail = graph.nodes[index].state in {pending, running}
+  if can_fail:
+    graph.nodes[index].state = failed
+  graph.log_node_failure(node_id, reason)
+  can_fail
+
+proc complete_node*(graph: var WorkGraph; node_id: uint32): bool =
+  let index = graph.node_index(node_id)
+  if index < 0 or graph.nodes[index].state != running:
+    return false
+  graph.nodes[index].state = completed
+  true
+
+proc node_is_running*(graph: WorkGraph; node_id: uint32): bool =
+  let index = graph.node_index(node_id)
+  index >= 0 and graph.nodes[index].state == running
+
+proc drain_outgoing_messages*(graph: var WorkGraph): seq[WorkGraphMessage] =
+  result = graph.outgoing_messages
+  graph.outgoing_messages = @[]
+
+proc send_work_graph_message(graph: var WorkGraph; bridge: CodexBridge;
+    node_id: uint32; text: string): bool =
+  try:
+    bridge.send_node_message(node_id, text)
+    graph.outgoing_messages.add(WorkGraphMessage(
+      node_id: node_id,
+      text: text))
+    true
+  except CatchableError as error:
+    discard graph.fail_node(node_id, error.msg)
+    false
+
+proc start_available_nodes*(graph: var WorkGraph; bridge: CodexBridge) =
+  if bridge == nil:
+    return
+  for index in 0 ..< graph.nodes.len:
+    if not graph.node_runnable(graph.nodes[index]):
+      continue
+    let node_id = graph.nodes[index].id
+    let prompt = graph.nodes[index].node_prompt()
+    graph.nodes[index].state = running
+    discard graph.send_work_graph_message(bridge, node_id, prompt)
+
+proc reply_finish_node(bridge: CodexBridge; event: CodexRuntimeEvent;
+    success: bool; message: string): bool =
+  if bridge == nil:
+    return false
+  bridge.reply_server_request(
+    event.request_id_value,
+    event.node_id,
+    DynamicToolCallResponse(
+      success: success,
+      content_items: if message.len > 0:
+        @[dynamic_tool_text(message)]
+      else: @[]))
+
+proc handle_finish_node_call(graph: var WorkGraph; bridge: CodexBridge;
+    event: CodexRuntimeEvent) =
+  if event.tool_name != finish_node_name:
+    discard graph.fail_node(event.node_id, "unknown dynamic tool: " & event.tool_name)
+    discard bridge.reply_finish_node(event, false, "unknown dynamic tool")
+    return
+
+  let index = graph.node_index(event.node_id)
+  if index >= 0 and graph.nodes[index].state == running:
+    if not bridge.reply_finish_node(event, true, "node completed"):
+      discard graph.fail_node(event.node_id, "finish_node response could not be queued")
+  else:
+    discard graph.fail_node(event.node_id, "finish_node called for non-running node")
+    discard bridge.reply_finish_node(event, false, "finish_node failed")
+
+proc handle_codex_event*(graph: var WorkGraph; bridge: CodexBridge;
+    event: CodexRuntimeEvent) =
+  case event.kind
+  of cre_global_notification:
+    if event.server_request_kind == sr_tool_call:
+      graph.handle_finish_node_call(bridge, event)
+  of cre_turn_completed, cre_tool_response_sent:
+    discard graph.complete_node(event.node_id)
+  of cre_thread_error, cre_node_error:
+    discard graph.fail_node(event.node_id, event.text)
+  of cre_runtime_closed:
+    for node in graph.nodes.mitems:
+      if node.state == running:
+        node.state = failed
+        graph.log_node_failure(node.id, "Codex runtime closed")
+  else:
+    discard

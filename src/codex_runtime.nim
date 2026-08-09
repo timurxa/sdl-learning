@@ -374,7 +374,8 @@ proc handle_message*(runtime: ptr CodexRuntime; message: Message) =
     discard
   of mk_server_request:
     apply_server_request(runtime.state, message.server_request)
-    reject_server_request(runtime, message.server_request.id)
+    if message.server_request.kind != sr_tool_call:
+      reject_server_request(runtime, message.server_request.id)
   of mk_server_response:
     let key = request_id_key(message.server_response.id)
     if not runtime.state.server_requests.hasKey(key):
@@ -402,41 +403,34 @@ proc accept_json*(runtime: ptr CodexRuntime; node: JsonNode): Message =
   result = parse_message(node, runtime.pending)
   handle_message(runtime, result)
 
-proc accept_tool_response*(runtime: ptr CodexRuntime; context: ToolCallContext;
-    success: bool; content_items: seq[DynamicToolContentItem]) =
+proc handle_server_response(runtime: ptr CodexRuntime;
+    response: ServerResponse) =
   handle_message(runtime, Message(
     kind: mk_server_response,
-    server_response: ServerResponse(
-      id: context.request_id,
-      result: some(serialize_dynamic_tool_call_response(DynamicToolCallResponse(
-        success: success,
-        content_items: content_items
-      ))),
-      error: none(Error)
-    )
-  ))
+    server_response: response))
+
+proc accept_tool_response*(runtime: ptr CodexRuntime; context: ToolCallContext;
+    success: bool; content_items: seq[DynamicToolContentItem]) =
+  runtime.handle_server_response(ServerResponse(
+    id: context.request_id,
+    result: some(serialize_dynamic_tool_call_response(DynamicToolCallResponse(
+      success: success,
+      content_items: content_items))),
+    error: none(Error)))
 
 proc reply_server_request*(runtime: ptr CodexRuntime; id: RequestId;
     result: JsonNode) =
-  handle_message(runtime, Message(
-    kind: mk_server_response,
-    server_response: ServerResponse(
-      id: id,
-      result: some(result),
-      error: none(Error)
-    )
-  ))
+  runtime.handle_server_response(ServerResponse(
+    id: id,
+    result: some(result),
+    error: none(Error)))
 
 proc fail_server_request*(runtime: ptr CodexRuntime; id: RequestId;
     code: int64; message: string) =
-  handle_message(runtime, Message(
-    kind: mk_server_response,
-    server_response: ServerResponse(
-      id: id,
-      result: none(JsonNode),
-      error: some(Error(id: id, code: code, message: message))
-    )
-  ))
+  runtime.handle_server_response(ServerResponse(
+    id: id,
+    result: none(JsonNode),
+    error: some(Error(id: id, code: code, message: message))))
 
 proc is_running*(runtime: ptr CodexRuntime): bool =
   runtime.process.running

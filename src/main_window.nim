@@ -1,4 +1,4 @@
-import std/[json, random, strutils, tables]
+import std/[json, strutils, tables]
 import clay
 import sdl
 import ui
@@ -113,33 +113,13 @@ type
     workspace_tab: WorkspaceTab
     graph_tab: GraphTab
     codex_bridge: CodexBridge
+    codex_runtime_closed: bool
     pending_graph_events: seq[UiEvent]
 
-const
-  debug_execution_plan_types = [llm_worker, graph_creation, human_input]
-  debug_node_states = [pending, running, completed, failed]
-
-proc debug_randomize_graph(graph: var GraphView; node_count: int) =
-  graph.work_graph.nodes = newSeq[WorkNode](node_count)
-  for node_index in 0 ..< node_count:
-    var wait_for: seq[uint32] = @[]
-    if node_index > 0:
-      wait_for.add(uint32(node_index))
-      for dependency_index in 0 ..< node_index - 1:
-        if rand(3) == 0:
-          wait_for.add(uint32(dependency_index + 1))
-    graph.work_graph.nodes[node_index] = WorkNode(
-      id: uint32(node_index + 1),
-      wait_for: wait_for,
-      state: debug_node_states[rand(debug_node_states.high)],
-      execution_plan: ExecutionPlan(
-        `type`: debug_execution_plan_types[rand(debug_execution_plan_types.high)]))
-
 proc new_debug_graph_tab(): GraphTab =
-  randomize()
   new(result)
   result.node_conversations = initTable[uint32, NodeConversation]()
-  result.graph_view.debug_randomize_graph(8 + rand(5))
+  result.graph_view.work_graph = new_work_graph()
   var layout_config = default_graph_layout_config()
   layout_config.layer_gap = 96
   layout_config.node_gap = 56
@@ -187,16 +167,7 @@ proc new_main_window*(): MainWindow =
     ui_state: new_ui_state(),
     tab_manager: TabManager(active_tab: main_tab_workspace),
     workspace_tab: WorkspaceTab(
-      graph_view: GraphView(work_graph: WorkGraph(nodes: @[
-        WorkNode(
-          id: 1,
-          state: pending,
-          execution_plan: ExecutionPlan(`type`: llm_worker)),
-        WorkNode(
-          id: 2,
-          wait_for: @[1],
-          state: pending,
-          execution_plan: ExecutionPlan(`type`: human_input))]))),
+      graph_view: GraphView(work_graph: new_work_graph())),
     graph_tab: new_debug_graph_tab(),
     codex_bridge: new_codex_bridge())
 
@@ -253,6 +224,14 @@ proc activity_entry(kind: ConversationActivityKind; activity_id,
 proc add_node_message(tab: GraphTab; node_id: uint32;
     speaker: ConversationSpeaker; content: string) =
   tab.node_conversation(node_id).messages.add(message_entry(speaker, content))
+
+proc display_work_graph_messages(view: MainWindow) =
+  let messages = view.graph_tab.graph_view.work_graph.drain_outgoing_messages()
+  for message in messages:
+    view.graph_tab.add_node_message(
+      message.node_id, conversation_system, message.text)
+  if messages.len > 0:
+    view.graph_tab.scroll_conversation_to_end = true
 
 proc add_global_message(tab: GraphTab; content: string) =
   tab.global_log_messages.add(content)
@@ -618,7 +597,8 @@ proc apply_conversation_event(view: MainWindow; event: CodexRuntimeEvent) =
         conversation.status_detail = "WAITING"
       elif event.notification_kind == nk_model_rerouted:
         conversation.current_model = json_string(payload, "toModel")
-  of cre_thread_ready, cre_thread_error, cre_runtime_error, cre_runtime_closed:
+  of cre_thread_ready, cre_thread_error, cre_tool_response_sent,
+      cre_runtime_error, cre_runtime_closed:
     discard
   view.graph_tab.node_conversations[event.node_id] = conversation
   view.graph_tab.scroll_conversation_to_end = true
@@ -643,6 +623,8 @@ proc apply_codex_event(view: MainWindow; event: CodexRuntimeEvent) =
     conversation.thread_requested = true
     conversation.state = conversation_ready
     view.graph_tab.node_conversations[event.node_id] = conversation
+  of cre_tool_response_sent:
+    discard
   of cre_thread_error:
     view.apply_conversation_error(
       event.node_id, "THREAD ERROR: ", event.text, close_thread = true)
@@ -665,7 +647,15 @@ proc apply_codex_event(view: MainWindow; event: CodexRuntimeEvent) =
 proc poll_codex_events(view: MainWindow) =
   var event: CodexRuntimeEvent
   while view.codex_bridge.try_receive(event):
+    if event.kind == cre_runtime_closed:
+      view.codex_runtime_closed = true
+    view.graph_tab.graph_view.work_graph.handle_codex_event(
+      view.codex_bridge, event)
     view.apply_codex_event(event)
+  if not view.codex_runtime_closed:
+    view.graph_tab.graph_view.work_graph.start_available_nodes(
+      view.codex_bridge)
+  view.display_work_graph_messages()
 
 proc sync_graph_viewport(view: MainWindow) =
   let surface_data = clay_get_element_data(clay_id("graph_surface"))
@@ -803,6 +793,10 @@ proc apply_ui_actions(view: MainWindow) =
       if not view.graph_tab.graph_view.selected_node_valid:
         continue
       let node_id = view.graph_tab.graph_view.selected_node_id
+      if not view.graph_tab.graph_view.work_graph.node_is_running(node_id):
+        view.graph_tab.add_global_message(
+          "NODE " & $node_id & " IS NOT RUNNING")
+        continue
       let message = content.strip
       view.graph_tab.add_node_message(node_id, conversation_user, message)
       view.graph_tab.scroll_conversation_to_end = true
@@ -823,11 +817,7 @@ proc sync_selected_node(view: MainWindow) =
 
   let node_id = graph.selected_node_id
   var conversation = view.graph_tab.node_conversation(node_id)
-  if not conversation.thread_requested:
-    conversation.thread_requested = true
-    conversation.state = conversation_starting
-    view.graph_tab.node_conversations[node_id] = conversation
-    view.codex_bridge.request_node_thread(node_id)
+  view.graph_tab.node_conversations[node_id] = conversation
 
 proc build_tab_bar(view: MainWindow) =
   let workspace_button_element_id = clay_id(workspace_tab_button_id)
