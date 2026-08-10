@@ -3,6 +3,17 @@ import codex_json
 import codex_runtime
 
 type
+  CodexServerResponseKind* = enum
+    csr_dynamic_tool_call,
+    csr_user_input
+
+  CodexServerResponse* = object
+    case kind*: CodexServerResponseKind
+    of csr_dynamic_tool_call:
+      dynamic_tool_response*: DynamicToolCallResponse
+    of csr_user_input:
+      user_input_answers*: seq[UserInputAnswer]
+
   CodexRuntimeInputKind* = enum
     cri_send_node_message,
     cri_reply_server_request,
@@ -19,7 +30,7 @@ type
     of cri_reply_server_request:
       server_request_id*: RequestId
       server_request_node_id*: uint32
-      server_response*: DynamicToolCallResponse
+      server_response*: CodexServerResponse
     of cri_shutdown:
       discard
     of cri_stdout_line, cri_stderr_line:
@@ -52,6 +63,9 @@ type
     params_json*: string
     conversation_scoped*: bool
     notification_kind*: NotificationKind
+    thread_status*: Option[ThreadStatusKind]
+    active_flags*: set[ActiveFlag]
+    will_retry*: Option[bool]
     server_request_kind*: ServerRequestKind
 
   CodexReaderContext = object
@@ -71,6 +85,18 @@ type
     stderr_thread_started: bool
 
   CodexBridge* = ptr CodexBridgeState
+
+proc server_request_kind(response: CodexServerResponse): ServerRequestKind =
+  case response.kind
+  of csr_dynamic_tool_call: sr_tool_call
+  of csr_user_input: sr_tool_user_input
+
+proc serialize(response: CodexServerResponse): JsonNode =
+  case response.kind
+  of csr_dynamic_tool_call:
+    serialize_dynamic_tool_call_response(response.dynamic_tool_response)
+  of csr_user_input:
+    serialize_user_input_response(response.user_input_answers)
 
 const
   finish_node_name* = "finish_node"
@@ -137,9 +163,6 @@ proc notification_item_id(notification: Notification): string =
   if notification.params.item_id.isSome:
     result = notification.params.item_id.get
 
-proc notification_will_retry(notification: Notification): bool =
-  notification.params.will_retry.isSome and notification.params.will_retry.get
-
 proc notification_node_id(thread_nodes: Table[string, uint32];
     notification: Notification): uint32 =
   let thread_id = notification_thread_id(notification)
@@ -149,15 +172,16 @@ proc notification_node_id(thread_nodes: Table[string, uint32];
 proc server_request_event(thread_nodes: Table[string, uint32];
     request: ServerRequest): CodexRuntimeEvent =
   let identity = server_request_identity(request)
+  let thread_id = identity.thread_id
   CodexRuntimeEvent(
     kind: cre_global_notification,
-    node_id: if identity.thread_id.isSome:
-      node_id_for_thread(thread_nodes, identity.thread_id.get).get(0'u32)
+    node_id: if thread_id.isSome:
+      node_id_for_thread(thread_nodes, thread_id.get).get(0'u32)
     else:
       0'u32,
     text: "server request: " & request.method_name,
     method_name: request.method_name,
-    thread_id: if identity.thread_id.isSome: identity.thread_id.get else: "",
+    thread_id: if thread_id.isSome: thread_id.get else: "",
     turn_id: if identity.turn_id.isSome: identity.turn_id.get else: "",
     item_id: if identity.item_id.isSome: identity.item_id.get else: "",
     request_id: request_id_key(request.id),
@@ -192,6 +216,9 @@ proc notification_event(notification: Notification; node_id: uint32;
     params_json: notification_payload_json(notification),
     conversation_scoped: notification.kind.is_conversation_notification,
     notification_kind: notification.kind,
+    thread_status: notification.params.thread_status,
+    active_flags: notification.params.active_flags,
+    will_retry: notification.params.will_retry,
     server_request_kind: sr_unknown)
 
 proc emit_unknown_notification(bridge: ptr CodexBridgeState;
@@ -293,8 +320,7 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
         let node_id = node_id_for_thread(
           thread_nodes, notification.params.thread_id.value)
         if node_id.isSome:
-          let turn_succeeded = notification.params.turn_status.isSome and
-            notification.params.turn_status.get == ts_completed
+          let turn_succeeded = notification.params.turn_status.turn_succeeded
           queued_messages.clear_queued_messages(node_id.get)
           if not turn_succeeded:
             bridge.emit_event(notification_event(
@@ -312,7 +338,7 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
         let node_id = node_id_for_thread(
           thread_nodes, notification.params.thread_id.value)
         if node_id.isSome:
-          let event_kind = if notification.notification_will_retry:
+          let event_kind = if notification.params.will_retry.retry_requested:
             cre_global_notification
           else:
             cre_node_error
@@ -324,7 +350,7 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
             event_kind,
             notification.params.error_message.get("runtime error")))
       else:
-        let event_kind = if notification.notification_will_retry:
+        let event_kind = if notification.params.will_retry.retry_requested:
           cre_global_notification
         else:
           cre_runtime_error
@@ -423,10 +449,12 @@ proc handle_command(runtime: ptr CodexRuntime; bridge: ptr CodexBridgeState;
     try:
       runtime.reply_server_request(
         input.server_request_id,
-        serialize_dynamic_tool_call_response(input.server_response))
+        input.server_response.serialize())
       bridge.emit_event(CodexRuntimeEvent(
         kind: cre_tool_response_sent,
-        node_id: input.server_request_node_id))
+        node_id: input.server_request_node_id,
+        conversation_scoped: true,
+        server_request_kind: input.server_response.server_request_kind()))
     except CatchableError as error:
       bridge.emit_event(CodexRuntimeEvent(
         kind: cre_node_error,
@@ -540,19 +568,35 @@ proc send_node_message*(bridge: CodexBridge; node_id: uint32; text: string) =
     message_node_id: node_id,
     message_text: text))
 
-proc reply_server_request*(bridge: CodexBridge; request_id: RequestId;
-    node_id: uint32; response: DynamicToolCallResponse): bool =
+proc enqueue_server_response(bridge: CodexBridge;
+    input: CodexRuntimeInput): bool =
   if bridge == nil:
     return false
   try:
-    bridge[].input_channel.send(CodexRuntimeInput(
-    kind: cri_reply_server_request,
-    server_request_id: request_id,
-    server_request_node_id: node_id,
-    server_response: response))
+    bridge[].input_channel.send(input)
     true
   except CatchableError:
     false
+
+proc reply_server_request*(bridge: CodexBridge; request_id: RequestId;
+    node_id: uint32; response: DynamicToolCallResponse): bool =
+  bridge.enqueue_server_response(CodexRuntimeInput(
+    kind: cri_reply_server_request,
+    server_request_id: request_id,
+    server_request_node_id: node_id,
+    server_response: CodexServerResponse(
+      kind: csr_dynamic_tool_call,
+      dynamic_tool_response: response)))
+
+proc reply_user_input*(bridge: CodexBridge; request_id: RequestId;
+    node_id: uint32; answers: seq[UserInputAnswer]): bool =
+  bridge.enqueue_server_response(CodexRuntimeInput(
+      kind: cri_reply_server_request,
+      server_request_id: request_id,
+      server_request_node_id: node_id,
+      server_response: CodexServerResponse(
+        kind: csr_user_input,
+        user_input_answers: answers)))
 
 proc try_receive*(bridge: CodexBridge; event: var CodexRuntimeEvent): bool =
   let received = bridge[].event_channel.tryRecv()

@@ -228,6 +228,10 @@ type
     turn_id*: string
     extra_fields*: JsonObject
 
+  UserInputAnswer* = object
+    question_id*: string
+    answer*: string
+
   DynamicToolCallParams* = object
     arguments*: JsonNode
     call_id*: string
@@ -429,6 +433,18 @@ type
     of mk_notification:
       notification*: Notification
 
+proc turn_succeeded*(status: Option[TurnStatus]): bool {.inline.} =
+  status.isSome and status.get == ts_completed
+
+proc active_flags_are_waiting*(flags: set[ActiveFlag]): bool {.inline.} =
+  af_waiting_on_approval in flags or af_waiting_on_user_input in flags
+
+proc thread_status_is_terminal*(status: ThreadStatusKind): bool {.inline.} =
+  status in {tsk_system_error, tsk_not_loaded}
+
+proc retry_requested*(will_retry: Option[bool]): bool {.inline.} =
+  will_retry.isSome and will_retry.get
+
 proc new_notification_params*(): NotificationParams =
   NotificationParams(
     thread_id: Nullable[string](has_value: false),
@@ -615,6 +631,14 @@ proc serialize_dynamic_tool_call_response*(value: DynamicToolCallResponse): Json
   result["contentItems"] = newJArray()
   for item in value.content_items:
     result["contentItems"].add(serialize_dynamic_tool_content_item(item))
+
+proc serialize_user_input_response*(answers: openArray[UserInputAnswer]): JsonNode =
+  result = newJObject()
+  result["answers"] = newJObject()
+  for answer in answers:
+    result["answers"][answer.question_id] = newJObject()
+    result["answers"][answer.question_id]["answers"] = newJArray()
+    result["answers"][answer.question_id]["answers"].add(%answer.answer)
 
 proc parse_ask_for_approval(node: JsonNode): AskForApproval =
   case node.getStr:

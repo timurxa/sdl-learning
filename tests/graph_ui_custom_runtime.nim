@@ -58,23 +58,34 @@ let surface_data = clay_get_element_data(clay_id("graph_surface"))
 doAssert surface_data.found
 graph.set_graph_viewport(surface_data.bounding_box)
 
-doAssert graph.draw_list.items.len == 6
+doAssert graph.draw_list.items.len == 11
 doAssert graph.draw_list.items[0].kind == opaque_draw_quad
 doAssert graph.draw_list.items[1].kind == opaque_draw_triangle
 doAssert graph.draw_list.items[2].kind == opaque_draw_circle
 doAssert graph.draw_list.items[3].kind == opaque_draw_circle
 doAssert graph.draw_list.items[4].kind == opaque_draw_circle
 doAssert graph.draw_list.items[5].kind == opaque_draw_circle
+doAssert graph.draw_list.items[6].kind == opaque_draw_circle
+doAssert graph.draw_list.items[7].kind == opaque_draw_circle
+doAssert graph.draw_list.items[8].kind == opaque_draw_circle
+doAssert graph.draw_list.items[9].kind == opaque_draw_circle
+doAssert graph.draw_list.items[10].kind == opaque_draw_circle
 doAssert graph.draw_list.items[0].z_index == 0
 doAssert graph.draw_list.items[1].z_index == 0
 doAssert graph.draw_list.items[0].shape_data[0] == 120
 doAssert graph.draw_list.items[0].shape_data[2] == 132
 doAssert graph.draw_list.items[2].z_index == 10
 doAssert graph.draw_list.items[3].z_index == 10
-doAssert graph.draw_list.items[4].z_index == 11
+doAssert graph.draw_list.items[4].z_index == 10
 doAssert graph.draw_list.items[5].z_index == 11
+doAssert graph.draw_list.items[6].z_index == 11
+doAssert graph.draw_list.items[7].z_index == 11
+doAssert graph.draw_list.items[8].z_index == 12
+doAssert graph.draw_list.items[9].z_index == 12
+doAssert graph.draw_list.items[10].z_index == 12
 doAssert graph.draw_list.items[2].size.width == 32
 doAssert graph.draw_list.items[3].size.width == 26
+doAssert graph.draw_list.items[4].size.width == 24
 
 graph.handle_event(UiEvent(
   kind: ui_event_mouse_move,
@@ -100,16 +111,34 @@ element("root"):
     discard
 discard clay_end_layout(0)
 
-doAssert graph.draw_list.items.len == 7
+doAssert graph.draw_list.items.len == 12
 doAssert graph.draw_list.items[2].kind == opaque_draw_circle
 doAssert graph.draw_list.items[3].kind == opaque_draw_circle
 doAssert graph.draw_list.items[4].kind == opaque_draw_circle
+doAssert graph.draw_list.items[5].kind == opaque_draw_circle
+doAssert graph.draw_list.items[6].kind == opaque_draw_circle
+doAssert graph.draw_list.items[7].kind == opaque_draw_circle
+doAssert graph.draw_list.items[8].kind == opaque_draw_circle
+doAssert graph.draw_list.items[9].kind == opaque_draw_circle
+doAssert graph.draw_list.items[10].kind == opaque_draw_circle
+doAssert graph.draw_list.items[11].kind == opaque_draw_circle
 doAssert graph.draw_list.items[2].size.width == 40
 doAssert graph.draw_list.items[3].size.width == 32
 doAssert graph.draw_list.items[4].size.width == 26
+doAssert graph.draw_list.items[5].size.width == 24
+doAssert graph.draw_list.items[6].size.width == 32
+doAssert graph.draw_list.items[7].size.width == 26
+doAssert graph.draw_list.items[8].size.width == 24
 doAssert graph.draw_list.items[2].z_index == 10
 doAssert graph.draw_list.items[3].z_index == 10
 doAssert graph.draw_list.items[4].z_index == 10
+doAssert graph.draw_list.items[5].z_index == 10
+doAssert graph.draw_list.items[6].z_index == 11
+doAssert graph.draw_list.items[7].z_index == 11
+doAssert graph.draw_list.items[8].z_index == 11
+doAssert graph.draw_list.items[9].z_index == 12
+doAssert graph.draw_list.items[10].z_index == 12
+doAssert graph.draw_list.items[11].z_index == 12
 
 var custom_command_count: int
 for command in commands:

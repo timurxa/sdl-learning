@@ -109,7 +109,7 @@ A graph-creation node may mutate a canonical node only when:
 - the target is `pending`; and
 - the graph-creation node dominates the target in the effective graph.
 
-Running, completed, and failed nodes are immutable. This domination rule is the concurrency-control mechanism: graph-creation nodes may execute and commit concurrently because their editable regions cannot overlap.
+`running`, `awaiting_human_input`, `completed`, and `failed` nodes are immutable. This domination rule is the concurrency-control mechanism: graph-creation nodes may execute and commit concurrently because their editable regions cannot overlap.
 
 = Canonical node model
 
@@ -128,7 +128,7 @@ Every canonical node has the following logical shape:
     "instructions": "executor-facing instructions"
   },
   "reasoning_level": "straightforward | bounded | deep_reasoning",
-  "state": "pending | running | completed | failed"
+  "state": "pending | running | awaiting_human_input | completed | failed"
 }
 ```
 
@@ -267,10 +267,11 @@ A `human_input` node invokes no model. One node produces exactly one human respo
 The orchestrator:
 
 1. presents `execution_plan.instructions` exactly as the user-facing question;
-2. waits for one user response;
-3. creates the node's single runtime-generated output;
-4. writes the instructions first and the response verbatim beneath them;
-5. completes the node after the artifact exists.
+2. changes the node state from `pending` to `awaiting_human_input` once its dependencies are complete and the question is visible;
+3. waits for one user response;
+4. creates the node's single runtime-generated output;
+5. writes the instructions first and the response verbatim beneath them;
+6. completes the node after the artifact exists.
 
 The runtime-generated artifact uses a conventional path such as `response.txt` beneath the node's artifact directory and logically contains:
 
@@ -320,8 +321,11 @@ The canonical lifecycle is:
 
 ```text
 pending → running → completed
-                  ↘ failed
+      ↘ awaiting_human_input → completed
+        ↘ failed
 ```
+
+`awaiting_human_input` is a durable waiting state, not a second `pending` state. It means the human-input question has been presented and the node is waiting for its one response. A node in this state cannot be scheduled again, edited, or treated as runnable. A response transitions it to `completed` after the runtime-generated response artifact passes validation; an input or runtime failure transitions it to `failed`.
 
 The scheduler launches every runnable node concurrently. The orchestration layer defines no separate concurrency cap; provider, process, and execution-backend limits may constrain actual parallelism.
 

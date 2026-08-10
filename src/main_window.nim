@@ -1,4 +1,4 @@
-import std/[json, strutils, tables]
+import std/[json, options, strutils, tables]
 import clay
 import sdl
 import ui
@@ -98,9 +98,18 @@ type
     token_usage: string
     current_model: string
 
+  UserInputQuestions = object
+    question_ids: seq[string]
+    prompt: string
+
+  PendingUserInput = object
+    request_id: RequestId
+    question_ids: seq[string]
+
   GraphTab = ref object
     graph_view: GraphView
     node_conversations: Table[uint32, NodeConversation]
+    pending_user_inputs: Table[uint32, PendingUserInput]
     global_log_messages: seq[string]
     previous_selected_node_id: uint32
     previous_selected_node_valid: bool
@@ -119,6 +128,7 @@ type
 proc new_debug_graph_tab(): GraphTab =
   new(result)
   result.node_conversations = initTable[uint32, NodeConversation]()
+  result.pending_user_inputs = initTable[uint32, PendingUserInput]()
   result.graph_view.work_graph = new_work_graph()
   var layout_config = default_graph_layout_config()
   layout_config.layer_gap = 96
@@ -258,6 +268,53 @@ proc json_int(node: JsonNode; key: string): int =
   if node.kind == JObject and node.contains(key) and
       node[key].kind == JInt:
     return int(node[key].getInt)
+
+proc user_input_questions(payload: JsonNode): UserInputQuestions =
+  if payload.kind != JObject or not payload.contains("questions") or
+      payload["questions"].kind != JArray:
+    return
+  var prompts: seq[string] = @[]
+  var question_index = 0
+  for question in payload["questions"]:
+    if question.kind != JObject:
+      inc question_index
+      continue
+    let question_id = json_string(question, "id")
+    if question_id.len == 0:
+      continue
+    result.question_ids.add(question_id)
+    let header = json_string(question, "header")
+    let body = json_string(question, "question")
+    let prompt = if header.len > 0 and body.len > 0:
+      header & ": " & body
+    elif body.len > 0:
+      body
+    else:
+      header
+    if prompt.len > 0:
+      prompts.add($(question_index + 1) & ". " & prompt)
+    inc question_index
+  result.prompt = prompts.join("\n")
+
+proc parse_answers(input: PendingUserInput; content: string):
+    tuple[success: bool; answers: seq[UserInputAnswer]; error: string] =
+  let stripped = content.strip
+  if stripped.len == 0:
+    result.error = "INPUT RESPONSE CANNOT BE EMPTY"
+    return
+  let answer_values = if input.question_ids.len == 1:
+    @[stripped]
+  else:
+    stripped.splitLines()
+  if answer_values.len != input.question_ids.len:
+    result.error = "EXPECTS " & $input.question_ids.len &
+      " ANSWERS, ONE PER LINE"
+    return
+  for answer_index, question_id in input.question_ids:
+    result.answers.add(UserInputAnswer(
+      question_id: question_id,
+      answer: answer_values[answer_index]))
+  result.success = true
 
 proc json_text(node: JsonNode; key: string): string =
   if node.kind != JObject or not node.contains(key):
@@ -414,7 +471,8 @@ proc format_plan(payload: JsonNode): string =
 proc update_activity(conversation: var NodeConversation;
     event: CodexRuntimeEvent; payload: JsonNode;
     kind: ConversationActivityKind;
-    item: ConversationItemDescriptor; title = "") =
+    item: ConversationItemDescriptor; user_input: UserInputQuestions;
+    title = "") =
   let key = event.activity_key(kind)
   var index = conversation.find_activity(key)
   if index < 0:
@@ -489,7 +547,9 @@ proc update_activity(conversation: var NodeConversation;
     of sr_tool_user_input:
       entry.title = "Input requested"
       entry.activity_state = cas_waiting
-      entry.detail = "Tool requested user input"
+      entry.detail = if user_input.prompt.len > 0:
+        user_input.prompt else: "Tool requested user input"
+      entry.body = user_input.prompt
     of sr_command_execution_approval:
       entry.title = "Command approval requested"
       entry.activity_state = cas_waiting
@@ -513,6 +573,20 @@ proc finalize_activities(conversation: var NodeConversation;
       cas_error else: cas_complete
     conversation.messages[index].expanded = false
 
+proc apply_conversation_error(view: MainWindow; node_id: uint32;
+    prefix, message: string; close_thread = false; status_detail = "";
+    turn_id = "") =
+  view.graph_tab.pending_user_inputs.del(node_id)
+  var conversation = view.graph_tab.node_conversation(node_id)
+  if close_thread:
+    conversation.thread_requested = false
+  conversation.state = conversation_error
+  conversation.status_detail = status_detail
+  conversation.finalize_activities(turn_id, error_state = true)
+  conversation.messages.add(message_entry(conversation_system, prefix & message))
+  view.graph_tab.node_conversations[node_id] = conversation
+  view.graph_tab.scroll_conversation_to_end = true
+
 proc apply_conversation_event(view: MainWindow; event: CodexRuntimeEvent) =
   var conversation = view.graph_tab.node_conversation(event.node_id)
   case event.kind
@@ -524,13 +598,22 @@ proc apply_conversation_event(view: MainWindow; event: CodexRuntimeEvent) =
     conversation.state = conversation_ready
     conversation.status_detail.setLen(0)
   of cre_node_error:
-    conversation.finalize_activities(event.turn_id, true)
-    conversation.state = conversation_error
-    conversation.status_detail.setLen(0)
-    conversation.messages.add(message_entry(
-      conversation_system, "ERROR: " & event.text))
+    view.apply_conversation_error(
+      event.node_id, "ERROR: ", event.text, turn_id = event.turn_id)
+    return
   of cre_global_notification:
     let payload = event.event_payload
+    let user_input = if event.server_request_kind == sr_tool_user_input:
+      user_input_questions(payload)
+    else:
+      UserInputQuestions()
+    if event.server_request_kind == sr_tool_user_input:
+      if user_input.question_ids.len > 0:
+        let pending_input = PendingUserInput(
+          request_id: event.request_id_value,
+          question_ids: user_input.question_ids)
+        view.graph_tab.pending_user_inputs[event.node_id] = pending_input
+      conversation.state = conversation_working
     case event.notification_kind
     of nk_thread_started:
       conversation.state = conversation_ready
@@ -540,41 +623,27 @@ proc apply_conversation_event(view: MainWindow; event: CodexRuntimeEvent) =
       conversation.state = conversation_working
       conversation.status_detail.setLen(0)
     of nk_thread_status_changed:
-      let status = if payload.kind == JObject and payload.contains("status"):
-        json_string(payload["status"], "type")
-      else: ""
-      case status
-      of "idle":
-        conversation.state = conversation_ready
-        conversation.status_detail.setLen(0)
-      of "active":
-        conversation.state = conversation_working
-        var waiting = false
-        if payload["status"].kind == JObject and
-            payload["status"].contains("activeFlags") and
-            payload["status"]["activeFlags"].kind == JArray:
-          for flag in payload["status"]["activeFlags"]:
-            if flag.kind == JString and
-                flag.getStr in ["waitingOnApproval", "waitingOnUserInput"]:
-              waiting = true
-        conversation.status_detail = if waiting: "WAITING" else: "WORKING"
-      of "systemError", "notLoaded":
-        conversation.state = conversation_error
-        conversation.status_detail = if status == "systemError":
-          "SYSTEM ERROR" else: "NOT LOADED"
-        conversation.finalize_activities(error_state = true)
-      else:
-        discard
+      if event.thread_status.isSome:
+        case event.thread_status.get
+        of tsk_idle:
+          conversation.state = conversation_ready
+          conversation.status_detail.setLen(0)
+        of tsk_active:
+          conversation.state = conversation_working
+          let waiting = event.active_flags.active_flags_are_waiting
+          conversation.status_detail = if waiting: "WAITING" else: "WORKING"
+        of tsk_system_error, tsk_not_loaded:
+          view.graph_tab.pending_user_inputs.del(event.node_id)
+          conversation.state = conversation_error
+          conversation.status_detail = if event.thread_status.get == tsk_system_error:
+            "SYSTEM ERROR" else: "NOT LOADED"
+          conversation.finalize_activities(error_state = true)
+        of tsk_unknown:
+          discard
     of nk_error:
-      let will_retry = payload.kind == JObject and payload.contains("willRetry") and
-        payload["willRetry"].kind == JBool and payload["willRetry"].getBool
-      if will_retry:
+      if event.will_retry.retry_requested:
         conversation.state = conversation_working
         conversation.status_detail = "RETRYING"
-      else:
-        conversation.state = conversation_error
-        conversation.messages.add(message_entry(
-          conversation_system, "ERROR: " & event.text))
     else:
       let is_item_lifecycle = event.notification_kind in {
         nk_item_started, nk_item_completed}
@@ -592,27 +661,20 @@ proc apply_conversation_event(view: MainWindow; event: CodexRuntimeEvent) =
           item.kind == "agentMessage":
         discard
       else:
-        conversation.update_activity(event, payload, activity_kind, item)
+        conversation.update_activity(
+          event, payload, activity_kind, item, user_input)
       if event.server_request_kind != sr_unknown:
-        conversation.status_detail = "WAITING"
+        conversation.status_detail = if event.server_request_kind == sr_tool_user_input:
+          "WAITING FOR INPUT" else: "WAITING"
       elif event.notification_kind == nk_model_rerouted:
         conversation.current_model = json_string(payload, "toModel")
-  of cre_thread_ready, cre_thread_error, cre_tool_response_sent,
-      cre_runtime_error, cre_runtime_closed:
+  of cre_tool_response_sent:
+    if event.server_request_kind == sr_tool_user_input:
+      view.graph_tab.pending_user_inputs.del(event.node_id)
+  of cre_thread_ready, cre_thread_error, cre_runtime_error,
+      cre_runtime_closed:
     discard
   view.graph_tab.node_conversations[event.node_id] = conversation
-  view.graph_tab.scroll_conversation_to_end = true
-
-proc apply_conversation_error(view: MainWindow; node_id: uint32;
-    prefix, message: string; close_thread = false) =
-  var conversation = view.graph_tab.node_conversation(node_id)
-  if close_thread:
-    conversation.thread_requested = false
-  conversation.state = conversation_error
-  conversation.status_detail.setLen(0)
-  conversation.finalize_activities(error_state = true)
-  conversation.messages.add(message_entry(conversation_system, prefix & message))
-  view.graph_tab.node_conversations[node_id] = conversation
   view.graph_tab.scroll_conversation_to_end = true
 
 proc apply_codex_event(view: MainWindow; event: CodexRuntimeEvent) =
@@ -624,7 +686,8 @@ proc apply_codex_event(view: MainWindow; event: CodexRuntimeEvent) =
     conversation.state = conversation_ready
     view.graph_tab.node_conversations[event.node_id] = conversation
   of cre_tool_response_sent:
-    discard
+    if conversation_event:
+      view.apply_conversation_event(event)
   of cre_thread_error:
     view.apply_conversation_error(
       event.node_id, "THREAD ERROR: ", event.text, close_thread = true)
@@ -642,13 +705,24 @@ proc apply_codex_event(view: MainWindow; event: CodexRuntimeEvent) =
   of cre_runtime_error:
     view.graph_tab.add_global_message("RUNTIME ERROR: " & event.text)
   of cre_runtime_closed:
+    view.codex_runtime_closed = true
+    var active_node_ids: seq[uint32] = @[]
+    for node_id, conversation in view.graph_tab.node_conversations:
+      if conversation.state in {conversation_starting, conversation_working}:
+        active_node_ids.add(node_id)
+    for node_id in active_node_ids:
+      view.apply_conversation_error(
+        node_id,
+        "ERROR: ",
+        "CODEX RUNTIME CLOSED",
+        close_thread = true,
+        status_detail = "RUNTIME CLOSED")
+    view.graph_tab.pending_user_inputs.clear()
     view.graph_tab.add_global_message("CODEX RUNTIME CLOSED")
 
 proc poll_codex_events(view: MainWindow) =
   var event: CodexRuntimeEvent
   while view.codex_bridge.try_receive(event):
-    if event.kind == cre_runtime_closed:
-      view.codex_runtime_closed = true
     view.graph_tab.graph_view.work_graph.handle_codex_event(
       view.codex_bridge, event)
     view.apply_codex_event(event)
@@ -793,14 +867,37 @@ proc apply_ui_actions(view: MainWindow) =
       if not view.graph_tab.graph_view.selected_node_valid:
         continue
       let node_id = view.graph_tab.graph_view.selected_node_id
-      if not view.graph_tab.graph_view.work_graph.node_is_running(node_id):
+      let graph = view.graph_tab.graph_view
+      var submitted_user_input = false
+      if view.graph_tab.pending_user_inputs.hasKey(node_id):
+        if not graph.work_graph.node_can_accept_user_input(node_id):
+          view.graph_tab.add_global_message(
+            "NODE " & $node_id & " IS NOT WAITING FOR INPUT")
+          continue
+        let pending_input = view.graph_tab.pending_user_inputs[node_id]
+        let parsed_answers = pending_input.parse_answers(content)
+        if not parsed_answers.success:
+          view.graph_tab.add_global_message(
+            "NODE " & $node_id & " " & parsed_answers.error)
+          continue
+        if not view.codex_bridge.reply_user_input(
+            pending_input.request_id, node_id, parsed_answers.answers):
+          view.graph_tab.add_global_message(
+            "NODE " & $node_id & " INPUT RESPONSE FAILED")
+          continue
+        submitted_user_input = true
+      elif view.graph_tab.graph_view.work_graph.answer_human_input(
+          node_id, content.strip):
+        submitted_user_input = true
+      elif not graph.work_graph.node_is_running(node_id):
         view.graph_tab.add_global_message(
           "NODE " & $node_id & " IS NOT RUNNING")
         continue
       let message = content.strip
       view.graph_tab.add_node_message(node_id, conversation_user, message)
       view.graph_tab.scroll_conversation_to_end = true
-      view.codex_bridge.send_node_message(node_id, message)
+      if not submitted_user_input:
+        view.codex_bridge.send_node_message(node_id, message)
       view.ui_state.clear_text_field(graph_conversation_input_id)
 
 proc sync_selected_node(view: MainWindow) =

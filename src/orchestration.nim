@@ -1,3 +1,4 @@
+import std/[options, strutils]
 import codex_bridge
 import codex_json
 
@@ -9,10 +10,12 @@ type
 
   ExecutionPlan* = object
     `type`*: ExecutionPlanType
+    instructions*: string
 
   NodeState* = enum
     pending
     running
+    awaiting_human_input
     completed
     failed
 
@@ -41,7 +44,9 @@ proc new_work_graph*(): WorkGraph =
       id: 2,
       wait_for: @[1],
       state: pending,
-      execution_plan: ExecutionPlan(`type`: human_input))
+      execution_plan: ExecutionPlan(
+        `type`: human_input,
+        instructions: "What should happen next?"))
   ])
 
 proc node_index(graph: WorkGraph; node_id: uint32): int =
@@ -60,12 +65,18 @@ proc node_runnable(graph: WorkGraph; node: WorkNode): bool =
       return false
   true
 
+proc node_state_is_active(state: NodeState): bool {.inline.} =
+  state in {running, awaiting_human_input}
+
 proc runnable_node_ids*(graph: WorkGraph): seq[uint32] =
   for node in graph.nodes:
     if graph.node_runnable(node):
       result.add(node.id)
 
 proc node_prompt(node: WorkNode): string =
+  if node.execution_plan.`type` == human_input and
+      node.execution_plan.instructions.len > 0:
+    return node.execution_plan.instructions
   "Your execution type is " & $node.execution_plan.`type` & ". Do nothing."
 
 proc log_node_failure(graph: var WorkGraph; node_id: uint32; reason: string) =
@@ -76,7 +87,8 @@ proc fail_node*(graph: var WorkGraph; node_id: uint32; reason: string): bool =
   if index < 0:
     graph.log_node_failure(node_id, reason)
     return false
-  let can_fail = graph.nodes[index].state in {pending, running}
+  let can_fail = graph.nodes[index].state == pending or
+    graph.nodes[index].state.node_state_is_active
   if can_fail:
     graph.nodes[index].state = failed
   graph.log_node_failure(node_id, reason)
@@ -84,7 +96,7 @@ proc fail_node*(graph: var WorkGraph; node_id: uint32; reason: string): bool =
 
 proc complete_node*(graph: var WorkGraph; node_id: uint32): bool =
   let index = graph.node_index(node_id)
-  if index < 0 or graph.nodes[index].state != running:
+  if index < 0 or not graph.nodes[index].state.node_state_is_active:
     return false
   graph.nodes[index].state = completed
   true
@@ -92,6 +104,25 @@ proc complete_node*(graph: var WorkGraph; node_id: uint32): bool =
 proc node_is_running*(graph: WorkGraph; node_id: uint32): bool =
   let index = graph.node_index(node_id)
   index >= 0 and graph.nodes[index].state == running
+
+proc node_can_accept_user_input*(graph: WorkGraph; node_id: uint32): bool =
+  let index = graph.node_index(node_id)
+  index >= 0 and graph.nodes[index].state.node_state_is_active
+
+proc mark_awaiting_human_input*(graph: var WorkGraph; node_id: uint32): bool =
+  let index = graph.node_index(node_id)
+  if index < 0 or graph.nodes[index].state notin {pending, running}:
+    return false
+  graph.nodes[index].state = awaiting_human_input
+  true
+
+proc answer_human_input*(graph: var WorkGraph; node_id: uint32;
+    answer: string): bool =
+  let index = graph.node_index(node_id)
+  if index < 0 or graph.nodes[index].execution_plan.`type` != human_input or
+      graph.nodes[index].state != awaiting_human_input or answer.strip.len == 0:
+    return false
+  graph.complete_node(node_id)
 
 proc drain_outgoing_messages*(graph: var WorkGraph): seq[WorkGraphMessage] =
   result = graph.outgoing_messages
@@ -110,13 +141,18 @@ proc send_work_graph_message(graph: var WorkGraph; bridge: CodexBridge;
     false
 
 proc start_available_nodes*(graph: var WorkGraph; bridge: CodexBridge) =
-  if bridge == nil:
-    return
   for index in 0 ..< graph.nodes.len:
     if not graph.node_runnable(graph.nodes[index]):
       continue
     let node_id = graph.nodes[index].id
     let prompt = graph.nodes[index].node_prompt()
+    if graph.nodes[index].execution_plan.`type` == human_input:
+      if graph.mark_awaiting_human_input(node_id):
+        graph.outgoing_messages.add(WorkGraphMessage(
+          node_id: node_id, text: prompt))
+      continue
+    if bridge == nil:
+      continue
     graph.nodes[index].state = running
     discard graph.send_work_graph_message(bridge, node_id, prompt)
 
@@ -152,16 +188,29 @@ proc handle_codex_event*(graph: var WorkGraph; bridge: CodexBridge;
     event: CodexRuntimeEvent) =
   case event.kind
   of cre_global_notification:
-    if event.server_request_kind == sr_tool_call:
+    if event.notification_kind == nk_thread_status_changed and
+        event.thread_status.isSome and
+        event.thread_status.get.thread_status_is_terminal:
+      let reason = if event.thread_status.get == tsk_system_error:
+        "Codex thread system error" else: "Codex thread not loaded"
+      discard graph.fail_node(event.node_id, reason)
+    elif event.server_request_kind == sr_tool_user_input:
+      discard graph.mark_awaiting_human_input(event.node_id)
+    elif event.server_request_kind == sr_tool_call:
       graph.handle_finish_node_call(bridge, event)
-  of cre_turn_completed, cre_tool_response_sent:
+  of cre_turn_completed:
     discard graph.complete_node(event.node_id)
+  of cre_tool_response_sent:
+    if event.server_request_kind != sr_tool_user_input:
+      discard graph.complete_node(event.node_id)
   of cre_thread_error, cre_node_error:
     discard graph.fail_node(event.node_id, event.text)
   of cre_runtime_closed:
-    for node in graph.nodes.mitems:
-      if node.state == running:
-        node.state = failed
-        graph.log_node_failure(node.id, "Codex runtime closed")
+    var active_node_ids: seq[uint32] = @[]
+    for node in graph.nodes:
+      if node.state.node_state_is_active:
+        active_node_ids.add(node.id)
+    for node_id in active_node_ids:
+      discard graph.fail_node(node_id, "Codex runtime closed")
   else:
     discard

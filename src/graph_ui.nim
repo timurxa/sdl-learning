@@ -90,6 +90,7 @@ type
     panel_valid: bool
     pointer_position: ClayVector2
     pointer_valid: bool
+    animation_time: float32
     layout_solver*: GraphLayoutSolver
 
 const
@@ -104,6 +105,12 @@ const
   graph_panel_host_z_index = 32766'i16
   graph_panel_z_index = 32767'i16
   work_node_size = 32
+  graph_node_separator_width = 1'f32
+  graph_node_spinner_dot_count = 3
+  graph_node_spinner_dot_diameter = 3'f32
+  graph_node_spinner_orbit_gap = 3'f32
+  graph_node_spinner_period = 1.2'f32
+  graph_tau = 6.283185307179586'f32
 
 proc default_graph_layout_config*(): GraphLayoutConfig =
   GraphLayoutConfig(
@@ -774,6 +781,9 @@ proc begin_graph_layout*(graph: var GraphView;
     graph.work_graph, config)
 
 proc step_graph_layout*(graph: var GraphView; delta_time: float32): bool =
+  graph.animation_time += max(delta_time, 0'f32)
+  while graph.animation_time >= graph_node_spinner_period:
+    graph.animation_time -= graph_node_spinner_period
   graph.layout_solver.step_graph_layout(delta_time)
 
 proc ensure_graph_canvas_state(graph: var GraphView) {.inline.} =
@@ -1078,18 +1088,47 @@ proc node_state_color(state: NodeState): ClayColor =
   case state
   of pending: rgba(20, 18, 15, 255)
   of running: rgba(70, 145, 255, 255)
+  of awaiting_human_input: rgba(255, 160, 64, 255)
   of completed: rgba(83, 220, 169, 255)
   of failed: rgba(255, 103, 174, 255)
 
+proc add_running_spinner_draw_items(graph: GraphView;
+    geometry: GraphNodeGeometry; node_z_index: int16) =
+  let center = vector2(
+    geometry.circle_origin.x + geometry.circle_diameter / 2'f32,
+    geometry.circle_origin.y + geometry.circle_diameter / 2'f32)
+  let orbit_radius = geometry.circle_diameter / 2'f32 +
+    graph_node_spinner_orbit_gap * graph.zoom
+  let dot_diameter = max(
+    graph_node_spinner_dot_diameter * graph.zoom, 2'f32)
+  let phase = graph.animation_time / graph_node_spinner_period * graph_tau
+  for dot_index in 0 ..< graph_node_spinner_dot_count:
+    let angle = phase - float32(dot_index) * graph_tau /
+      float32(graph_node_spinner_dot_count)
+    let dot_center = vector2(
+      center.x + cos(angle) * orbit_radius,
+      center.y + sin(angle) * orbit_radius)
+    graph.draw_list.add_opaque_circle(
+      vector2(
+        dot_center.x - dot_diameter / 2'f32,
+        dot_center.y - dot_diameter / 2'f32),
+      dot_diameter,
+      node_state_color(running),
+      node_z_index + 1)
+
 proc add_graph_circle_draw_items(graph: GraphView; geometry: GraphNodeGeometry;
-    size: ClayDimensions; inner_color, border_color: ClayColor;
+    inner_color: ClayColor; state: NodeState;
     highlighted: bool; node_z_index: int16) =
-  let inner_circle_diameter_world = max(
-    min(size.width, size.height) - graph_node_border_width * 2'f32,
-    0'f32)
+  let border_color = node_state_color(state)
+  let border_width = max(graph_node_border_width * graph.zoom, 1'f32)
+  let separator_width = max(graph_node_separator_width * graph.zoom, 1'f32)
+  let separator_diameter = max(
+    geometry.circle_diameter - border_width * 2'f32, 0'f32)
+  let inner_circle_diameter = max(
+    separator_diameter - separator_width * 2'f32, 0'f32)
   let inner_circle_origin = vector2(
-    geometry.circle_origin.x + graph_node_border_width * graph.zoom,
-    geometry.circle_origin.y + graph_node_border_width * graph.zoom)
+    geometry.circle_origin.x + border_width + separator_width,
+    geometry.circle_origin.y + border_width + separator_width)
   if highlighted:
     let highlight_origin = vector2(
       geometry.circle_origin.x - graph_node_highlight_width * graph.zoom,
@@ -1104,19 +1143,28 @@ proc add_graph_circle_draw_items(graph: GraphView; geometry: GraphNodeGeometry;
     geometry.circle_diameter,
     border_color,
     node_z_index)
-  if inner_circle_diameter_world > 0:
+  if separator_diameter > 0:
+    graph.draw_list.add_opaque_circle(
+      vector2(
+        geometry.circle_origin.x + border_width,
+        geometry.circle_origin.y + border_width),
+      separator_diameter,
+      rgba(20, 18, 15, 255),
+      node_z_index)
+  if inner_circle_diameter > 0:
     graph.draw_list.add_opaque_circle(
       inner_circle_origin,
-      inner_circle_diameter_world * graph.zoom,
+      inner_circle_diameter,
       inner_color,
       node_z_index)
+  if state == running:
+    graph.add_running_spinner_draw_items(geometry, node_z_index)
 
 proc add_work_node_draw_items(graph: GraphView; node: WorkNode) =
   graph.add_graph_circle_draw_items(
     graph.work_node_geometry(node),
-    dimensions(work_node_size, work_node_size),
     execution_plan_color(node.execution_plan.`type`),
-    node_state_color(node.state),
+    node.state,
     graph.hovered_node_valid and graph.hovered_node_id == node.id,
     graph.work_node_z_index(node.id))
 

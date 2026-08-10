@@ -173,20 +173,14 @@ proc server_request_identity*(request: ServerRequest): ServerRequestIdentity =
 proc server_request_thread_id*(request: ServerRequest): Option[string] =
   request.server_request_identity.thread_id
 
-proc server_request_turn_id*(request: ServerRequest): Option[string] =
-  request.server_request_identity.turn_id
-
-proc server_request_item_id*(request: ServerRequest): Option[string] =
-  request.server_request_identity.item_id
-
 proc apply_server_request*(state: var RuntimeState; request: ServerRequest) =
   let key = request_id_key(request.id)
   state.server_requests[key] = request
 
-  let identity = server_request_identity(request)
-  if identity.thread_id.isNone:
+  let thread_id = server_request_thread_id(request)
+  if thread_id.isNone:
     return
-  let agent_id = find_agent_for_thread(state, identity.thread_id.get)
+  let agent_id = find_agent_for_thread(state, thread_id.get)
   if agent_id.isNone:
     return
   var agent = state.agents[agent_id.get]
@@ -201,15 +195,15 @@ proc remove_server_request*(state: var RuntimeState; id: RequestId): Option[Serv
   let request = state.server_requests[key]
   state.server_requests.del(key)
 
-  let identity = server_request_identity(request)
-  if identity.thread_id.isSome:
-    let agent_id = find_agent_for_thread(state, identity.thread_id.get)
+  let thread_id = server_request_thread_id(request)
+  if thread_id.isSome:
+    let agent_id = find_agent_for_thread(state, thread_id.get)
     if agent_id.isSome:
       var still_waiting = false
       for pending in state.server_requests.values:
-        let pending_identity = server_request_identity(pending)
-        if pending_identity.thread_id.isSome and
-            pending_identity.thread_id.get == identity.thread_id.get:
+        let pending_thread_id = server_request_thread_id(pending)
+        if pending_thread_id.isSome and
+            pending_thread_id.get == thread_id.get:
           still_waiting = true
           break
       if not still_waiting:
@@ -218,6 +212,30 @@ proc remove_server_request*(state: var RuntimeState; id: RequestId): Option[Serv
           agent.state = as_working
           state.agents[agent_id.get] = agent
   some(request)
+
+proc clear_server_requests_for_thread(state: var RuntimeState;
+    thread_id: string) =
+  var request_keys: seq[string] = @[]
+  for key, request in state.server_requests:
+    let request_thread_id = server_request_thread_id(request)
+    if request_thread_id.isSome and request_thread_id.get == thread_id:
+      request_keys.add(key)
+  for key in request_keys:
+    state.server_requests.del(key)
+
+proc notification_ends_server_requests(notification: Notification): bool =
+  case notification.kind
+  of nk_thread_status_changed:
+    notification.params.thread_status.isSome and
+      notification.params.thread_status.get.thread_status_is_terminal
+  of nk_thread_closed:
+    true
+  of nk_turn_completed:
+    not notification.params.turn_status.turn_succeeded
+  of nk_error:
+    not notification.params.will_retry.retry_requested
+  else:
+    false
 
 proc apply_notification*(state: var RuntimeState; notification: Notification) =
   if notification.kind notin {
@@ -233,6 +251,8 @@ proc apply_notification*(state: var RuntimeState; notification: Notification) =
   if not params.thread_id.has_value:
     return
   let thread_id = params.thread_id.value
+  if notification.notification_ends_server_requests:
+    state.clear_server_requests_for_thread(thread_id)
   let agent_id = find_agent_for_thread(state, thread_id)
   if agent_id.isNone:
     return
@@ -248,19 +268,20 @@ proc apply_notification*(state: var RuntimeState; notification: Notification) =
       agent.turn_id = params.turn_id
     agent.state = as_working
   of nk_turn_completed:
+    let turn_succeeded = params.turn_status.turn_succeeded
     if params.turn_id.isSome:
       agent.turn_id = none(string)
       let request_key = request_for_turn(state, params.turn_id.get)
       if request_key.isSome:
         var outgoing = state.requests[request_key.get]
-        if params.turn_status.isSome and params.turn_status.get == ts_failed:
+        if not turn_succeeded:
           outgoing.state = rs_failed
           if params.error_message.isSome:
             outgoing.error = params.error_message
         else:
           outgoing.state = rs_completed
         state.requests[request_key.get] = outgoing
-    if params.turn_status.isSome and params.turn_status.get == ts_failed:
+    if not turn_succeeded:
       if params.error_message.isSome:
         set_agent_error(agent, params.error_message.get)
       else:
@@ -273,8 +294,7 @@ proc apply_notification*(state: var RuntimeState; notification: Notification) =
       of tsk_idle:
         agent.state = as_idle
       of tsk_active:
-        if af_waiting_on_approval in params.active_flags or
-            af_waiting_on_user_input in params.active_flags:
+        if params.active_flags.active_flags_are_waiting:
           agent.state = as_waiting
         else:
           agent.state = as_working
@@ -288,7 +308,7 @@ proc apply_notification*(state: var RuntimeState; notification: Notification) =
     agent.state = as_closed
     agent.turn_id = none(string)
   of nk_error:
-    if params.will_retry.isSome and params.will_retry.get:
+    if params.will_retry.retry_requested:
       agent.state = as_working
       clear_agent_error(agent)
     elif params.error_message.isSome:
@@ -374,7 +394,7 @@ proc handle_message*(runtime: ptr CodexRuntime; message: Message) =
     discard
   of mk_server_request:
     apply_server_request(runtime.state, message.server_request)
-    if message.server_request.kind != sr_tool_call:
+    if message.server_request.kind notin {sr_tool_call, sr_tool_user_input}:
       reject_server_request(runtime, message.server_request.id)
   of mk_server_response:
     let key = request_id_key(message.server_response.id)
