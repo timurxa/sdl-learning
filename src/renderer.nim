@@ -197,6 +197,18 @@ var active_renderer: Renderer
 proc new_renderer*(): Renderer =
   new(result)
 
+proc upload_buffer_region(copy_pass: ptr SdlGpuCopyPass;
+    transfer_buffer: ptr SdlGpuTransferBuffer; transfer_offset, size: uint32;
+    buffer: ptr SdlGpuBuffer) =
+  var source = SdlGpuTransferBufferLocation(
+    transfer_buffer: transfer_buffer,
+    offset: transfer_offset)
+  var destination = SdlGpuBufferRegion(
+    buffer: buffer,
+    offset: 0,
+    size: size)
+  upload_to_gpu_buffer(copy_pass, addr source, addr destination, true)
+
 proc new_opaque_draw_list*(): OpaqueDrawList =
   new(result)
 
@@ -1656,55 +1668,20 @@ proc render_frame*(renderer: Renderer; clay_context: ptr ClayContext;
   upload_glyph_atlas_regions(copy_pass)
 
   if not quad_vertex_buffer_initialized:
-    var quad_source = SdlGpuTransferBufferLocation(
-      transfer_buffer: instance_transfer_buffer,
-      offset: 0,
-    )
-    var quad_destination = SdlGpuBufferRegion(
-      buffer: quad_vertex_buffer,
-      offset: 0,
-      size: uint32(sizeof(quad_vertices)),
-    )
-    upload_to_gpu_buffer(
-      copy_pass,
-      addr quad_source,
-      addr quad_destination,
-      true,
-    )
+    upload_buffer_region(
+      copy_pass, instance_transfer_buffer, 0,
+      uint32(sizeof(quad_vertices)), quad_vertex_buffer)
 
   if instance_data.len > 0:
-    var instance_source = SdlGpuTransferBufferLocation(
-      transfer_buffer: instance_transfer_buffer,
-      offset: uint32(instance_transfer_offset),
-    )
-    var instance_destination = SdlGpuBufferRegion(
-      buffer: instance_buffer,
-      offset: 0,
-      size: uint32(instance_data.len * sizeof(SpriteInstance)),
-    )
-    upload_to_gpu_buffer(
-      copy_pass,
-      addr instance_source,
-      addr instance_destination,
-      true,
-    )
+    upload_buffer_region(
+      copy_pass, instance_transfer_buffer,
+      uint32(instance_transfer_offset),
+      uint32(instance_data.len * sizeof(SpriteInstance)), instance_buffer)
 
   if text_instance_data.len > 0:
-    var text_instance_source = SdlGpuTransferBufferLocation(
-      transfer_buffer: text_instance_transfer_buffer,
-      offset: 0,
-    )
-    var text_instance_destination = SdlGpuBufferRegion(
-      buffer: text_instance_buffer,
-      offset: 0,
-      size: uint32(text_instance_data.len * sizeof(TextInstance)),
-    )
-    upload_to_gpu_buffer(
-      copy_pass,
-      addr text_instance_source,
-      addr text_instance_destination,
-      true,
-    )
+    upload_buffer_region(
+      copy_pass, text_instance_transfer_buffer, 0,
+      uint32(text_instance_data.len * sizeof(TextInstance)), text_instance_buffer)
 
   end_gpu_copy_pass(copy_pass)
 

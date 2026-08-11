@@ -122,7 +122,8 @@ proc default_graph_layout_config*(): GraphLayoutConfig =
 proc work_node_dimensions(): ClayDimensions {.inline.} =
   dimensions(work_node_size, work_node_size)
 
-proc valid_graph_float(value: float32): bool {.inline.}
+proc valid_graph_float(value: float32): bool {.inline.} =
+  value == value and value >= -high(float32) and value <= high(float32)
 
 proc graph_layout_edge_key(edge: GraphLayoutEdge): uint64 {.inline.} =
   (uint64(edge.start_node_id) shl 32) or uint64(edge.end_node_id)
@@ -524,16 +525,16 @@ proc graph_layout_positions_close(solver: GraphLayoutSolver): bool =
       return false
   true
 
+proc normalize_graph_float(value, fallback: float32): float32 =
+  if value < 0 or not valid_graph_float(value): fallback else: value
+
 proc normalize_graph_layout_config(config: GraphLayoutConfig): GraphLayoutConfig =
   let defaults = default_graph_layout_config()
   result = config
-  if result.layer_gap < 0 or not valid_graph_float(result.layer_gap):
-    result.layer_gap = defaults.layer_gap
-  if result.node_gap < 0 or not valid_graph_float(result.node_gap):
-    result.node_gap = defaults.node_gap
-  if result.transition_seconds < 0 or
-      not valid_graph_float(result.transition_seconds):
-    result.transition_seconds = defaults.transition_seconds
+  result.layer_gap = normalize_graph_float(result.layer_gap, defaults.layer_gap)
+  result.node_gap = normalize_graph_float(result.node_gap, defaults.node_gap)
+  result.transition_seconds = normalize_graph_float(
+    result.transition_seconds, defaults.transition_seconds)
   if result.crossing_sweeps < 1:
     result.crossing_sweeps = defaults.crossing_sweeps
 
@@ -942,9 +943,6 @@ proc clear_graph_pointer*(graph: var GraphView) =
   graph.pan_active = false
   graph.pointer_valid = false
   graph.refresh_graph_hover()
-
-proc valid_graph_float(value: float32): bool {.inline.} =
-  value == value and value >= -high(float32) and value <= high(float32)
 
 proc cancel_pan*(graph: var GraphView) {.inline.} =
   graph.pan_active = false

@@ -83,6 +83,23 @@ proc set_agent_error(agent: var Agent; message: string) =
 proc clear_agent_error(agent: var Agent) =
   agent.last_error = NullableOption[string](state: nos_null)
 
+proc mark_thread_started(agent: var Agent) =
+  if agent.state == as_starting:
+    agent.state = as_idle
+
+proc mark_turn_started(agent: var Agent; turn_id: Option[string]) =
+  if turn_id.isSome:
+    agent.turn_id = turn_id
+  agent.state = as_working
+
+proc mark_turn_completed(agent: var Agent; succeeded: bool;
+    error_message: Option[string]) =
+  agent.turn_id = none(string)
+  if succeeded:
+    agent.state = as_idle
+  else:
+    set_agent_error(agent, error_message.get("turn failed"))
+
 proc apply_success*(state: var RuntimeState; success: Success) =
   let key = request_id_key(success.id)
   if not state.requests.hasKey(key):
@@ -90,31 +107,23 @@ proc apply_success*(state: var RuntimeState; success: Success) =
 
   var outgoing = state.requests[key]
   outgoing.result = some(success.raw_result)
-  outgoing.state = rs_completed
-
-  case outgoing.request.kind:
-  of mk_initialize:
-    discard
-  of mk_thread_start:
-    if outgoing.agent_id.isSome:
-      let agent_id = outgoing.agent_id.get
-      if state.agents.hasKey(agent_id):
-        var agent = state.agents[agent_id]
-        agent.thread_id = nullable_string(success.result.thread_id)
-        agent.state = as_idle
-        clear_agent_error(agent)
-        state.agents[agent_id] = agent
-  of mk_turn_start:
-    outgoing.state = rs_accepted
+  let is_turn_start = outgoing.request.kind == mk_turn_start
+  outgoing.state = if is_turn_start: rs_accepted else: rs_completed
+  if is_turn_start:
     outgoing.turn_id = some(success.result.turn_id)
-    if outgoing.agent_id.isSome:
-      let agent_id = outgoing.agent_id.get
-      if state.agents.hasKey(agent_id):
-        var agent = state.agents[agent_id]
-        agent.turn_id = some(success.result.turn_id)
-        agent.state = as_working
+
+  if outgoing.agent_id.isSome:
+    let agent_id = outgoing.agent_id.get
+    if state.agents.hasKey(agent_id):
+      var agent = state.agents[agent_id]
+      if outgoing.request.kind == mk_thread_start:
+        agent.thread_id = nullable_string(success.result.thread_id)
+        agent.mark_thread_started
         clear_agent_error(agent)
-        state.agents[agent_id] = agent
+      elif is_turn_start:
+        agent.mark_turn_started(some(success.result.turn_id))
+        clear_agent_error(agent)
+      state.agents[agent_id] = agent
 
   state.requests[key] = outgoing
 
@@ -184,10 +193,11 @@ proc apply_server_request*(state: var RuntimeState; request: ServerRequest) =
   let agent_id = find_agent_for_thread(state, thread_id.get)
   if agent_id.isNone:
     return
-  var agent = state.agents[agent_id.get]
+  let agent_id_value = agent_id.get
+  var agent = state.agents[agent_id_value]
   if agent.state != as_closed and agent.state != as_error:
     agent.state = as_waiting
-    state.agents[agent_id.get] = agent
+    state.agents[agent_id_value] = agent
 
 proc remove_server_request*(state: var RuntimeState; id: RequestId): Option[ServerRequest] =
   let key = request_id_key(id)
@@ -198,20 +208,22 @@ proc remove_server_request*(state: var RuntimeState; id: RequestId): Option[Serv
 
   let thread_id = server_request_thread_id(request)
   if thread_id.isSome:
-    let agent_id = find_agent_for_thread(state, thread_id.get)
+    let thread_id_value = thread_id.get
+    let agent_id = find_agent_for_thread(state, thread_id_value)
     if agent_id.isSome:
+      let agent_id_value = agent_id.get
       var still_waiting = false
       for pending in state.server_requests.values:
         let pending_thread_id = server_request_thread_id(pending)
         if pending_thread_id.isSome and
-            pending_thread_id.get == thread_id.get:
+            pending_thread_id.get == thread_id_value:
           still_waiting = true
           break
       if not still_waiting:
-        var agent = state.agents[agent_id.get]
+        var agent = state.agents[agent_id_value]
         if agent.state == as_waiting:
           agent.state = as_working
-          state.agents[agent_id.get] = agent
+          state.agents[agent_id_value] = agent
   some(request)
 
 proc clear_server_requests_for_thread(state: var RuntimeState;
@@ -262,33 +274,21 @@ proc apply_notification*(state: var RuntimeState; notification: Notification) =
 
   case notification.kind:
   of nk_thread_started:
-    if agent.state == as_starting:
-      agent.state = as_idle
+    agent.mark_thread_started
   of nk_turn_started:
-    if params.turn_id.isSome:
-      agent.turn_id = params.turn_id
-    agent.state = as_working
+    agent.mark_turn_started(params.turn_id)
   of nk_turn_completed:
     let turn_succeeded = params.turn_status.turn_succeeded
     if params.turn_id.isSome:
-      agent.turn_id = none(string)
       let request_key = request_for_turn(state, params.turn_id.get)
       if request_key.isSome:
-        var outgoing = state.requests[request_key.get]
-        if not turn_succeeded:
-          outgoing.state = rs_failed
-          if params.error_message.isSome:
-            outgoing.error = params.error_message
-        else:
-          outgoing.state = rs_completed
-        state.requests[request_key.get] = outgoing
-    if not turn_succeeded:
-      if params.error_message.isSome:
-        set_agent_error(agent, params.error_message.get)
-      else:
-        set_agent_error(agent, "turn failed")
-    else:
-      agent.state = as_idle
+        let request_key_value = request_key.get
+        var outgoing = state.requests[request_key_value]
+        outgoing.state = if turn_succeeded: rs_completed else: rs_failed
+        if not turn_succeeded and params.error_message.isSome:
+          outgoing.error = params.error_message
+        state.requests[request_key_value] = outgoing
+    agent.mark_turn_completed(turn_succeeded, params.error_message)
   of nk_thread_status_changed:
     if params.thread_status.isSome:
       case params.thread_status.get:
@@ -369,10 +369,11 @@ proc apply_dynamic_tool_call*(state: var RuntimeState; request: ServerRequest) =
   let tool = agent.find_dynamic_tool(params.tool)
   if tool.isNone:
     raise newException(ValueError, "unknown dynamic tool: " & params.tool)
-  if tool.get.callback.isNil:
+  let dynamic_tool = tool.get
+  if dynamic_tool.callback.isNil:
     raise newException(ValueError, "dynamic tool has no callback: " & params.tool)
 
-  tool.get.callback(tool.get.data, ToolCallContext(
+  dynamic_tool.callback(dynamic_tool.data, ToolCallContext(
     request_id: request.id,
     params: params
   ))
@@ -404,17 +405,16 @@ proc handle_message*(runtime: ptr CodexRuntime; message: Message) =
     send_server_response(runtime, message.server_response)
     discard remove_server_request(runtime.state, message.server_response.id)
   of mk_success:
-    let key = request_id_key(message.success.id)
-    if runtime.state.requests.hasKey(key):
-      apply_success(runtime.state, message.success)
+    apply_success(runtime.state, message.success)
     if message.success.result.kind == mk_initialize:
       runtime.initialized = true
       runtime.initialization_error = none(string)
       send_initialized(runtime)
   of mk_error:
+    let key = request_id_key(message.error.id)
     apply_error(runtime.state, message.error)
-    if runtime.state.requests.hasKey(request_id_key(message.error.id)):
-      let request = runtime.state.requests[request_id_key(message.error.id)]
+    if runtime.state.requests.hasKey(key):
+      let request = runtime.state.requests[key]
       if request.request.kind == mk_initialize:
         runtime.initialization_error = some(message.error.message)
   of mk_notification:
@@ -600,7 +600,7 @@ proc create_agent*(runtime: ptr CodexRuntime; agent_id: AgentId;
   )
 
 proc send_agent_message*(runtime: ptr CodexRuntime; agent_id: AgentId;
-    text: string; effort: ReasoningEffort = re_low): RequestId =
+    text: string; effort: ReasoningEffort): RequestId =
   if not runtime.state.agents.hasKey(agent_id):
     raise newException(ValueError, "unknown agent: " & agent_id)
   let agent = runtime.state.agents[agent_id]
@@ -624,3 +624,10 @@ proc send_agent_message*(runtime: ptr CodexRuntime; agent_id: AgentId;
     Params(kind: mk_turn_start, turn_start: params),
     some(agent_id)
   )
+
+proc send_agent_message*(runtime: ptr CodexRuntime; agent_id: AgentId;
+    text: string): RequestId =
+  if not runtime.state.agents.hasKey(agent_id):
+    raise newException(ValueError, "unknown agent: " & agent_id)
+  runtime.send_agent_message(
+    agent_id, text, runtime.state.agents[agent_id].default_effort)

@@ -84,6 +84,8 @@ type
     title: string
     detail: string
     body: string
+    request_json: string
+    response_json: string
     expanded: bool
     files: seq[ConversationFileSummary]
     added: int
@@ -112,7 +114,7 @@ type
     global_log_messages: seq[string]
     previous_selected_node_id: uint32
     previous_selected_node_valid: bool
-    scroll_conversation_to_end: bool
+    pending_conversation_scrolls: Table[uint32, bool]
 
   MainWindow* = ref object
     palette: Palette
@@ -128,6 +130,7 @@ proc new_graph_tab(objective: string): GraphTab =
   new(result)
   result.node_conversations = initTable[uint32, NodeConversation]()
   result.pending_user_inputs = initTable[uint32, PendingUserInput]()
+  result.pending_conversation_scrolls = initTable[uint32, bool]()
   result.graph_view.work_graph = new_work_graph(objective = objective)
   var layout_config = default_graph_layout_config()
   layout_config.layer_gap = 96
@@ -226,24 +229,30 @@ proc activity_entry(kind: ConversationActivityKind; activity_id,
     activity_id: activity_id,
     turn_id: turn_id,
     title: title,
-    expanded: kind != cak_thinking,
+    expanded: kind notin {cak_thinking, cak_tool},
     files: @[])
+
+proc request_conversation_scroll(tab: GraphTab; node_id: uint32) =
+  tab.pending_conversation_scrolls[node_id] = true
 
 proc add_node_message(tab: GraphTab; node_id: uint32;
     speaker: ConversationSpeaker; content: string) =
   tab.node_conversation(node_id).messages.add(message_entry(speaker, content))
+  tab.request_conversation_scroll(node_id)
+
+proc add_global_message(tab: GraphTab; content: string)
 
 proc display_work_graph_messages(view: MainWindow) =
   let messages = view.graph_tab.graph_view.work_graph.drain_outgoing_messages()
   for message in messages:
-    view.graph_tab.add_node_message(
-      message.node_id, conversation_system, message.text)
-  if messages.len > 0:
-    view.graph_tab.scroll_conversation_to_end = true
-
+    if message.node_id == 0:
+      view.graph_tab.add_global_message(message.text)
+    else:
+      view.graph_tab.add_node_message(
+        message.node_id, conversation_system, message.text)
 proc add_global_message(tab: GraphTab; content: string) =
   tab.global_log_messages.add(content)
-  tab.scroll_conversation_to_end = true
+  tab.request_conversation_scroll(0)
 
 proc append_agent_delta(tab: GraphTab; node_id: uint32; delta: string) =
   var conversation = tab.node_conversation(node_id)
@@ -255,7 +264,7 @@ proc append_agent_delta(tab: GraphTab; node_id: uint32; delta: string) =
   else:
     conversation.messages[^1].content.add(delta)
   tab.node_conversations[node_id] = conversation
-  tab.scroll_conversation_to_end = true
+  tab.request_conversation_scroll(node_id)
 
 proc json_string(node: JsonNode; key: string): string =
   if node.kind == JObject and node.contains(key) and
@@ -266,6 +275,21 @@ proc json_int(node: JsonNode; key: string): int =
   if node.kind == JObject and node.contains(key) and
       node[key].kind == JInt:
     return int(node[key].getInt)
+
+proc try_parse_json(value: string): Option[JsonNode] =
+  if value.len == 0:
+    return none(JsonNode)
+  try:
+    some(parseJson(value))
+  except CatchableError:
+    none(JsonNode)
+
+proc pretty_json(value: string): string =
+  let parsed = try_parse_json(value)
+  if parsed.isSome:
+    parsed.get.pretty
+  else:
+    value
 
 proc user_input_questions(payload: JsonNode): UserInputQuestions =
   if payload.kind != JObject or not payload.contains("questions") or
@@ -330,12 +354,7 @@ proc json_text(node: JsonNode; key: string): string =
     discard
 
 proc event_payload(event: CodexRuntimeEvent): JsonNode =
-  if event.params_json.len == 0:
-    return newJObject()
-  try:
-    parseJson(event.params_json)
-  except CatchableError:
-    newJObject()
+  try_parse_json(event.params_json).get(newJObject())
 
 proc activity_kind_for_notification(kind: NotificationKind): ConversationActivityKind =
   case kind:
@@ -542,6 +561,7 @@ proc update_activity(conversation: var NodeConversation;
       entry.title = "Tool call"
       entry.activity_state = cas_waiting
       entry.detail = json_string(payload, "tool")
+      entry.request_json = pretty_json(event.params_json)
     of sr_tool_user_input:
       entry.title = "Input requested"
       entry.activity_state = cas_waiting
@@ -558,6 +578,17 @@ proc update_activity(conversation: var NodeConversation;
       entry.detail = json_string(payload, "reason")
     else:
       discard
+  conversation.messages[index] = entry
+
+proc update_tool_response(conversation: var NodeConversation;
+    event: CodexRuntimeEvent) =
+  let index = conversation.find_activity(event.activity_key(cak_tool))
+  if index < 0:
+    return
+  var entry = conversation.messages[index]
+  entry.response_json = pretty_json(event.response_json)
+  entry.activity_state = cas_complete
+  entry.expanded = false
   conversation.messages[index] = entry
 
 proc finalize_activities(conversation: var NodeConversation;
@@ -583,10 +614,11 @@ proc apply_conversation_error(view: MainWindow; node_id: uint32;
   conversation.finalize_activities(turn_id, error_state = true)
   conversation.messages.add(message_entry(conversation_system, prefix & message))
   view.graph_tab.node_conversations[node_id] = conversation
-  view.graph_tab.scroll_conversation_to_end = true
+  view.graph_tab.request_conversation_scroll(node_id)
 
 proc apply_conversation_event(view: MainWindow; event: CodexRuntimeEvent) =
   var conversation = view.graph_tab.node_conversation(event.node_id)
+  var conversation_changed = false
   case event.kind
   of cre_agent_message_delta:
     view.graph_tab.append_agent_delta(event.node_id, event.text)
@@ -601,11 +633,13 @@ proc apply_conversation_event(view: MainWindow; event: CodexRuntimeEvent) =
     return
   of cre_global_notification:
     let payload = event.event_payload
-    let user_input = if event.server_request_kind == sr_tool_user_input:
+    let is_server_request = event.server_request_kind != sr_unknown
+    let is_user_input_request = event.server_request_kind == sr_tool_user_input
+    let user_input = if is_user_input_request:
       user_input_questions(payload)
     else:
       UserInputQuestions()
-    if event.server_request_kind == sr_tool_user_input:
+    if is_user_input_request:
       if user_input.question_ids.len > 0:
         let pending_input = PendingUserInput(
           request_id: event.request_id_value,
@@ -622,7 +656,8 @@ proc apply_conversation_event(view: MainWindow; event: CodexRuntimeEvent) =
       conversation.status_detail.setLen(0)
     of nk_thread_status_changed:
       if event.thread_status.isSome:
-        case event.thread_status.get
+        let status = event.thread_status.get
+        case status
         of tsk_idle:
           conversation.state = conversation_ready
           conversation.status_detail.setLen(0)
@@ -633,7 +668,7 @@ proc apply_conversation_event(view: MainWindow; event: CodexRuntimeEvent) =
         of tsk_system_error, tsk_not_loaded:
           view.graph_tab.pending_user_inputs.del(event.node_id)
           conversation.state = conversation_error
-          conversation.status_detail = if event.thread_status.get == tsk_system_error:
+          conversation.status_detail = if status == tsk_system_error:
             "SYSTEM ERROR" else: "NOT LOADED"
           conversation.finalize_activities(error_state = true)
         of tsk_unknown:
@@ -649,7 +684,7 @@ proc apply_conversation_event(view: MainWindow; event: CodexRuntimeEvent) =
         item_descriptor(payload)
       else:
         ConversationItemDescriptor(activity_kind: cak_lifecycle)
-      let activity_kind = if event.server_request_kind != sr_unknown:
+      let activity_kind = if is_server_request:
         activity_kind_for_request(event.server_request_kind)
       elif item.kind.len > 0:
         item.activity_kind
@@ -661,19 +696,24 @@ proc apply_conversation_event(view: MainWindow; event: CodexRuntimeEvent) =
       else:
         conversation.update_activity(
           event, payload, activity_kind, item, user_input)
-      if event.server_request_kind != sr_unknown:
-        conversation.status_detail = if event.server_request_kind == sr_tool_user_input:
+        conversation_changed = true
+      if is_server_request:
+        conversation.status_detail = if is_user_input_request:
           "WAITING FOR INPUT" else: "WAITING"
       elif event.notification_kind == nk_model_rerouted:
         conversation.current_model = json_string(payload, "toModel")
   of cre_tool_response_sent:
-    if event.server_request_kind == sr_tool_user_input:
+    if event.server_request_kind == sr_tool_call:
+      conversation.update_tool_response(event)
+      conversation_changed = true
+    elif event.server_request_kind == sr_tool_user_input:
       view.graph_tab.pending_user_inputs.del(event.node_id)
   of cre_thread_ready, cre_thread_error, cre_runtime_error,
       cre_runtime_closed:
     discard
   view.graph_tab.node_conversations[event.node_id] = conversation
-  view.graph_tab.scroll_conversation_to_end = true
+  if conversation_changed:
+    view.graph_tab.request_conversation_scroll(event.node_id)
 
 proc apply_codex_event(view: MainWindow; event: CodexRuntimeEvent) =
   let conversation_event = event.conversation_scoped and event.node_id != 0
@@ -773,12 +813,12 @@ proc finish_frame(view: MainWindow) =
   if view.tab_manager.active_tab == main_tab_graph:
     view.sync_selected_node()
   view.ui_state.finish_frame()
-  if not view.graph_tab.scroll_conversation_to_end:
+  let selected_node_id = if view.graph_tab.graph_view.selected_node_valid:
+    view.graph_tab.graph_view.selected_node_id else: 0'u32
+  if not view.graph_tab.pending_conversation_scrolls.hasKey(selected_node_id):
     return
-  let log_id = if view.graph_tab.graph_view.selected_node_valid:
-    graph_conversation_log_id
-  else:
-    graph_global_log_id
+  let log_id = if selected_node_id > 0:
+    graph_conversation_log_id else: graph_global_log_id
   let scroll_data = clay_get_scroll_container_data(
     clay_id(log_id))
   if not scroll_data.found or scroll_data.scroll_position == nil:
@@ -788,7 +828,7 @@ proc finish_frame(view: MainWindow) =
     float32(scroll_data.scroll_container_dimensions.height),
     0'f32)
   scroll_data.scroll_position[].y = -overflow
-  view.graph_tab.scroll_conversation_to_end = false
+  view.graph_tab.pending_conversation_scrolls.del(selected_node_id)
 
 proc render*(view: MainWindow; renderer: Renderer; clay_context: ptr ClayContext;
     string_cache: var ClayStringCache; delta_time: float32): bool =
@@ -908,9 +948,13 @@ proc apply_ui_actions(view: MainWindow) =
         view.graph_tab.add_global_message(
           "NODE " & $node_id & " IS NOT RUNNING")
         continue
+      elif view.graph_tab.node_conversation(node_id).state in {
+          conversation_starting, conversation_working}:
+        view.graph_tab.add_global_message(
+          "NODE " & $node_id & " IS BUSY")
+        continue
       let message = content.strip
       view.graph_tab.add_node_message(node_id, conversation_user, message)
-      view.graph_tab.scroll_conversation_to_end = true
       if not submitted_user_input:
         discard view.graph_tab.graph_view.work_graph.set_node_objective(
           node_id, message)
@@ -1575,15 +1619,19 @@ proc activity_header(entry: ConversationEntry): string =
     result.add(" / +" & $entry.added & " -" & $entry.removed)
 
 proc activity_body(entry: ConversationEntry): string =
-  result = entry.body
-  if entry.files.len == 0:
-    return
-  if result.len > 0:
-    result.add("\n")
-  for file in entry.files:
-    result.add(file.path & "  +" & $file.added & " -" & $file.removed)
-    result.add("\n")
-  result.setLen(result.len - 1)
+  var sections: seq[string] = @[]
+  if entry.request_json.len > 0:
+    sections.add("REQUEST\n" & entry.request_json)
+  if entry.body.len > 0:
+    sections.add(entry.body)
+  if entry.files.len > 0:
+    var files: seq[string] = @[]
+    for file in entry.files:
+      files.add(file.path & "  +" & $file.added & " -" & $file.removed)
+    sections.add(files.join("\n"))
+  if entry.response_json.len > 0:
+    sections.add("RESPONSE\n" & entry.response_json)
+  sections.join("\n\n")
 
 proc build_graph_conversation_panel(view: MainWindow) =
   let input_element_id = clay_id(graph_conversation_input_id)
@@ -1678,6 +1726,8 @@ proc build_graph_conversation_panel(view: MainWindow) =
         else:
           let activity_button_id = graph_activity_button_prefix & $message_index
           let activity_element_id = clay_id(activity_button_id)
+          let activity_content = if message.expanded:
+            activity_body(message) else: ""
           view.ui_state.register_button(activity_button_id, activity_element_id)
           let activity_declaration = declaration(
             layout = layout(
@@ -1700,8 +1750,7 @@ proc build_graph_conversation_panel(view: MainWindow) =
                 font_size = 9
                 text_color = palette_color(view.palette.ink)
                 wrap_mode = clay_text_wrap_words_and_graphemes
-              if message.expanded and
-                  (message.body.len > 0 or message.files.len > 0):
+              if activity_content.len > 0:
                 element(clay_id_with_index(
                     "graph_conversation_activity_body",
                     uint32(message_index)), declaration(
@@ -1709,7 +1758,7 @@ proc build_graph_conversation_panel(view: MainWindow) =
                         sizing = sizing(grow(), fit()),
                         padding = padding_all(5)),
                       background_color = palette_color(view.palette.paper))):
-                  text(activity_body(message)):
+                  text(activity_content):
                     font_size = 9
                     text_color = palette_color(view.palette.ink)
                     wrap_mode = clay_text_wrap_words_and_graphemes

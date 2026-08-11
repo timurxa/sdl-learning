@@ -117,7 +117,7 @@ Every canonical node has the following logical shape:
 
 ```json
 {
-  "id": "opaque-random-id",
+  "id": 2,
   "description": "extremely short graph label",
   "objective": "required result",
   "inputs": [InputArtifactRef, ...],
@@ -125,14 +125,14 @@ Every canonical node has the following logical shape:
   "wait_for": ["node-id", ...],
   "execution_plan": {
     "type": "llm_worker | graph_creation | human_input",
-    "instructions": "executor-facing instructions"
+    "instructions": "executor-facing instructions",
+    "reasoning_level": "straightforward | bounded | deep_reasoning"
   },
-  "reasoning_level": "straightforward | bounded | deep_reasoning",
   "state": "pending | running | awaiting_human_input | completed | failed"
 }
 ```
 
-`id` and `state` are runtime-owned. `create_node` accepts every other applicable field, generates a random opaque identifier, and initializes `state` to `pending`.
+`id` and `state` are runtime-owned. `create_node` accepts every other applicable field, allocates the next sequential positive integer identifier, and initializes `state` to `pending`.
 
 == Field semantics
 
@@ -144,11 +144,11 @@ Every canonical node has the following logical shape:
   [`description`], [An extremely short graph label used in compact graph views.],
   [`objective`], [The result the node must achieve.],
   [`inputs`], [Declared artifact references available to the node.],
-  [`outputs`], [Paths whose existence is required for successful completion.],
+  [`outputs`], [Declared file outputs for the final user or downstream workers. Optional for `human_input`, whose `response.txt` output is implicit.],
   [`wait_for`], [Explicit completion dependencies only. Artifact-producer dependencies are computed dynamically.],
   [`execution_plan.type`], [Selects execution semantics and available orchestration tools.],
   [`execution_plan.instructions`], [How the executor should perform the work. For human input, this is the exact question shown to the user.],
-  [`reasoning_level`], [Abstract inference requirement mapped externally to a concrete runtime configuration.],
+  [`execution_plan.reasoning_level`], [Abstract inference requirement mapped to a concrete runtime reasoning effort.],
   [`state`], [Persisted lifecycle state.],
 )
 
@@ -160,7 +160,7 @@ The allowed reasoning levels are:
 - `bounded`: the task requires nontrivial but limited analysis;
 - `deep_reasoning`: the task requires extensive planning, synthesis, or difficult reasoning.
 
-`reasoning_level` is required for `llm_worker` and `graph_creation`, and omitted for `human_input`. The runtime, not the node schema, maps these values to models, reasoning effort, and related provider settings.
+For model-executed nodes, `execution_plan.reasoning_level` defaults to `straightforward` when omitted and maps to concrete reasoning effort. Human-input nodes do not use reasoning effort and omit this field in serialized node records.
 
 = Artifact model
 
@@ -213,7 +213,7 @@ Within this repository:
 - absolute artifact paths are invalid;
 - traversal components such as `..` are invalid.
 
-This is basic race and ownership isolation, not a security boundary. Version 1 imposes no additional restrictions on ordinary files outside `orchestration/artifacts/`. In particular, a `graph_creation` node may use normal filesystem and task tools outside the artifact repository even though it cannot declare task artifacts.
+This is basic race and ownership isolation, not a security boundary. Version 1 imposes no additional restrictions on ordinary files outside `orchestration/artifacts/`. In particular, a `graph_creation` node may use normal filesystem and task tools outside the artifact repository; declared outputs still resolve beneath its own artifact directory.
 
 == Prompt inclusion
 
@@ -246,7 +246,7 @@ A `graph_creation` node receives:
 - pending-edit inspection and control tools;
 - `finish_node()`.
 
-It may consume declared artifacts. Its canonical `outputs` MUST be `[]`. It may complete without creating or modifying downstream nodes.
+It may consume declared artifacts and declare file outputs needed by the final user or downstream workers beneath its own artifact directory. Graph structure is created through graph tools, not artifact files. It may complete without creating or modifying downstream nodes.
 
 Its durable orchestration effect is graph mutation. Its instructions SHOULD direct it to create human-input work when the objective contains material ambiguity or underspecification. A common clarification structure is:
 
@@ -263,6 +263,8 @@ Independent questions may be represented by parallel human-input nodes. A downst
 == `human_input`
 
 A `human_input` node invokes no model. One node produces exactly one human response.
+
+Its `outputs` field may be omitted. The runtime always supplies one implicit `response.txt` output; do not declare it.
 
 The orchestrator:
 
@@ -342,10 +344,7 @@ Both paths use identical validation. `finish_node()` takes no arguments.
 
 For an LLM worker, completion succeeds only when every declared output path exists.
 
-For a graph-creation node, completion succeeds only when:
-
-- `outputs` is empty; and
-- no pending edit remains.
+For a graph-creation node, completion succeeds only when no pending edit remains and every declared output path exists.
 
 Any failed completion attempt immediately marks the node `failed`. The thread is not resumed for correction. This applies equally to explicit `finish_node()` and normal turn termination.
 
@@ -389,7 +388,9 @@ finish_node()
 
 `create_node` accepts a complete applicable node definition except `id` and `state`.
 
-The runtime automatically ensures that a created node effectively depends on the current graph-creation node. If this dependency is not already induced by an input artifact, the current graph-creation node is added to the new node's explicit `wait_for` set.
+The runtime automatically ensures that a created node effectively depends on the current graph-creation node. If the current graph-creation node is absent from both the proposed explicit `wait_for` dependencies and input producers, the runtime omits a redundant explicit owner edge when the owner dominates every proposed parent; otherwise it adds the owner to `wait_for`. Proposed dependency declarations are retained as supplied, including an owner edge already present in either field.
+
+Effective dependency IDs use a stable first-seen union of `wait_for` followed by input producer IDs. That effective dependency set and ordering, rather than the presence of a redundant owner in the `wait_for` field, are the compatibility contract.
 
 The resulting graph must still satisfy acyclicity and domination authority. A proposal that introduces another root-to-target path bypassing the current graph creator is invalid.
 
@@ -427,9 +428,9 @@ Pending sequences are scoped to the invoking graph-creation node. Unrelated grap
 
 == Speculative evaluation
 
-Pending edits are applied and validated in sequence order against a private speculative graph derived from the canonical graph. Later edits may reference nodes created or modified by earlier pending edits using their normal opaque node IDs.
+Pending edits are applied and validated in sequence order against a private speculative graph derived from the canonical graph. Later edits may reference nodes created or modified by earlier pending edits using their sequential node IDs.
 
-An invalid `create_node` still allocates its random opaque node ID immediately. The node is not canonical, is not schedulable, and is invisible to `get_node` and ordinary graph views, but later edits in the same sequence may reference it.
+An invalid `create_node` still allocates its sequential node ID immediately. The node is not canonical, is not schedulable, and is invisible to `get_node` and ordinary graph views, but later edits in the same sequence may reference it.
 
 The runtime distinguishes at least:
 
@@ -495,16 +496,16 @@ A new orchestration begins with exactly one root node:
   "wait_for": [],
   "execution_plan": {
     "type": "graph_creation",
-    "instructions": "Construct the work graph for the objective. If material ambiguities or underspecifications exist, strongly prefer creating one or more human_input nodes and a subsequent graph_creation node that consumes and synthesizes their responses before expanding the affected work."
+    "instructions": "Construct the work graph for the objective. If a material ambiguity blocks safe execution, create one or more human_input nodes, then create a graph_creation node that consumes their responses before expanding the affected work.",
+    "reasoning_level": "bounded"
   },
-  "reasoning_level": "{runtime-selected graph-planning level}",
   "state": "pending"
 }
 ```
 
 There is no privileged planner outside the graph. The bootstrap node is an ordinary graph-creation node and follows the same mutation, authority, context, and completion rules.
 
-The runtime selects the bootstrap reasoning level according to request complexity. This selection is a runtime policy, not an additional node field.
+The bootstrap uses the `bounded` reasoning level by default. This is runtime policy, not an additional node field.
 
 = Orchestration termination
 
@@ -523,13 +524,13 @@ Zero final artifacts is valid. In that case, successful completion reports no fi
 The implementation MUST preserve all of the following:
 
 1. The effective dependency graph is acyclic.
-2. Canonical node IDs are opaque and random.
+2. Canonical node IDs are positive sequential integers.
 3. Only `pending` dominated nodes are mutable.
 4. `wait_for` stores explicit dependencies only.
 5. Artifact-producer dependencies are derived dynamically from validated inputs.
 6. Every input references an output declared by its producer.
 7. Output paths are relative, traversal-free, and unique within a node.
-8. `graph_creation.outputs` is always empty.
+8. Every declared output path exists before its producer completes.
 9. `human_input` has exactly one runtime-generated response output.
 10. Ordinary graph views expose canonical state only.
 11. Pending edits are evaluated in deterministic sequence order.

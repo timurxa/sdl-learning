@@ -462,6 +462,18 @@ proc new_notification_params*(): NotificationParams =
     turn_extra_fields: initTable[string, JsonNode](),
     extra_fields: initTable[string, JsonNode]())
 
+proc parse_notification_context(params: var NotificationParams;
+    wire_params: JsonNode) =
+  if wire_params.kind != JObject:
+    return
+  if wire_params.contains("threadId"):
+    params.thread_id = Nullable[string](has_value: true,
+      value: wire_params["threadId"].getStr)
+  if wire_params.contains("turnId"):
+    params.turn_id = some(wire_params["turnId"].getStr)
+  if wire_params.contains("itemId"):
+    params.item_id = some(wire_params["itemId"].getStr)
+
 proc register_dynamic_tool*(registry: var DynamicToolRegistry;
     name, description: string; input_schema: JsonNode; data: pointer;
     callback: DynamicToolCallback) =
@@ -494,7 +506,8 @@ proc json_object_node(value: JsonObject): JsonNode =
   for key, item in value.pairs:
     result[key] = item
 
-proc extra_fields(node: JsonNode; known: varargs[string]): JsonObject =
+proc extra_fields_from_list(node: JsonNode;
+    known: openArray[string]): JsonObject =
   result = initTable[string, JsonNode]()
   if node.kind != JObject:
     return
@@ -506,6 +519,29 @@ proc extra_fields(node: JsonNode; known: varargs[string]): JsonObject =
         break
     if not is_known:
       result[key] = value
+
+proc extra_fields(node: JsonNode; known: varargs[string]): JsonObject =
+  extra_fields_from_list(node, known)
+
+proc notification_extra_fields(node: JsonNode;
+    additional: varargs[string]): JsonObject =
+  var known = @[
+    "threadId",
+    "turnId",
+    "itemId"]
+  for field in additional:
+    known.add(field)
+  extra_fields_from_list(node, known)
+
+proc parse_item_lifecycle(params: var NotificationParams;
+    wire_params: JsonNode) =
+  params.item_id = some(wire_params["item"]["id"].getStr)
+  params.extra_fields = notification_extra_fields(wire_params, "item")
+
+proc parse_notification_delta(params: var NotificationParams;
+    wire_params: JsonNode) =
+  params.delta = some(wire_params["delta"].getStr)
+  params.extra_fields = notification_extra_fields(wire_params, "delta")
 
 proc add_extra_fields(node: JsonNode; fields: JsonObject) =
   for key, value in fields.pairs:
@@ -521,29 +557,21 @@ proc put_nullable_option[T](node: JsonNode; key: string;
   of nos_value:
     node[key] = serialize(value.value)
 
-proc nullable_string(node: JsonNode; key: string): NullableOption[string] =
+proc parse_nullable_option[T](node: JsonNode; key: string;
+    parse_value: proc(value: JsonNode): T {.gcsafe.}): NullableOption[T] {.gcsafe.} =
   if not node.contains(key):
-    return NullableOption[string](state: nos_none)
+    return NullableOption[T](state: nos_none)
   if node[key].kind == JNull:
-    return NullableOption[string](state: nos_null)
-  NullableOption[string](state: nos_value, value: node[key].getStr)
+    return NullableOption[T](state: nos_null)
+  NullableOption[T](state: nos_value, value: parse_value(node[key]))
 
-proc nullable_bool(node: JsonNode; key: string): NullableOption[bool] =
-  if not node.contains(key):
-    return NullableOption[bool](state: nos_none)
-  if node[key].kind == JNull:
-    return NullableOption[bool](state: nos_null)
-  NullableOption[bool](state: nos_value, value: node[key].getBool)
-
-proc nullable_strings(node: JsonNode; key: string): NullableOption[seq[string]] =
-  if not node.contains(key):
-    return NullableOption[seq[string]](state: nos_none)
-  if node[key].kind == JNull:
-    return NullableOption[seq[string]](state: nos_null)
+proc parse_json_string(value: JsonNode): string {.gcsafe.} = value.getStr
+proc parse_json_bool(value: JsonNode): bool {.gcsafe.} = value.getBool
+proc parse_json_strings(value: JsonNode): seq[string] {.gcsafe.} =
   var values: seq[string] = @[]
-  for item in node[key]:
+  for item in value:
     values.add(item.getStr)
-  NullableOption[seq[string]](state: nos_value, value: values)
+  values
 
 proc json_node(value: string): JsonNode = %value
 proc json_node(value: bool): JsonNode = %value
@@ -687,8 +715,10 @@ proc serialize_initialize_capabilities(value: InitializeCapabilities): JsonNode 
 
 proc parse_initialize_capabilities(node: JsonNode): InitializeCapabilities =
   InitializeCapabilities(
-    experimental_api: nullable_bool(node, "experimentalApi"),
-    opt_out_notification_methods: nullable_strings(node, "optOutNotificationMethods"),
+    experimental_api: parse_nullable_option(
+      node, "experimentalApi", parse_json_bool),
+    opt_out_notification_methods: parse_nullable_option(
+      node, "optOutNotificationMethods", parse_json_strings),
     extra_fields: extra_fields(node, "experimentalApi", "optOutNotificationMethods")
   )
 
@@ -702,7 +732,7 @@ proc serialize_client_info(info: ClientInfo): JsonNode =
 proc parse_client_info(node: JsonNode): ClientInfo =
   ClientInfo(
     name: node["name"].getStr,
-    title: nullable_string(node, "title"),
+    title: parse_nullable_option(node, "title", parse_json_string),
     version: node["version"].getStr,
     extra_fields: extra_fields(node, "name", "title", "version")
   )
@@ -714,17 +744,9 @@ proc serialize_initialize_params(params: InitializeParams): JsonNode =
   result["clientInfo"] = serialize_client_info(params.client_info)
 
 proc parse_initialize_params(node: JsonNode): InitializeParams =
-  var capabilities = NullableOption[InitializeCapabilities](state: nos_none)
-  if node.contains("capabilities"):
-    if node["capabilities"].kind == JNull:
-      capabilities = NullableOption[InitializeCapabilities](state: nos_null)
-    else:
-      capabilities = NullableOption[InitializeCapabilities](
-        state: nos_value,
-        value: parse_initialize_capabilities(node["capabilities"])
-      )
   InitializeParams(
-    capabilities: capabilities,
+    capabilities: parse_nullable_option(
+      node, "capabilities", parse_initialize_capabilities),
     client_info: parse_client_info(node["clientInfo"]),
     extra_fields: extra_fields(node, "capabilities", "clientInfo")
   )
@@ -763,53 +785,22 @@ proc parse_dynamic_tool_specs(node: JsonNode): seq[DynamicToolSpec] =
   for item in node:
     result.add(parse_dynamic_tool_spec(item))
 
-proc nullable_dynamic_tool_specs(node: JsonNode; key: string): NullableOption[seq[DynamicToolSpec]] =
-  if not node.contains(key):
-    return NullableOption[seq[DynamicToolSpec]](state: nos_none)
-  if node[key].kind == JNull:
-    return NullableOption[seq[DynamicToolSpec]](state: nos_null)
-  NullableOption[seq[DynamicToolSpec]](
-    state: nos_value,
-    value: parse_dynamic_tool_specs(node[key])
-  )
-
 proc parse_thread_start_params(node: JsonNode): ThreadStartParams =
-  var approval = NullableOption[AskForApproval](state: nos_none)
-  if node.contains("approvalPolicy"):
-    if node["approvalPolicy"].kind == JNull:
-      approval = NullableOption[AskForApproval](state: nos_null)
-    else:
-      approval = NullableOption[AskForApproval](state: nos_value, value: parse_ask_for_approval(node["approvalPolicy"]))
-  var sandbox = NullableOption[SandboxMode](state: nos_none)
-  if node.contains("sandbox"):
-    if node["sandbox"].kind == JNull:
-      sandbox = NullableOption[SandboxMode](state: nos_null)
-    else:
-      sandbox = NullableOption[SandboxMode](state: nos_value, value: parse_sandbox_mode(node["sandbox"]))
-  var personality = NullableOption[Personality](state: nos_none)
-  if node.contains("personality"):
-    if node["personality"].kind == JNull:
-      personality = NullableOption[Personality](state: nos_null)
-    else:
-      personality = NullableOption[Personality](state: nos_value, value: parse_personality(node["personality"]))
-  var config = NullableOption[Config](state: nos_none)
-  if node.contains("config"):
-    if node["config"].kind == JNull:
-      config = NullableOption[Config](state: nos_null)
-    else:
-      config = NullableOption[Config](state: nos_value, value: parse_config(node["config"]))
   ThreadStartParams(
-    approval_policy: approval,
-    base_instructions: nullable_string(node, "baseInstructions"),
-    config: config,
-    cwd: nullable_string(node, "cwd"),
-    developer_instructions: nullable_string(node, "developerInstructions"),
-    sandbox: sandbox,
-    ephemeral: nullable_bool(node, "ephemeral"),
-    model_provider: nullable_string(node, "modelProvider"),
-    personality: personality,
-    model: nullable_string(node, "model"),
-    dynamic_tools: nullable_dynamic_tool_specs(node, "dynamicTools"),
+    approval_policy: parse_nullable_option(node, "approvalPolicy", parse_ask_for_approval),
+    base_instructions: parse_nullable_option(
+      node, "baseInstructions", parse_json_string),
+    config: parse_nullable_option(node, "config", parse_config),
+    cwd: parse_nullable_option(node, "cwd", parse_json_string),
+    developer_instructions: parse_nullable_option(
+      node, "developerInstructions", parse_json_string),
+    sandbox: parse_nullable_option(node, "sandbox", parse_sandbox_mode),
+    ephemeral: parse_nullable_option(node, "ephemeral", parse_json_bool),
+    model_provider: parse_nullable_option(
+      node, "modelProvider", parse_json_string),
+    personality: parse_nullable_option(node, "personality", parse_personality),
+    model: parse_nullable_option(node, "model", parse_json_string),
+    dynamic_tools: parse_nullable_option(node, "dynamicTools", parse_dynamic_tool_specs),
     extra_fields: extra_fields(node, "approvalPolicy", "baseInstructions", "config", "cwd", "developerInstructions", "sandbox", "ephemeral", "modelProvider", "personality", "model", "dynamicTools")
   )
 
@@ -882,27 +873,24 @@ proc serialize_message*(message: Message): JsonNode =
     else:
       raise newException(ValueError, "only initialized notification is client-sendable")
 
+const server_request_methods: array[ServerRequestKind, string] = [
+  "item/commandExecution/requestApproval",
+  "item/fileChange/requestApproval",
+  "item/tool/requestUserInput",
+  "item/tool/call",
+  "account/chatgptAuthTokens/refresh",
+  "applyPatchApproval",
+  "execCommandApproval",
+  ""]
+
 proc server_request_kind*(method_name: string): ServerRequestKind =
-  case method_name:
-  of "item/commandExecution/requestApproval": sr_command_execution_approval
-  of "item/fileChange/requestApproval": sr_file_change_approval
-  of "item/tool/requestUserInput": sr_tool_user_input
-  of "item/tool/call": sr_tool_call
-  of "account/chatgptAuthTokens/refresh": sr_auth_tokens_refresh
-  of "applyPatchApproval": sr_apply_patch_approval
-  of "execCommandApproval": sr_exec_command_approval
-  else: sr_unknown
+  for kind in ServerRequestKind:
+    if server_request_methods[kind] == method_name:
+      return kind
+  sr_unknown
 
 proc server_request_method*(kind: ServerRequestKind): string =
-  case kind:
-  of sr_command_execution_approval: "item/commandExecution/requestApproval"
-  of sr_file_change_approval: "item/fileChange/requestApproval"
-  of sr_tool_user_input: "item/tool/requestUserInput"
-  of sr_tool_call: "item/tool/call"
-  of sr_auth_tokens_refresh: "account/chatgptAuthTokens/refresh"
-  of sr_apply_patch_approval: "applyPatchApproval"
-  of sr_exec_command_approval: "execCommandApproval"
-  of sr_unknown: ""
+  server_request_methods[kind]
 
 proc is_conversation_server_request*(kind: ServerRequestKind): bool =
   kind in {
@@ -1076,9 +1064,9 @@ proc parse_command_action(node: JsonNode): CommandAction =
   CommandAction(
     kind: kind,
     command: node["command"].getStr,
-    name: nullable_string(node, "name"),
-    path: nullable_string(node, "path"),
-    query: nullable_string(node, "query"),
+    name: parse_nullable_option(node, "name", parse_json_string),
+    path: parse_nullable_option(node, "path", parse_json_string),
+    query: parse_nullable_option(node, "query", parse_json_string),
     extra_fields: extra_fields(node, "type", "command", "name", "path", "query")
   )
 
@@ -1091,31 +1079,27 @@ proc parse_parsed_command(node: JsonNode): ParsedCommand =
   ParsedCommand(
     kind: kind,
     cmd: node["cmd"].getStr,
-    name: nullable_string(node, "name"),
-    path: nullable_string(node, "path"),
-    query: nullable_string(node, "query"),
+    name: parse_nullable_option(node, "name", parse_json_string),
+    path: parse_nullable_option(node, "path", parse_json_string),
+    query: parse_nullable_option(node, "query", parse_json_string),
     extra_fields: extra_fields(node, "type", "cmd", "name", "path", "query")
   )
 
+proc parse_command_actions(value: JsonNode): seq[CommandAction] =
+  for item in value:
+    result.add(parse_command_action(item))
+
 proc parse_command_execution_params(node: JsonNode): CommandExecutionRequestApprovalParams =
-  var actions = NullableOption[seq[CommandAction]](state: nos_none)
-  if node.contains("commandActions"):
-    if node["commandActions"].kind == JNull:
-      actions = NullableOption[seq[CommandAction]](state: nos_null)
-    else:
-      var values: seq[CommandAction] = @[]
-      for item in node["commandActions"]:
-        values.add(parse_command_action(item))
-      actions = NullableOption[seq[CommandAction]](state: nos_value, value: values)
-  var amendment = nullable_strings(node, "proposedExecpolicyAmendment")
   CommandExecutionRequestApprovalParams(
-    approval_id: nullable_string(node, "approvalId"),
-    command: nullable_string(node, "command"),
-    command_actions: actions,
-    cwd: nullable_string(node, "cwd"),
+    approval_id: parse_nullable_option(node, "approvalId", parse_json_string),
+    command: parse_nullable_option(node, "command", parse_json_string),
+    command_actions: parse_nullable_option(
+      node, "commandActions", parse_command_actions),
+    cwd: parse_nullable_option(node, "cwd", parse_json_string),
     item_id: node["itemId"].getStr,
-    proposed_execpolicy_amendment: amendment,
-    reason: nullable_string(node, "reason"),
+    proposed_execpolicy_amendment: parse_nullable_option(
+      node, "proposedExecpolicyAmendment", parse_json_strings),
+    reason: parse_nullable_option(node, "reason", parse_json_string),
     thread_id: node["threadId"].getStr,
     turn_id: node["turnId"].getStr,
     extra_fields: extra_fields(node, "approvalId", "command", "commandActions", "cwd", "itemId", "proposedExecpolicyAmendment", "reason", "threadId", "turnId")
@@ -1123,34 +1107,29 @@ proc parse_command_execution_params(node: JsonNode): CommandExecutionRequestAppr
 
 proc parse_file_change_params(node: JsonNode): FileChangeRequestApprovalParams =
   FileChangeRequestApprovalParams(
-    grant_root: nullable_string(node, "grantRoot"),
+    grant_root: parse_nullable_option(node, "grantRoot", parse_json_string),
     item_id: node["itemId"].getStr,
-    reason: nullable_string(node, "reason"),
+    reason: parse_nullable_option(node, "reason", parse_json_string),
     thread_id: node["threadId"].getStr,
     turn_id: node["turnId"].getStr,
     extra_fields: extra_fields(node, "grantRoot", "itemId", "reason", "threadId", "turnId")
   )
 
+proc parse_tool_question_options(value: JsonNode): seq[ToolRequestUserInputOption] =
+  for item in value:
+    result.add(ToolRequestUserInputOption(
+      description: item["description"].getStr,
+      label: item["label"].getStr,
+      extra_fields: extra_fields(item, "description", "label")
+    ))
+
 proc parse_tool_question(node: JsonNode): ToolRequestUserInputQuestion =
-  var options = NullableOption[seq[ToolRequestUserInputOption]](state: nos_none)
-  if node.contains("options"):
-    if node["options"].kind == JNull:
-      options = NullableOption[seq[ToolRequestUserInputOption]](state: nos_null)
-    else:
-      var values: seq[ToolRequestUserInputOption] = @[]
-      for item in node["options"]:
-        values.add(ToolRequestUserInputOption(
-          description: item["description"].getStr,
-          label: item["label"].getStr,
-          extra_fields: extra_fields(item, "description", "label")
-        ))
-      options = NullableOption[seq[ToolRequestUserInputOption]](state: nos_value, value: values)
   ToolRequestUserInputQuestion(
     header: node["header"].getStr,
     id: node["id"].getStr,
-    is_other: nullable_bool(node, "isOther"),
-    is_secret: nullable_bool(node, "isSecret"),
-    options: options,
+    is_other: parse_nullable_option(node, "isOther", parse_json_bool),
+    is_secret: parse_nullable_option(node, "isSecret", parse_json_bool),
+    options: parse_nullable_option(node, "options", parse_tool_question_options),
     question: node["question"].getStr,
     extra_fields: extra_fields(node, "header", "id", "isOther", "isSecret", "options", "question")
   )
@@ -1182,7 +1161,8 @@ proc parse_auth_refresh_params(node: JsonNode): ChatgptAuthTokensRefreshParams =
     of "unauthorized": atrr_unauthorized
     else: atrr_unknown
   ChatgptAuthTokensRefreshParams(
-    previous_account_id: nullable_string(node, "previousAccountId"),
+    previous_account_id: parse_nullable_option(
+      node, "previousAccountId", parse_json_string),
     reason: reason,
     extra_fields: extra_fields(node, "previousAccountId", "reason")
   )
@@ -1195,9 +1175,10 @@ proc parse_file_change(node: JsonNode): FileChange =
     else: fck_unknown
   FileChange(
     kind: kind,
-    content: nullable_string(node, "content"),
-    move_path: nullable_string(node, "move_path"),
-    unified_diff: nullable_string(node, "unified_diff"),
+    content: parse_nullable_option(node, "content", parse_json_string),
+    move_path: parse_nullable_option(node, "move_path", parse_json_string),
+    unified_diff: parse_nullable_option(
+      node, "unified_diff", parse_json_string),
     extra_fields: extra_fields(node, "type", "content", "move_path", "unified_diff")
   )
 
@@ -1209,8 +1190,8 @@ proc parse_apply_patch_params(node: JsonNode): ApplyPatchApprovalParams =
     call_id: node["callId"].getStr,
     conversation_id: node["conversationId"].getStr,
     file_changes: changes,
-    grant_root: nullable_string(node, "grantRoot"),
-    reason: nullable_string(node, "reason"),
+    grant_root: parse_nullable_option(node, "grantRoot", parse_json_string),
+    reason: parse_nullable_option(node, "reason", parse_json_string),
     extra_fields: extra_fields(node, "callId", "conversationId", "fileChanges", "grantRoot", "reason")
   )
 
@@ -1222,13 +1203,14 @@ proc parse_exec_command_params(node: JsonNode): ExecCommandApprovalParams =
   for item in node["parsedCmd"]:
     parsed.add(parse_parsed_command(item))
   ExecCommandApprovalParams(
-    approval_id: nullable_string(node, "approvalId"),
+    approval_id: parse_nullable_option(
+      node, "approvalId", parse_json_string),
     call_id: node["callId"].getStr,
     command: command,
     conversation_id: node["conversationId"].getStr,
     cwd: node["cwd"].getStr,
     parsed_cmd: parsed,
-    reason: nullable_string(node, "reason"),
+    reason: parse_nullable_option(node, "reason", parse_json_string),
     extra_fields: extra_fields(node, "approvalId", "callId", "command", "conversationId", "cwd", "parsedCmd", "reason")
   )
 
@@ -1272,6 +1254,7 @@ proc parse_notification(node: JsonNode): Notification =
   var params = new_notification_params()
   let wire_params = if node.contains("params"): node["params"] else: newJObject()
   params.raw_params = wire_params
+  params.parse_notification_context(wire_params)
   case method_name:
   of "initialized":
     result.kind = nk_initialized
@@ -1282,16 +1265,14 @@ proc parse_notification(node: JsonNode): Notification =
     params.extra_fields = extra_fields(wire_params, "thread")
   of "thread/tokenUsage/updated":
     result.kind = nk_thread_token_usage_updated
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "tokenUsage")
+    params.extra_fields = notification_extra_fields(wire_params, "tokenUsage")
   of "turn/started":
     result.kind = nk_turn_started
     params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
     params.turn_id = some(wire_params["turn"]["id"].getStr)
     params.turn_status = some(parse_turn_status(wire_params["turn"]["status"]))
     params.turn_extra_fields = extra_fields(wire_params["turn"], "id", "status")
-    params.extra_fields = extra_fields(wire_params, "threadId", "turn")
+    params.extra_fields = notification_extra_fields(wire_params, "turn")
   of "turn/completed":
     result.kind = nk_turn_completed
     params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
@@ -1300,118 +1281,76 @@ proc parse_notification(node: JsonNode): Notification =
     if wire_params["turn"].contains("error") and wire_params["turn"]["error"].kind != JNull:
       params.error_message = some(wire_params["turn"]["error"]["message"].getStr)
     params.turn_extra_fields = extra_fields(wire_params["turn"], "id", "status", "error")
-    params.extra_fields = extra_fields(wire_params, "threadId", "turn")
+    params.extra_fields = notification_extra_fields(wire_params, "turn")
   of "turn/diff/updated":
     result.kind = nk_turn_diff_updated
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "diff")
+    params.extra_fields = notification_extra_fields(wire_params, "diff")
   of "turn/plan/updated":
     result.kind = nk_turn_plan_updated
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "explanation", "plan")
+    params.extra_fields = notification_extra_fields(
+      wire_params, "explanation", "plan")
   of "item/started":
     result.kind = nk_item_started
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.item_id = some(wire_params["item"]["id"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "item")
+    params.parse_item_lifecycle(wire_params)
   of "item/completed":
     result.kind = nk_item_completed
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.item_id = some(wire_params["item"]["id"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "item")
+    params.parse_item_lifecycle(wire_params)
   of "item/agentMessage/delta":
     result.kind = nk_agent_message_delta
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.item_id = some(wire_params["itemId"].getStr)
-    params.delta = some(wire_params["delta"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "delta")
+    params.parse_notification_delta(wire_params)
   of "item/plan/delta":
     result.kind = nk_plan_delta
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.item_id = some(wire_params["itemId"].getStr)
-    params.delta = some(wire_params["delta"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "delta")
+    params.parse_notification_delta(wire_params)
   of "item/commandExecution/outputDelta":
     result.kind = nk_command_execution_output_delta
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.item_id = some(wire_params["itemId"].getStr)
-    params.delta = some(wire_params["delta"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "delta")
+    params.parse_notification_delta(wire_params)
   of "item/commandExecution/terminalInteraction":
     result.kind = nk_terminal_interaction
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.item_id = some(wire_params["itemId"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "processId", "stdin")
+    params.extra_fields = notification_extra_fields(
+      wire_params, "processId", "stdin")
   of "item/fileChange/outputDelta":
     result.kind = nk_file_change_output_delta
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.item_id = some(wire_params["itemId"].getStr)
-    params.delta = some(wire_params["delta"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "delta")
+    params.parse_notification_delta(wire_params)
   of "item/mcpToolCall/progress":
     result.kind = nk_mcp_tool_call_progress
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.item_id = some(wire_params["itemId"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "message")
+    params.extra_fields = notification_extra_fields(wire_params, "message")
   of "item/reasoning/summaryTextDelta":
     result.kind = nk_reasoning_summary_text_delta
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.item_id = some(wire_params["itemId"].getStr)
     params.summary_index = some(wire_params["summaryIndex"].getInt)
     params.delta = some(wire_params["delta"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "summaryIndex", "delta")
+    params.extra_fields = notification_extra_fields(
+      wire_params, "summaryIndex", "delta")
   of "item/reasoning/summaryPartAdded":
     result.kind = nk_reasoning_summary_part_added
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.item_id = some(wire_params["itemId"].getStr)
     params.summary_index = some(wire_params["summaryIndex"].getInt)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "itemId", "summaryIndex")
+    params.extra_fields = notification_extra_fields(
+      wire_params, "summaryIndex")
   of "item/reasoning/textDelta":
     result.kind = nk_unknown
   of "thread/compacted":
     result.kind = nk_thread_compacted
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId")
+    params.extra_fields = notification_extra_fields(wire_params)
   of "model/rerouted":
     result.kind = nk_model_rerouted
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.turn_id = some(wire_params["turnId"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "fromModel", "toModel", "reason")
+    params.extra_fields = notification_extra_fields(
+      wire_params, "fromModel", "toModel", "reason")
   of "thread/status/changed":
     result.kind = nk_thread_status_changed
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
     var flags: set[ActiveFlag]
     params.thread_status = some(parse_thread_status(wire_params["status"], flags))
     params.active_flags = flags
-    params.extra_fields = extra_fields(wire_params, "threadId", "status")
+    params.extra_fields = notification_extra_fields(wire_params, "status")
   of "thread/closed":
     result.kind = nk_thread_closed
-    params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    params.extra_fields = extra_fields(wire_params, "threadId")
+    params.extra_fields = notification_extra_fields(wire_params)
   of "error":
     result.kind = nk_error
-    if wire_params.contains("threadId"):
-      params.thread_id = Nullable[string](has_value: true, value: wire_params["threadId"].getStr)
-    if wire_params.contains("turnId"):
-      params.turn_id = some(wire_params["turnId"].getStr)
     if wire_params.contains("error"):
       params.error_message = some(wire_params["error"]["message"].getStr)
     if wire_params.contains("willRetry"):
       params.will_retry = some(wire_params["willRetry"].getBool)
-    params.extra_fields = extra_fields(wire_params, "threadId", "turnId", "error", "willRetry")
+    params.extra_fields = notification_extra_fields(
+      wire_params, "error", "willRetry")
   else:
     result.kind = nk_unknown
     if wire_params.kind == JObject:

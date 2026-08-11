@@ -29,6 +29,7 @@ type
       message_text*: string
       developer_instructions*: string
       graph_creation_node*: bool
+      reasoning_effort*: ReasoningEffort
     of cri_reply_server_request:
       server_request_id*: RequestId
       server_request_node_id*: uint32
@@ -63,6 +64,7 @@ type
     request_id_value*: RequestId
     tool_name*: string
     params_json*: string
+    response_json*: string
     conversation_scoped*: bool
     notification_kind*: NotificationKind
     thread_status*: Option[ThreadStatusKind]
@@ -111,19 +113,20 @@ const
   list_pending_edits_name* = "list_pending_edits"
   get_pending_edit_name* = "get_pending_edit"
   discard_edit_name* = "discard_edit"
-  graph_creation_tool_names = [
-    create_node_name,
-    update_node_name,
-    delete_node_name,
-    reassign_output_name,
-    get_node_name,
-    get_graph_view_name,
-    list_pending_edits_name,
-    get_pending_edit_name,
-    discard_edit_name]
+  llm_worker_type_name* = "llm_worker"
+  graph_creation_type_name* = "graph_creation"
+  human_input_type_name* = "human_input"
+  straightforward_reasoning_name* = "straightforward"
+  bounded_reasoning_name* = "bounded"
+  deep_reasoning_name* = "deep_reasoning"
+
+proc graph_creation_tools*(): seq[DynamicTool]
 
 proc is_graph_creation_tool_name*(name: string): bool =
-  name in graph_creation_tool_names
+  for tool in graph_creation_tools():
+    if tool.name == name:
+      return true
+  false
 
 proc graph_tool(name, description: string; input_schema: JsonNode): DynamicTool =
   DynamicTool(
@@ -144,7 +147,7 @@ proc object_schema(properties: JsonNode; required: seq[string]): JsonNode =
 proc finish_node_tool*(): DynamicTool =
   graph_tool(
     finish_node_name,
-    "Mark the current orchestration node complete.",
+    "Complete node. Tip: write outputs first; graph creators need no pending edits.",
     object_schema(newJObject(), @[]))
 
 proc string_schema(description = ""): JsonNode =
@@ -166,30 +169,53 @@ proc node_definition_schema(): JsonNode =
   properties["objective"] = string_schema("Required node result.")
   properties["inputs"] = newJObject()
   properties["inputs"]["type"] = %"array"
-  properties["inputs"]["items"] = object_schema(
+  properties["inputs"]["description"] = %"File inputs from earlier node outputs."
+  var input_schema = object_schema(
     %*{
-      "producer_node_id": {"type": "integer", "minimum": 1},
-      "path": {"type": "string"},
-      "description": {"type": "string"}
+      "producer_node_id": {
+        "type": "integer", "minimum": 1,
+        "description": "Existing producer node ID."},
+      "path": {
+        "type": "string",
+        "description": "Declared output path on producer."},
+      "description": {
+        "type": "string",
+        "description": "How consumer uses this file."}
     }, @["producer_node_id", "path", "description"])
+  input_schema["description"] = %"All three fields are required."
+  properties["inputs"]["items"] = input_schema
   properties["outputs"] = newJObject()
   properties["outputs"]["type"] = %"array"
-  properties["outputs"]["items"] = object_schema(
+  properties["outputs"]["description"] = %"Files for final user or downstream workers. Omit for human_input; runtime adds response.txt."
+  var output_schema = object_schema(
     %*{
-      "path": {"type": "string"},
-      "description": {"type": "string"},
-      "final": {"type": "boolean"}
+      "path": {
+        "type": "string",
+        "description": "Relative file path this node writes."},
+      "description": {
+        "type": "string",
+        "description": "What this file contains."},
+      "final": {
+        "type": "boolean",
+        "description": "True when reportable to final user."}
     }, @["path", "description"])
+  output_schema["description"] = %"Declare files only; do not use outputs for graph structure."
+  properties["outputs"]["items"] = output_schema
   properties["wait_for"] = newJObject()
   properties["wait_for"]["type"] = %"array"
+  properties["wait_for"]["description"] = %"Node IDs that must complete first."
   properties["wait_for"]["items"] = integer_schema()
   properties["execution_plan"] = object_schema(
     %*{
-      "type": {"type": "string", "enum": ["llm_worker", "graph_creation", "human_input"]},
-      "instructions": {"type": "string"}
+      "type": {"type": "string", "enum": [
+        llm_worker_type_name, graph_creation_type_name, human_input_type_name]},
+      "instructions": {"type": "string"},
+      "reasoning_level": {"type": "string", "enum": [
+        straightforward_reasoning_name, bounded_reasoning_name,
+        deep_reasoning_name]}
     }, @["type", "instructions"])
   object_schema(properties, @[
-    "description", "objective", "inputs", "outputs", "wait_for",
+    "description", "objective", "inputs", "wait_for",
     "execution_plan"])
 
 proc node_changes_schema(): JsonNode =
@@ -233,24 +259,29 @@ proc graph_creation_tools*(): seq[DynamicTool] =
   pending_edit_properties["edit_id"] = integer_schema()
 
   result = @[
-    graph_tool(create_node_name, "Create a pending work node.", object_schema(
+    graph_tool(create_node_name,
+      "Create pending node. Inputs need producer_node_id, path, description; human_input may omit outputs; runtime adds response.txt.", object_schema(
       create_properties, @["node_definition"])),
-    graph_tool(update_node_name, "Replace fields on a pending work node.", object_schema(
+    graph_tool(update_node_name,
+      "Update pending node. On pending_invalid, retry same tool with edit_id.", object_schema(
       update_properties, @["node_id", "changes"])),
-    graph_tool(delete_node_name, "Delete a pending work node.", object_schema(
+    graph_tool(delete_node_name,
+      "Delete pending node. On pending_invalid, retry same tool with edit_id.", object_schema(
       delete_properties, @["node_id"])),
-    graph_tool(reassign_output_name, "Move one declared output between pending nodes.", object_schema(
+    graph_tool(reassign_output_name,
+      "Move declared output. Omit destination_path to keep source path.", object_schema(
       reassign_properties, @[
         "source_node_id", "source_path", "destination_node_id"])),
-    graph_tool(get_node_name, "Inspect one canonical work node.", object_schema(
+    graph_tool(get_node_name, "Read canonical node before editing.", object_schema(
       get_node_properties, @["node_id"])),
-    graph_tool(get_graph_view_name, "Show a simple BFS graph summary.", object_schema(
+    graph_tool(get_graph_view_name,
+      "Inspect graph. Tip: bidirectional, depth 1, max_nodes 8.", object_schema(
       graph_view_properties, @["direction", "depth", "max_nodes"])),
-    graph_tool(list_pending_edits_name, "List staged graph edits.", object_schema(
+    graph_tool(list_pending_edits_name, "List this creator's staged edits.", object_schema(
       newJObject(), @[])),
-    graph_tool(get_pending_edit_name, "Inspect one staged graph edit.", object_schema(
+    graph_tool(get_pending_edit_name, "Inspect staged edit before correcting.", object_schema(
       pending_edit_properties, @["edit_id"])),
-    graph_tool(discard_edit_name, "Discard one staged graph edit.", object_schema(
+    graph_tool(discard_edit_name, "Discard staged edit instead of correcting.", object_schema(
       pending_edit_properties, @["edit_id"]))]
 
 proc emit_event(bridge: ptr CodexBridgeState; event: CodexRuntimeEvent) =
@@ -302,12 +333,6 @@ proc notification_turn_id(notification: Notification): string =
 proc notification_item_id(notification: Notification): string =
   if notification.params.item_id.isSome:
     result = notification.params.item_id.get
-
-proc notification_node_id(thread_nodes: Table[string, uint32];
-    notification: Notification): uint32 =
-  let thread_id = notification_thread_id(notification)
-  if thread_id.len > 0:
-    return node_id_for_thread(thread_nodes, thread_id).get(0'u32)
 
 proc server_request_event(thread_nodes: Table[string, uint32];
     request: ServerRequest): CodexRuntimeEvent =
@@ -368,14 +393,14 @@ proc emit_unknown_notification(bridge: ptr CodexBridgeState;
     text: notification.method_name & " " &
       params_prefix(notification.params.raw_params)))
 
-proc clear_queued_messages(queued_messages: var Table[uint32, seq[string]];
+proc clear_queued_messages(queued_messages: var Table[uint32, string];
     node_id: uint32) =
   queued_messages.del(node_id)
 
 proc send_next_queued_message(runtime: ptr CodexRuntime;
     bridge: ptr CodexBridgeState; node_id: uint32;
     request_nodes: var Table[string, uint32];
-    queued_messages: var Table[uint32, seq[string]]) =
+    queued_messages: var Table[uint32, string]) =
   let agent_id = agent_id_for_node(node_id)
   if not queued_messages.hasKey(node_id):
     return
@@ -384,13 +409,11 @@ proc send_next_queued_message(runtime: ptr CodexRuntime;
   let agent = runtime.agents[agent_id]
   if not agent.thread_id.has_value or agent.state != as_idle:
     return
-  let message = queued_messages[node_id][0]
+  let message = queued_messages[node_id]
   try:
     let request_id = runtime.send_agent_message(agent_id, message)
     request_nodes[request_id_key(request_id)] = node_id
-    queued_messages[node_id].delete(0)
-    if queued_messages[node_id].len == 0:
-      queued_messages.clear_queued_messages(node_id)
+    queued_messages.clear_queued_messages(node_id)
   except CatchableError as error:
     var failed_agent = runtime.agents[agent_id]
     failed_agent.state = as_error
@@ -405,7 +428,7 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
     bridge: ptr CodexBridgeState; message: Message;
     request_nodes: var Table[string, uint32];
     thread_nodes: var Table[string, uint32];
-    queued_messages: var Table[uint32, seq[string]]) =
+    queued_messages: var Table[uint32, string]) =
   case message.kind
   of mk_success:
     let request_key = request_id_key(message.success.id)
@@ -435,82 +458,64 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
           runtime.agents.del(request.agent_id.get)
           queued_messages.clear_queued_messages(node_id)
       elif request.request.kind == mk_turn_start and request.agent_id.isSome:
-        queued_messages.clear_queued_messages(
-          request_nodes.getOrDefault(request_key, node_id))
+        queued_messages.clear_queued_messages(node_id)
     bridge.emit_event(CodexRuntimeEvent(
       kind: event_kind,
       node_id: node_id,
       text: message.error.message))
   of mk_notification:
     let notification = message.notification
+    let thread_id = notification.params.thread_id
+    let thread_node_id = if thread_id.has_value:
+      node_id_for_thread(thread_nodes, thread_id.value)
+    else:
+      none(uint32)
     case notification.kind
     of nk_agent_message_delta:
-      if notification.params.thread_id.has_value and
-          notification.params.delta.isSome:
-        let node_id = node_id_for_thread(
-          thread_nodes, notification.params.thread_id.value)
-        if node_id.isSome:
-          bridge.emit_event(notification_event(
-            notification,
-            node_id.get,
-            cre_agent_message_delta,
-            notification.params.delta.get))
-    of nk_turn_completed:
-      if notification.params.thread_id.has_value:
-        let node_id = node_id_for_thread(
-          thread_nodes, notification.params.thread_id.value)
-        if node_id.isSome:
-          let turn_succeeded = notification.params.turn_status.turn_succeeded
-          queued_messages.clear_queued_messages(node_id.get)
-          if not turn_succeeded:
-            bridge.emit_event(notification_event(
-              notification,
-              node_id.get,
-              cre_node_error,
-              notification.params.error_message.get("turn failed")))
-          else:
-            bridge.emit_event(notification_event(
-              notification,
-              node_id.get,
-              cre_turn_completed))
-    of nk_error:
-      if notification.params.thread_id.has_value:
-        let node_id = node_id_for_thread(
-          thread_nodes, notification.params.thread_id.value)
-        if node_id.isSome:
-          let event_kind = if notification.params.will_retry.retry_requested:
-            cre_global_notification
-          else:
-            cre_node_error
-          if event_kind == cre_node_error:
-            queued_messages.clear_queued_messages(node_id.get)
-          bridge.emit_event(notification_event(
-            notification,
-            node_id.get,
-            event_kind,
-            notification.params.error_message.get("runtime error")))
-      else:
-        let event_kind = if notification.params.will_retry.retry_requested:
-          cre_global_notification
-        else:
-          cre_runtime_error
+      if thread_node_id.isSome and notification.params.delta.isSome:
         bridge.emit_event(notification_event(
           notification,
-          0,
-          event_kind,
-          notification.params.error_message.get("runtime error")))
+          thread_node_id.get,
+          cre_agent_message_delta,
+          notification.params.delta.get))
+    of nk_turn_completed:
+      if thread_node_id.isSome:
+        let node_id = thread_node_id.get
+        let turn_succeeded = notification.params.turn_status.turn_succeeded
+        let event_kind = if turn_succeeded: cre_turn_completed else: cre_node_error
+        let event_text = if turn_succeeded: "" else:
+          notification.params.error_message.get("turn failed")
+        if not turn_succeeded:
+          queued_messages.clear_queued_messages(node_id)
+        bridge.emit_event(notification_event(
+          notification, node_id, event_kind, event_text))
+        if turn_succeeded:
+          queued_messages.clear_queued_messages(node_id)
+    of nk_error:
+      let event_kind = if notification.params.will_retry.retry_requested:
+        cre_global_notification
+      elif thread_node_id.isSome:
+        cre_node_error
+      else:
+        cre_runtime_error
+      let node_id = thread_node_id.get(0'u32)
+      if event_kind == cre_node_error:
+        queued_messages.clear_queued_messages(node_id)
+      bridge.emit_event(notification_event(
+        notification,
+        node_id,
+        event_kind,
+        notification.params.error_message.get("runtime error")))
     of nk_thread_closed:
-      if notification.params.thread_id.has_value:
-        let node_id = node_id_for_thread(
-          thread_nodes, notification.params.thread_id.value)
-        if node_id.isSome:
-          runtime.agents.del(agent_id_for_node(node_id.get))
-          thread_nodes.del(notification.params.thread_id.value)
-          queued_messages.clear_queued_messages(node_id.get)
-          bridge.emit_event(CodexRuntimeEvent(
-            kind: cre_thread_error,
-            node_id: node_id.get,
-            text: "Codex thread closed"))
+      if thread_node_id.isSome:
+        let node_id = thread_node_id.get
+        runtime.agents.del(agent_id_for_node(node_id))
+        thread_nodes.del(thread_id.value)
+        queued_messages.clear_queued_messages(node_id)
+        bridge.emit_event(CodexRuntimeEvent(
+          kind: cre_thread_error,
+          node_id: node_id,
+          text: "Codex thread closed"))
     of nk_unknown:
       if not notification.method_name.is_suppressed_notification:
         emit_unknown_notification(bridge, notification)
@@ -518,7 +523,7 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
       if notification.kind.is_conversation_notification:
         bridge.emit_event(notification_event(
           notification,
-          notification_node_id(thread_nodes, notification)))
+          thread_node_id.get(0'u32)))
   of mk_server_request:
     let request = message.server_request
     if request.kind.is_conversation_server_request:
@@ -536,7 +541,7 @@ proc handle_stdout_line(runtime: ptr CodexRuntime;
     bridge: ptr CodexBridgeState; line: string;
     request_nodes: var Table[string, uint32];
     thread_nodes: var Table[string, uint32];
-    queued_messages: var Table[uint32, seq[string]]) =
+    queued_messages: var Table[uint32, string]) =
   try:
     let message = runtime.accept_json(parseJson(line))
     handle_runtime_message(
@@ -549,7 +554,7 @@ proc handle_stdout_line(runtime: ptr CodexRuntime;
 proc handle_create_node_thread(runtime: ptr CodexRuntime;
     bridge: ptr CodexBridgeState; node_id: uint32;
     request_nodes: var Table[string, uint32]; developer_instructions: string;
-    graph_creation_node: bool) =
+    graph_creation_node: bool; reasoning_effort: ReasoningEffort) =
   let agent_id = agent_id_for_node(node_id)
   if runtime.agents.hasKey(agent_id):
     return
@@ -562,7 +567,7 @@ proc handle_create_node_thread(runtime: ptr CodexRuntime;
       "gpt-5.6-luna",
       tools,
       developer_instructions = developer_instructions,
-      default_effort = re_low)
+      default_effort = reasoning_effort)
     request_nodes[request_id_key(request_id)] = node_id
   except CatchableError as error:
     bridge.emit_event(CodexRuntimeEvent(
@@ -573,32 +578,43 @@ proc handle_create_node_thread(runtime: ptr CodexRuntime;
 proc handle_send_node_message(runtime: ptr CodexRuntime;
     bridge: ptr CodexBridgeState; input: CodexRuntimeInput;
     request_nodes: var Table[string, uint32];
-    queued_messages: var Table[uint32, seq[string]]) =
+    queued_messages: var Table[uint32, string]) =
   let node_id = input.message_node_id
   let agent_id = agent_id_for_node(node_id)
-  queued_messages.mgetOrPut(node_id, @[]).add(input.message_text)
+  if runtime.agents.hasKey(agent_id) and
+      runtime.agents[agent_id].state != as_idle:
+    bridge.emit_event(CodexRuntimeEvent(
+      kind: cre_global_notification,
+      node_id: 0,
+      text: "NODE " & $node_id & " IS BUSY"))
+    return
+  queued_messages[node_id] = input.message_text
   if not runtime.agents.hasKey(agent_id):
     handle_create_node_thread(runtime, bridge, node_id, request_nodes,
-      input.developer_instructions, input.graph_creation_node)
+      input.developer_instructions, input.graph_creation_node,
+      input.reasoning_effort)
     return
   send_next_queued_message(
     runtime, bridge, node_id, request_nodes, queued_messages)
 
 proc handle_command(runtime: ptr CodexRuntime; bridge: ptr CodexBridgeState;
     input: CodexRuntimeInput; request_nodes: var Table[string, uint32];
-    queued_messages: var Table[uint32, seq[string]]) =
+    queued_messages: var Table[uint32, string]) =
   case input.kind
   of cri_send_node_message:
     handle_send_node_message(runtime, bridge, input, request_nodes, queued_messages)
   of cri_reply_server_request:
-    queued_messages.clear_queued_messages(input.server_request_node_id)
     try:
+      let response_json = input.server_response.serialize()
       runtime.reply_server_request(
         input.server_request_id,
-        input.server_response.serialize())
+        response_json)
       bridge.emit_event(CodexRuntimeEvent(
         kind: cre_tool_response_sent,
         node_id: input.server_request_node_id,
+        request_id: request_id_key(input.server_request_id),
+        request_id_value: input.server_request_id,
+        response_json: response_json.pretty,
         conversation_scoped: true,
         server_request_kind: input.server_response.server_request_kind()))
     except CatchableError as error:
@@ -632,7 +648,7 @@ proc codex_worker(state: ptr CodexBridgeState) {.thread.} =
   var runtime: ptr CodexRuntime = nil
   var request_nodes = initTable[string, uint32]()
   var thread_nodes = initTable[string, uint32]()
-  var queued_messages = initTable[uint32, seq[string]]()
+  var queued_messages = initTable[uint32, string]()
   var pending_inputs: seq[CodexRuntimeInput] = @[]
   var should_stop = false
 
@@ -709,13 +725,15 @@ proc new_codex_bridge*(): CodexBridge =
   createThread(result[].worker_thread, codex_worker, result)
 
 proc send_node_message*(bridge: CodexBridge; node_id: uint32; text: string;
-    developer_instructions = ""; graph_creation_node = false) =
+    developer_instructions = ""; graph_creation_node = false;
+    reasoning_effort = re_low) =
   bridge[].input_channel.send(CodexRuntimeInput(
     kind: cri_send_node_message,
     message_node_id: node_id,
     message_text: text,
     developer_instructions: developer_instructions,
-    graph_creation_node: graph_creation_node))
+    graph_creation_node: graph_creation_node,
+    reasoning_effort: reasoning_effort))
 
 proc enqueue_server_response(bridge: CodexBridge;
     input: CodexRuntimeInput): bool =

@@ -9,9 +9,20 @@ type
     graph_creation
     human_input
 
+  ReasoningLevel* = enum
+    straightforward
+    bounded
+    deep_reasoning
+
   ExecutionPlan* = object
     `type`*: ExecutionPlanType
     instructions*: string
+    reasoning_level*: ReasoningLevel
+
+  ExecutionContract = object
+    requires_single_output: bool
+    graph_creator: bool
+    missing_output_label: string
 
   InputArtifactRef* = object
     producer_node_id*: uint32
@@ -106,7 +117,37 @@ type
     outgoing_messages*: seq[WorkGraphMessage]
     next_node_id: uint32
     next_edit_id: uint32
+    final_artifacts_reported: bool
     pending_sequences: seq[PendingEditSequence]
+
+  ResolvedOutputArtifact = object
+    declaration: OutputArtifactDecl
+    path: string
+
+const human_response_output_path = "response.txt"
+
+proc reasoning_effort(level: ReasoningLevel): ReasoningEffort =
+  case level:
+  of straightforward: re_low
+  of bounded: re_medium
+  of deep_reasoning: re_high
+
+proc node_execution_contract(execution_type: ExecutionPlanType): ExecutionContract =
+  result.missing_output_label = "output artifact"
+  case execution_type:
+  of llm_worker:
+    discard
+  of graph_creation:
+    result.graph_creator = true
+  of human_input:
+    result.requires_single_output = true
+    result.missing_output_label = "human input artifact"
+
+proc normalize_runtime_owned_outputs(node: var WorkNode) =
+  if node.execution_plan.`type`.node_execution_contract.requires_single_output:
+    node.outputs = @[OutputArtifactDecl(
+      path: human_response_output_path,
+      description: "Human response")]
 
 proc new_work_graph*(cwd = getCurrentDir(); objective = ""): WorkGraph =
   WorkGraph(
@@ -119,7 +160,8 @@ proc new_work_graph*(cwd = getCurrentDir(); objective = ""): WorkGraph =
         state: pending,
         execution_plan: ExecutionPlan(
           `type`: graph_creation,
-          instructions: "Construct the work graph for the objective. If material ambiguities or underspecifications exist, strongly prefer creating one or more human_input nodes and a subsequent graph_creation node that consumes and synthesizes their responses before expanding the affected work."))],
+          reasoning_level: bounded,
+          instructions: "Construct the work graph for the objective. If a material ambiguity blocks safe execution, create one or more human_input nodes, then a graph_creation node that consumes their responses before expanding the affected work. Human_input always gets implicit response.txt; do not declare it. Graph structure is created only with graph tools; artifacts are files for the final user or downstream workers."))],
     next_node_id: 2,
     next_edit_id: 1)
 
@@ -155,18 +197,31 @@ proc resolve_output_path*(graph: WorkGraph; node_id: uint32;
     output: OutputArtifactDecl): string =
   graph.resolve_artifact_path(node_id, output.path)
 
+proc resolved_output_artifacts(graph: WorkGraph;
+    node: WorkNode): seq[ResolvedOutputArtifact] =
+  for output in node.outputs:
+    result.add(ResolvedOutputArtifact(
+      declaration: output,
+      path: graph.resolve_output_path(node.id, output)))
+
 proc output_declared(node: WorkNode; path: string): bool =
   for output in node.outputs:
     if output.path == path:
       return true
   false
 
+proc duplicate_dependency_id(dependency_ids: seq[uint32]): Option[uint32] =
+  var seen: seq[uint32] = @[]
+  for dependency_id in dependency_ids:
+    if dependency_id in seen:
+      return some(dependency_id)
+    seen.add(dependency_id)
+  none(uint32)
+
 proc node_artifact_error*(graph: WorkGraph; node: WorkNode): string =
-  var wait_for_ids: seq[uint32] = @[]
-  for dependency_id in node.wait_for:
-    if dependency_id in wait_for_ids:
-      return "duplicate wait_for dependency: " & $dependency_id
-    wait_for_ids.add(dependency_id)
+  let duplicate_dependency = node.wait_for.duplicate_dependency_id
+  if duplicate_dependency.isSome:
+    return "duplicate wait_for dependency: " & $duplicate_dependency.get
 
   var output_paths: seq[string] = @[]
   for output in node.outputs:
@@ -176,11 +231,13 @@ proc node_artifact_error*(graph: WorkGraph; node: WorkNode): string =
       return "duplicate output artifact path: " & output.path
     output_paths.add(output.path)
 
-  if node.execution_plan.`type` == graph_creation and node.outputs.len > 0:
-    return "graph_creation nodes cannot declare output artifacts"
-
-  if node.execution_plan.`type` == human_input and node.outputs.len != 1:
-    return "human_input nodes must declare exactly one output artifact"
+  let contract = node.execution_plan.`type`.node_execution_contract
+  if contract.requires_single_output:
+    if node.outputs.len != 1:
+      return "human_input nodes must have exactly one runtime output artifact"
+    if node.outputs[0].path != human_response_output_path:
+      return "human_input output path is runtime-controlled: " &
+        human_response_output_path
 
   for input in node.inputs:
     if not input.path.artifact_path_is_valid:
@@ -283,7 +340,8 @@ proc graph_validation_errors*(graph: WorkGraph): seq[GraphMutationError] =
       result.add(mutation_error(
         "nodes[" & $bootstrap_index & "]",
         "Bootstrap node 1 must be the sole graph root."))
-    if graph.nodes[bootstrap_index].execution_plan.`type` != graph_creation:
+    if not graph.nodes[bootstrap_index].execution_plan.`type`.
+        node_execution_contract.graph_creator:
       result.add(mutation_error(
         "nodes[" & $bootstrap_index & "].execution_plan.type",
         "Bootstrap root must use graph_creation execution."))
@@ -364,12 +422,14 @@ proc dominates(graph: WorkGraph; actor_node_id, target_node_id: uint32): bool =
         queue.add(child_id)
   true
 
+proc is_running_graph_creator(graph: WorkGraph; node_id: uint32): bool =
+  let index = graph.node_index(node_id)
+  index >= 0 and graph.nodes[index].state == running and
+    graph.nodes[index].execution_plan.`type`.node_execution_contract.graph_creator
+
 proc actor_can_edit(graph: WorkGraph; actor_node_id, target_node_id: uint32): bool =
-  let actor_index = graph.node_index(actor_node_id)
   let target_index = graph.node_index(target_node_id)
-  actor_index >= 0 and target_index >= 0 and
-    graph.nodes[actor_index].state == running and
-    graph.nodes[actor_index].execution_plan.`type` == graph_creation and
+  graph.is_running_graph_creator(actor_node_id) and target_index >= 0 and
     graph.nodes[target_index].state == pending and
     graph.dominates(actor_node_id, target_node_id)
 
@@ -394,6 +454,7 @@ proc apply_node_changes(node: var WorkNode; changes: WorkNodeChanges) =
     node.wait_for = changes.wait_for.toSeq
   if changes.has_execution_plan:
     node.execution_plan = changes.execution_plan
+  node.normalize_runtime_owned_outputs
 
 proc apply_edit(graph: var WorkGraph; edit: GraphEdit): bool =
   case edit.kind
@@ -431,8 +492,7 @@ proc apply_edit(graph: var WorkGraph; edit: GraphEdit): bool =
     graph.nodes[source_index].outputs.delete(output_index)
     moved_output.path = if edit.destination_path.len > 0:
       edit.destination_path else: edit.source_path
-    let updated_destination_index = graph.node_index(edit.destination_node_id)
-    graph.nodes[updated_destination_index].outputs.add(moved_output)
+    graph.nodes[destination_index].outputs.add(moved_output)
     for node in graph.nodes.mitems:
       for input in node.inputs.mitems:
         if input.producer_node_id == edit.source_node_id and
@@ -465,9 +525,7 @@ proc reassign_consumer_ids(graph: WorkGraph; edit: GraphEdit): seq[uint32] =
 
 proc edit_authority_errors(graph: WorkGraph; owner_node_id: uint32;
     edit: GraphEdit): seq[GraphMutationError] =
-  let owner_index = graph.node_index(owner_node_id)
-  if owner_index < 0 or graph.nodes[owner_index].state != running or
-      graph.nodes[owner_index].execution_plan.`type` != graph_creation:
+  if not graph.is_running_graph_creator(owner_node_id):
     result.add(mutation_error(
       "caller",
       "Only a running graph_creation node may mutate the graph."))
@@ -512,11 +570,12 @@ proc edit_operation_error(graph: WorkGraph; edit: GraphEdit): seq[GraphMutationE
     if graph.node_index(edit.deleted_node_id) < 0:
       return
   of reassign_output_edit:
-    if graph.node_index(edit.source_node_id) < 0 or
-        graph.node_index(edit.destination_node_id) < 0:
+    let source_index = graph.node_index(edit.source_node_id)
+    let destination_index = graph.node_index(edit.destination_node_id)
+    if source_index < 0 or destination_index < 0:
       return
     var found_source = false
-    for output in graph.nodes[graph.node_index(edit.source_node_id)].outputs:
+    for output in graph.nodes[source_index].outputs:
       if output.path == edit.source_path:
         found_source = true
         break
@@ -530,7 +589,7 @@ proc edit_operation_error(graph: WorkGraph; edit: GraphEdit): seq[GraphMutationE
         "destination_path",
         "Destination path must be relative and traversal-free."))
     if edit.destination_path.len > 0:
-      for output in graph.nodes[graph.node_index(edit.destination_node_id)].outputs:
+      for output in graph.nodes[destination_index].outputs:
         if output.path == edit.destination_path and
             not (edit.source_node_id == edit.destination_node_id and
                  output.path == edit.source_path):
@@ -615,19 +674,38 @@ proc next_node_identifier(graph: var WorkGraph): uint32 =
     for node in graph.nodes:
       if node.id >= graph.next_node_id:
         graph.next_node_id = node.id + 1
-  while graph.node_index(graph.next_node_id) >= 0:
+  while true:
+    var used = graph.node_index(graph.next_node_id) >= 0
+    if not used:
+      for sequence in graph.pending_sequences:
+        for edit in sequence.edits:
+          if edit.kind == create_edit and
+              edit.created_node.id == graph.next_node_id:
+            used = true
+            break
+        if used:
+          break
+    if not used:
+      break
     inc graph.next_node_id
-  for sequence in graph.pending_sequences:
-    for edit in sequence.edits:
-      if edit.kind == create_edit and
-          edit.created_node.id == graph.next_node_id:
-        inc graph.next_node_id
   result = graph.next_node_id
   inc graph.next_node_id
 
 proc next_edit_identifier(graph: var WorkGraph): uint32 =
   if graph.next_edit_id == 0:
     graph.next_edit_id = 1
+  while true:
+    var used = false
+    for sequence in graph.pending_sequences:
+      for edit in sequence.edits:
+        if edit.id == graph.next_edit_id:
+          used = true
+          break
+      if used:
+        break
+    if not used:
+      break
+    inc graph.next_edit_id
   result = graph.next_edit_id
   inc graph.next_edit_id
 
@@ -775,10 +853,50 @@ proc stage_or_commit(graph: var WorkGraph; owner_node_id: uint32;
     edit_id = staged_edit.id,
     errors = errors)
 
+proc speculative_graph_before_create(graph: WorkGraph;
+    owner_node_id, edit_id: uint32): WorkGraph =
+  let sequence_index = graph.pending_sequence_index(owner_node_id)
+  if sequence_index < 0:
+    return graph.copy_graph
+
+  let sequence = graph.pending_sequences[sequence_index]
+  var end_index = sequence.edits.len
+  if edit_id > 0:
+    let edit_index = sequence.pending_edit_index(edit_id)
+    if edit_index >= 0:
+      end_index = edit_index
+  if end_index == 0:
+    return graph.copy_graph
+  discard graph.replay_edits(
+    owner_node_id,
+    sequence.edits[0 ..< end_index],
+    result)
+
+proc owner_dependency_is_implied(graph: WorkGraph; owner_node_id: uint32;
+    node: WorkNode): bool =
+  var has_proposed_parent = false
+  for dependency_id in node.wait_for:
+    has_proposed_parent = true
+    if dependency_id == owner_node_id:
+      return true
+  for input in node.inputs:
+    has_proposed_parent = true
+    if input.producer_node_id == owner_node_id:
+      return true
+
+  for dependency_id in node.wait_for:
+    if not graph.dominates(owner_node_id, dependency_id):
+      return false
+  for input in node.inputs:
+    if not graph.dominates(owner_node_id, input.producer_node_id):
+      return false
+  has_proposed_parent
+
 proc create_node*(graph: var WorkGraph; owner_node_id: uint32;
     node_definition: WorkNode; edit_id = 0'u32): GraphMutationResult =
   var node = node_definition
   node.state = pending
+  node.normalize_runtime_owned_outputs
   var staged_node_id = 0'u32
   if edit_id > 0:
     let sequence_index = graph.pending_sequence_index(owner_node_id)
@@ -788,12 +906,8 @@ proc create_node*(graph: var WorkGraph; owner_node_id: uint32;
           graph.pending_sequences[sequence_index].edits[edit_index].kind == create_edit:
         staged_node_id = graph.pending_sequences[sequence_index].edits[edit_index].created_node.id
   node.id = if staged_node_id > 0: staged_node_id else: graph.next_node_identifier()
-  var has_owner_input = false
-  for input in node.inputs:
-    if input.producer_node_id == owner_node_id:
-      has_owner_input = true
-      break
-  if owner_node_id notin node.wait_for and not has_owner_input:
+  let speculative = graph.speculative_graph_before_create(owner_node_id, edit_id)
+  if not speculative.owner_dependency_is_implied(owner_node_id, node):
     node.wait_for.add(owner_node_id)
   graph.stage_or_commit(
     owner_node_id,
@@ -910,16 +1024,27 @@ proc parse_identifier(node: JsonNode; field_path: string): uint32 =
 
 proc parse_execution_plan(node: JsonNode; field_path: string): ExecutionPlan =
   let value = node.require_object(field_path)
-  value.reject_unknown_fields(field_path, ["type", "instructions"])
+  value.reject_unknown_fields(
+    field_path, ["type", "instructions", "reasoning_level"])
   let type_name = value["type"].require_string(field_path & ".type")
   let execution_type = case type_name
-    of "llm_worker": llm_worker
-    of "graph_creation": graph_creation
-    of "human_input": human_input
+    of llm_worker_type_name: llm_worker
+    of graph_creation_type_name: graph_creation
+    of human_input_type_name: human_input
     else: raise newException(ValueError, field_path & ".type is invalid")
+  let reasoning_level = if value.contains("reasoning_level"):
+    case value["reasoning_level"].require_string(field_path & ".reasoning_level")
+    of straightforward_reasoning_name: straightforward
+    of bounded_reasoning_name: bounded
+    of deep_reasoning_name: deep_reasoning
+    else: raise newException(ValueError,
+      field_path & ".reasoning_level is invalid")
+  else:
+    straightforward
   ExecutionPlan(
     `type`: execution_type,
-    instructions: value["instructions"].require_string(field_path & ".instructions"))
+    instructions: value["instructions"].require_string(field_path & ".instructions"),
+    reasoning_level: reasoning_level)
 
 proc parse_inputs(node: JsonNode; field_path: string): seq[InputArtifactRef] =
   let values = node.require_array(field_path)
@@ -963,9 +1088,9 @@ proc parse_wait_for(node: JsonNode; field_path: string): seq[uint32] =
   for index in 0 ..< values.len:
     let item = values[index]
     let dependency_id = parse_identifier(item, field_path & "[" & $index & "]")
-    if dependency_id in result:
-      raise newException(ValueError, field_path & "[" & $index & "] duplicates dependency " & $dependency_id)
     result.add(dependency_id)
+    if result.duplicate_dependency_id.isSome:
+      raise newException(ValueError, field_path & "[" & $index & "] duplicates dependency " & $dependency_id)
 
 proc parse_node_definition*(node: JsonNode): WorkNode =
   let value = node.require_object("node_definition")
@@ -973,6 +1098,10 @@ proc parse_node_definition*(node: JsonNode): WorkNode =
     "node_definition",
     ["description", "objective", "inputs", "outputs", "wait_for",
      "execution_plan"])
+  let parsed_outputs = if value.contains("outputs"):
+    parse_outputs(value["outputs"], "node_definition.outputs")
+  else:
+    @[]
   result = WorkNode(
     description: value.require_field("description", "node_definition.description").require_string(
       "node_definition.description"),
@@ -981,9 +1110,7 @@ proc parse_node_definition*(node: JsonNode): WorkNode =
     inputs: parse_inputs(
       value.require_field("inputs", "node_definition.inputs"),
       "node_definition.inputs"),
-    outputs: parse_outputs(
-      value.require_field("outputs", "node_definition.outputs"),
-      "node_definition.outputs"),
+    outputs: parsed_outputs,
     wait_for: parse_wait_for(
       value.require_field("wait_for", "node_definition.wait_for"),
       "node_definition.wait_for"),
@@ -1045,10 +1172,13 @@ proc input_ref_json(input: InputArtifactRef): JsonNode =
   }
 
 proc execution_plan_json(plan: ExecutionPlan): JsonNode =
-  %*{
+  var value = %*{
     "type": $plan.`type`,
     "instructions": plan.instructions
   }
+  if not plan.`type`.node_execution_contract.requires_single_output:
+    value["reasoning_level"] = %($plan.reasoning_level)
+  value
 
 proc node_json(node: WorkNode): JsonNode =
   result = %*{
@@ -1137,7 +1267,7 @@ proc pending_edit_json(sequence: PendingEditSequence; edit_index: int;
   for error in evaluation.errors:
     result["errors"].add(error.mutation_error_json)
 
-proc pending_edit_json(graph: WorkGraph; owner_node_id, edit_id: uint32): JsonNode =
+proc pending_edit_json*(graph: WorkGraph; owner_node_id, edit_id: uint32): JsonNode =
   let sequence_index = graph.pending_sequence_index(owner_node_id)
   if sequence_index < 0:
     raise newException(ValueError, "pending edit does not exist")
@@ -1213,6 +1343,7 @@ proc graph_view_summary*(graph: WorkGraph; owner_node_id: uint32;
     let incoming = node.node_dependency_ids
     let outgoing = graph.dependency_children(node.id).mapIt($it)
     result.add("Node " & $node.id & ": " & node.description & "\n")
+    result.add("  Type: " & $node.execution_plan.`type` & "\n")
     result.add("  Incoming: " & (if incoming.len == 0: "none" else: incoming.mapIt($it).join(", ")) & "\n")
     result.add("  Outgoing: " & (if outgoing.len == 0: "none" else: outgoing.join(", ")))
     if index + 1 < queue.len:
@@ -1226,48 +1357,94 @@ proc node_completion_error*(graph: WorkGraph; node_id: uint32): string =
   result = graph.node_artifact_error(node)
   if result.len > 0:
     return
-  if node.execution_plan.`type` == human_input:
-    let path = graph.resolve_output_path(node_id, node.outputs[0])
-    if not fileExists(path):
-      return "missing human input artifact: " & path
-    return
-  if node.execution_plan.`type` == graph_creation and
-      graph.pending_sequence_index(node_id) >= 0:
+  let resolved_outputs = graph.resolved_output_artifacts(node)
+  let contract = node.execution_plan.`type`.node_execution_contract
+  if contract.graph_creator and graph.pending_sequence_index(node_id) >= 0:
     return "graph-creation node has pending edits"
-  if node.execution_plan.`type` != llm_worker:
-    return
-  for output in node.outputs:
-    let path = graph.resolve_output_path(node_id, output)
-    if not fileExists(path):
-      return "missing output artifact: " & path
+  for output in resolved_outputs:
+    if not path_exists(output.path):
+      return "missing " & contract.missing_output_label & ": " & output.path
 
-proc add_artifact_prompt(result: var string; path, description: string) =
-  result.add("Resolved path: " & path & "\n")
-  result.add("Description: " & description & "\n\n")
+proc add_artifact_prompt(result: var string; title, path, description: string) =
+  result.add("  - " & title & "\n")
+  result.add("    Resolved path: " & path & "\n")
+  result.add("    Description: " & description & "\n")
+
+proc add_node_prompt_contract(result: var string; node: WorkNode) =
+  let contract = node.execution_plan.`type`.node_execution_contract
+  result.add("Completion rules:\n")
+  if contract.graph_creator:
+    result.add("  - Use graph tools for graph changes.\n")
+    result.add("  - Artifacts are files for the final user or downstream workers; " &
+      "graph structure uses tools, not files.\n")
+    result.add("  - Inputs require producer_node_id, path, description; " &
+      "normal outputs require path, description; final is optional. " &
+      "Human_input omits outputs; runtime adds response.txt.\n")
+    result.add("Graph tool guide: only this running graph_creation node may use tools; " &
+      "inspect; mutate pending nodes dominated by this creator; " &
+      "on pending_invalid, retry same tool with edit_id or discard_edit; finish last.\n")
+    result.add("  - Correct or discard every pending invalid edit before finishing.\n")
+    result.add("  - Correct a pending edit with its edit_id and original tool, or discard it.\n")
+  elif contract.requires_single_output:
+    result.add("  - Human-input node; no model execution; response.txt output is implicit; do not declare it.\n")
+  else:
+    result.add("  - Do not create or modify the work graph.\n")
+  result.add("  - Write every declared output before calling finish_node.\n")
+  result.add("  - Call finish_node only after completion rules are satisfied.\n")
 
 proc node_developer_prompt*(graph: WorkGraph; node: WorkNode): string =
-  if node.inputs.len == 0 and node.outputs.len == 0:
-    return ""
-  result = ""
+  result.add("Current orchestration node:\n")
+  result.add("  ID: " & $node.id & "\n")
+  result.add("  Type: " & $node.execution_plan.`type` & "\n")
+  result.add("  Reasoning level: " & $node.execution_plan.reasoning_level & "\n")
+  result.add("  Description: " & node.description & "\n")
+  result.add("  Objective: " & node.objective & "\n")
+  result.add("  State: " & $node.state & "\n")
+  result.add("  Explicit dependencies: " &
+    (if node.wait_for.len == 0: "none" else: node.wait_for.mapIt($it).join(", ")) & "\n\n")
   if node.inputs.len > 0:
-    result.add("Input artifacts:\n")
+    result.add("Input artifacts (read from these paths):\n")
   for input in node.inputs:
-    result.add_artifact_prompt(graph.resolve_input_path(input), input.description)
-  if node.outputs.len > 0:
-    result.add("Output artifacts:\n")
-  for output in node.outputs:
     result.add_artifact_prompt(
-      graph.resolve_output_path(node.id, output), output.description)
+      "From node " & $input.producer_node_id,
+      graph.resolve_input_path(input), input.description)
+  if node.outputs.len > 0:
+    result.add("Output artifacts (write before completion):\n")
+  for output in graph.resolved_output_artifacts(node):
+    result.add_artifact_prompt(
+      if output.declaration.final: "Final output" else: "Output",
+      output.path, output.declaration.description)
+  result.add("\n")
+  result.add_node_prompt_contract(node)
+  result.add("\nNearby canonical graph:\n")
+  result.add(graph.graph_view_summary(node.id, "bidirectional", 1, 8))
 
 proc final_artifact_paths*(graph: WorkGraph): seq[string] =
   for node in graph.nodes:
     if node.state != completed:
       continue
-    for output in node.outputs:
-      if output.final:
-        let path = graph.resolve_output_path(node.id, output)
-        if fileExists(path):
-          result.add(path)
+    for output in graph.resolved_output_artifacts(node):
+      if output.declaration.final and path_exists(output.path):
+        result.add(output.path)
+
+proc all_nodes_completed(graph: WorkGraph): bool =
+  if graph.nodes.len == 0:
+    return false
+  for node in graph.nodes:
+    if node.state != completed:
+      return false
+  true
+
+proc report_final_artifacts(graph: var WorkGraph) =
+  graph.final_artifacts_reported = true
+  let paths = graph.final_artifact_paths
+  var message = "ORCHESTRATION COMPLETE\nFinal artifacts:"
+  if paths.len == 0:
+    message.add(" none")
+  else:
+    for path in paths:
+      message.add("\n  " & path)
+  graph.outgoing_messages.add(WorkGraphMessage(node_id: 0, text: message))
 
 proc node_runnable(graph: WorkGraph; node: WorkNode): bool =
   if node.state != pending:
@@ -1290,14 +1467,13 @@ proc runnable_node_ids*(graph: WorkGraph): seq[uint32] =
       result.add(node.id)
 
 proc node_prompt(node: WorkNode): string =
-  result = node.execution_plan.instructions
+  if node.execution_plan.`type`.node_execution_contract.requires_single_output:
+    return node.execution_plan.instructions
+  result = "Execute this orchestration task."
+  if node.execution_plan.instructions.len > 0:
+    result.add("\n\nInstructions:\n" & node.execution_plan.instructions)
   if node.objective.len > 0:
-    if result.len > 0:
-      result.add("\n\n")
-    result.add("Objective:\n" & node.objective)
-  if result.len > 0:
-    return
-  return "Your execution type is " & $node.execution_plan.`type` & ". Do nothing."
+    result.add("\n\nObjective:\n" & node.objective)
 
 proc log_node_failure(graph: var WorkGraph; node_id: uint32; reason: string) =
   graph.log_messages.add("NODE " & $node_id & " FAILED: " & reason)
@@ -1311,7 +1487,7 @@ proc fail_node*(graph: var WorkGraph; node_id: uint32; reason: string): bool =
     graph.nodes[index].state.node_state_is_active
   if can_fail:
     graph.nodes[index].state = failed
-    if graph.nodes[index].execution_plan.`type` == graph_creation:
+    if graph.nodes[index].execution_plan.`type`.node_execution_contract.graph_creator:
       let sequence_index = graph.pending_sequence_index(node_id)
       if sequence_index >= 0:
         graph.pending_sequences.delete(sequence_index)
@@ -1322,6 +1498,8 @@ proc complete_node_state(graph: var WorkGraph; index: int): bool =
   if index < 0 or not graph.nodes[index].state.node_state_is_active:
     return false
   graph.nodes[index].state = completed
+  if graph.all_nodes_completed and not graph.final_artifacts_reported:
+    graph.report_final_artifacts
   true
 
 proc attempt_completion_error*(graph: var WorkGraph; node_id: uint32): string =
@@ -1369,15 +1547,18 @@ proc mark_awaiting_human_input*(graph: var WorkGraph; node_id: uint32): bool =
 proc answer_human_input*(graph: var WorkGraph; node_id: uint32;
     answer: string): bool =
   let index = graph.node_index(node_id)
-  if index < 0 or graph.nodes[index].execution_plan.`type` != human_input or
-      graph.nodes[index].state != awaiting_human_input or answer.strip.len == 0:
+  if index < 0:
+    return false
+  let node = graph.nodes[index]
+  if not node.execution_plan.`type`.node_execution_contract.requires_single_output or
+      node.state != awaiting_human_input or answer.strip.len == 0:
     return false
   try:
-    let path = graph.resolve_output_path(node_id, graph.nodes[index].outputs[0])
+    let path = graph.resolve_artifact_path(node_id, human_response_output_path)
     createDir(graph.graph_artifact_root)
     createDir(parentDir(path))
     writeFile(path, "Instructions:\n" &
-      graph.nodes[index].execution_plan.instructions &
+      node.execution_plan.instructions &
       "\n\nResponse:\n" & answer)
     graph.attempt_completion(node_id)
   except CatchableError as error:
@@ -1390,16 +1571,21 @@ proc drain_outgoing_messages*(graph: var WorkGraph): seq[WorkGraphMessage] =
 
 proc send_work_graph_message(graph: var WorkGraph; bridge: CodexBridge;
     node_id: uint32; text: string; developer_instructions = "";
-    graph_creation_node = false): bool =
+    graph_creation_node = false; effort = re_low): bool =
   try:
     bridge.send_node_message(
       node_id,
       text,
       developer_instructions,
-      graph_creation_node)
+      graph_creation_node,
+      effort)
     graph.outgoing_messages.add(WorkGraphMessage(
       node_id: node_id,
       text: text))
+    if developer_instructions.len > 0:
+      graph.outgoing_messages.add(WorkGraphMessage(
+        node_id: node_id,
+        text: "DEVELOPER INSTRUCTIONS:\n" & developer_instructions))
     true
   except CatchableError as error:
     discard graph.fail_node(node_id, error.msg)
@@ -1407,25 +1593,30 @@ proc send_work_graph_message(graph: var WorkGraph; bridge: CodexBridge;
 
 proc start_available_nodes*(graph: var WorkGraph; bridge: CodexBridge) =
   for index in 0 ..< graph.nodes.len:
-    if not graph.node_runnable(graph.nodes[index]):
+    let node = graph.nodes[index]
+    let contract = node.execution_plan.`type`.node_execution_contract
+    let prompt = node.node_prompt
+    if not graph.node_runnable(node):
       continue
-    let node_id = graph.nodes[index].id
-    let prompt = graph.nodes[index].node_prompt()
-    let developer_prompt = graph.node_developer_prompt(graph.nodes[index])
-    if graph.nodes[index].execution_plan.`type` == human_input:
+    let node_id = node.id
+    if contract.requires_single_output:
       if graph.mark_awaiting_human_input(node_id):
         graph.outgoing_messages.add(WorkGraphMessage(
-          node_id: node_id, text: prompt))
+          node_id: node_id,
+          text: prompt))
       continue
     if bridge == nil:
       continue
     graph.nodes[index].state = running
+    let running_node = graph.nodes[index]
+    let developer_prompt = graph.node_developer_prompt(running_node)
     discard graph.send_work_graph_message(
       bridge,
       node_id,
       prompt,
       developer_prompt,
-      graph.nodes[index].execution_plan.`type` == graph_creation)
+      contract.graph_creator,
+      running_node.execution_plan.reasoning_level.reasoning_effort)
 
 proc reply_tool_call(bridge: CodexBridge; event: CodexRuntimeEvent;
     success: bool; message: string): bool =
@@ -1457,9 +1648,7 @@ proc parse_nonnegative_int(node: JsonNode; field_path: string): int =
 proc handle_graph_tool_call(graph: var WorkGraph; bridge: CodexBridge;
     event: CodexRuntimeEvent): string =
   try:
-    let owner_index = graph.node_index(event.node_id)
-    if owner_index < 0 or graph.nodes[owner_index].state != running or
-        graph.nodes[owner_index].execution_plan.`type` != graph_creation:
+    if not graph.is_running_graph_creator(event.node_id):
       raise newException(ValueError,
         "graph-creation tools require a running graph_creation node")
     let args = event.event_arguments.require_object("arguments")
@@ -1552,31 +1741,38 @@ proc handle_finish_node_call(graph: var WorkGraph; bridge: CodexBridge;
     discard graph.fail_node(event.node_id, result)
     discard bridge.reply_tool_call(event, false, "finish_node failed")
 
+proc handle_graph_server_request(graph: var WorkGraph; bridge: CodexBridge;
+    event: CodexRuntimeEvent): string =
+  if event.server_request_kind == sr_tool_user_input:
+    let index = graph.node_index(event.node_id)
+    if index >= 0 and graph.nodes[index].execution_plan.`type`.
+        node_execution_contract.requires_single_output:
+      discard graph.mark_awaiting_human_input(event.node_id)
+  elif event.server_request_kind == sr_tool_call:
+    if event.tool_name == finish_node_name:
+      result = graph.handle_finish_node_call(bridge, event)
+    elif event.tool_name.is_graph_creation_tool_name:
+      result = graph.handle_graph_tool_call(bridge, event)
+    else:
+      discard graph.fail_node(
+        event.node_id,
+        "unknown dynamic tool: " & event.tool_name)
+      discard bridge.reply_tool_call(event, false, "unknown dynamic tool")
+
 proc handle_codex_event*(graph: var WorkGraph; bridge: CodexBridge;
     event: CodexRuntimeEvent): string =
   case event.kind
   of cre_global_notification:
+    let thread_status = event.thread_status
     if event.notification_kind == nk_thread_status_changed and
-        event.thread_status.isSome and
-        event.thread_status.get.thread_status_is_terminal:
-      let reason = if event.thread_status.get == tsk_system_error:
-        "Codex thread system error" else: "Codex thread not loaded"
-      discard graph.fail_node(event.node_id, reason)
-    elif event.server_request_kind == sr_tool_user_input:
-      let index = graph.node_index(event.node_id)
-      if index >= 0 and
-          graph.nodes[index].execution_plan.`type` == human_input:
-        discard graph.mark_awaiting_human_input(event.node_id)
-    elif event.server_request_kind == sr_tool_call:
-      if event.tool_name == finish_node_name:
-        result = graph.handle_finish_node_call(bridge, event)
-      elif event.tool_name.is_graph_creation_tool_name:
-        result = graph.handle_graph_tool_call(bridge, event)
-      else:
-        discard graph.fail_node(
-          event.node_id,
-          "unknown dynamic tool: " & event.tool_name)
-        discard bridge.reply_tool_call(event, false, "unknown dynamic tool")
+        thread_status.isSome:
+      let status = thread_status.get
+      if status.thread_status_is_terminal:
+        let reason = if status == tsk_system_error:
+          "Codex thread system error" else: "Codex thread not loaded"
+        discard graph.fail_node(event.node_id, reason)
+    elif event.server_request_kind in {sr_tool_user_input, sr_tool_call}:
+      result = graph.handle_graph_server_request(bridge, event)
   of cre_turn_completed:
     result = graph.attempt_completion_error(event.node_id)
   of cre_tool_response_sent:

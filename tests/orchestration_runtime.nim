@@ -38,6 +38,7 @@ createDir(artifact_root)
 let bootstrap = new_work_graph(test_root, "build a thing")
 doAssert bootstrap.nodes.len == 1
 doAssert bootstrap.nodes[0].execution_plan.`type` == graph_creation
+doAssert bootstrap.nodes[0].execution_plan.reasoning_level == bounded
 doAssert bootstrap.nodes[0].objective == "build a thing"
 doAssert bootstrap.nodes[0].execution_plan.instructions.len > 0
 
@@ -133,6 +134,23 @@ doAssert direct_human_graph.nodes[0].state == completed
 doAssert readFile(joinPath(artifact_root, "7", "response.txt")) ==
   "Instructions:\nChoose a direction\n\nResponse:\nforward"
 
+var report_graph = WorkGraph(
+  artifact_root: artifact_root,
+  nodes: @[WorkNode(
+    id: 10,
+    state: running,
+    outputs: @[OutputArtifactDecl(
+      path: "final.txt", description: "Final", final: true)],
+    execution_plan: ExecutionPlan(`type`: llm_worker, instructions: "Work"))])
+createDir(joinPath(artifact_root, "10"))
+writeFile(joinPath(artifact_root, "10", "final.txt"), "final")
+doAssert report_graph.complete_node(10)
+let completion_messages = report_graph.drain_outgoing_messages()
+doAssert completion_messages.len == 1
+doAssert completion_messages[0].node_id == 0
+doAssert completion_messages[0].text.contains(
+  joinPath(artifact_root, "10", "final.txt"))
+
 var closed_input_graph = WorkGraph(nodes: @[
   WorkNode(id: 8, state: awaiting_human_input)])
 discard closed_input_graph.handle_codex_event(nil, CodexRuntimeEvent(
@@ -170,14 +188,19 @@ doAssert artifact_graph.runnable_node_ids() == @[21'u32]
 doAssert artifact_graph.final_artifact_paths() == @[
   joinPath(artifact_root, "20", "result.txt")]
 let developer_prompt = artifact_graph.node_developer_prompt(artifact_graph.nodes[1])
-doAssert developer_prompt.contains("Input artifacts:")
-doAssert developer_prompt.contains("Output artifacts:")
+doAssert developer_prompt.contains("Current orchestration node:")
+doAssert developer_prompt.contains("Type: llm_worker")
+doAssert developer_prompt.contains("Reasoning level: straightforward")
+doAssert developer_prompt.contains("Input artifacts (read from these paths):")
+doAssert developer_prompt.contains("Output artifacts (write before completion):")
+doAssert developer_prompt.contains("From node 20")
 doAssert developer_prompt.contains(
   joinPath(artifact_root, "20", "result.txt"))
 doAssert developer_prompt.contains(
   joinPath(artifact_root, "21", "final.txt"))
 doAssert developer_prompt.contains("input result")
 doAssert developer_prompt.contains("final result")
+doAssert developer_prompt.contains("Nearby canonical graph:")
 doAssert not developer_prompt.contains("producer_node_id")
 
 var invalid_graph = WorkGraph(nodes: @[WorkNode(
