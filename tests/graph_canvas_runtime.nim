@@ -224,6 +224,27 @@ doAssert graph.hovered_node_valid
 graph.handle_event(UiEvent(kind: ui_event_window_focus_lost))
 doAssert not graph.hovered_node_valid
 
+var sync_graph = GraphView(work_graph: WorkGraph(nodes: @[
+  WorkNode(
+    id: 1,
+    outputs: @[OutputArtifactDecl(path: "result.txt", description: "Result")],
+    execution_plan: ExecutionPlan(`type`: llm_worker))
+]))
+var sync_config = default_graph_layout_config()
+sync_config.transition_seconds = 0
+doAssert sync_graph.begin_graph_layout(sync_config)
+sync_graph.work_graph.nodes.add(WorkNode(
+  id: 2,
+  inputs: @[InputArtifactRef(
+    producer_node_id: 1,
+    path: "result.txt",
+    description: "Result")],
+  execution_plan: ExecutionPlan(`type`: llm_worker)))
+discard sync_graph.step_graph_layout(0)
+doAssert sync_graph.layout_solver.positions.len == 2
+doAssert sync_graph.layout_solver.positions[0].x <
+  sync_graph.layout_solver.positions[1].x
+
 var raw_wheel = SdlMouseWheelEvent(
   kind: sdl_event_mouse_wheel,
   x: 0,

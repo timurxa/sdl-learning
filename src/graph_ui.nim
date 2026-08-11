@@ -119,6 +119,9 @@ proc default_graph_layout_config*(): GraphLayoutConfig =
     transition_seconds: 0.18'f32,
     crossing_sweeps: 8)
 
+proc work_node_dimensions(): ClayDimensions {.inline.} =
+  dimensions(work_node_size, work_node_size)
+
 proc valid_graph_float(value: float32): bool {.inline.}
 
 proc graph_layout_edge_key(edge: GraphLayoutEdge): uint64 {.inline.} =
@@ -129,10 +132,17 @@ proc work_node_default_position(index: int): ClayVector2 {.inline.} =
 
 proc work_graph_edges(work_graph: WorkGraph): seq[GraphLayoutEdge] =
   for node in work_graph.nodes:
-    for dependency_id in node.wait_for:
+    for dependency_id in node.node_dependency_ids:
       result.add(GraphLayoutEdge(
         start_node_id: dependency_id,
         end_node_id: node.id))
+
+proc work_graph_edge_keys(work_graph: WorkGraph): seq[uint64] =
+  var edges = work_graph.work_graph_edges()
+  edges.sort(proc(left, right: GraphLayoutEdge): int =
+    cmp(graph_layout_edge_key(left), graph_layout_edge_key(right)))
+  for edge in edges:
+    result.add(graph_layout_edge_key(edge))
 
 proc work_graph_layout_nodes(work_graph: WorkGraph): seq[GraphNode] =
   result = newSeq[GraphNode](work_graph.nodes.len)
@@ -140,7 +150,7 @@ proc work_graph_layout_nodes(work_graph: WorkGraph): seq[GraphNode] =
     result[index] = GraphNode(
       stable_id: node.id,
       screen_position: work_node_default_position(index),
-      size: dimensions(work_node_size, work_node_size))
+      size: work_node_dimensions())
 
 proc graph_layout_center(position: ClayVector2; size: ClayDimensions): ClayVector2 {.inline.} =
   vector2(
@@ -515,16 +525,17 @@ proc graph_layout_positions_close(solver: GraphLayoutSolver): bool =
   true
 
 proc normalize_graph_layout_config(config: GraphLayoutConfig): GraphLayoutConfig =
+  let defaults = default_graph_layout_config()
   result = config
   if result.layer_gap < 0 or not valid_graph_float(result.layer_gap):
-    result.layer_gap = 72'f32
+    result.layer_gap = defaults.layer_gap
   if result.node_gap < 0 or not valid_graph_float(result.node_gap):
-    result.node_gap = 24'f32
+    result.node_gap = defaults.node_gap
   if result.transition_seconds < 0 or
       not valid_graph_float(result.transition_seconds):
-    result.transition_seconds = 0.18'f32
+    result.transition_seconds = defaults.transition_seconds
   if result.crossing_sweeps < 1:
-    result.crossing_sweeps = 8
+    result.crossing_sweeps = defaults.crossing_sweeps
 
 proc begin_graph_layout*(solver: var GraphLayoutSolver;
     nodes: openArray[GraphNode]; edges: openArray[GraphLayoutEdge];
@@ -544,16 +555,7 @@ proc begin_graph_layout*(solver: var GraphLayoutSolver;
   for index, edge in edges:
     ordered_edges[index] = edge
   ordered_edges.sort(proc(left, right: GraphLayoutEdge): int =
-    if left.start_node_id < right.start_node_id:
-      -1
-    elif left.start_node_id > right.start_node_id:
-      1
-    elif left.end_node_id < right.end_node_id:
-      -1
-    elif left.end_node_id > right.end_node_id:
-      1
-    else:
-      0)
+    cmp(graph_layout_edge_key(left), graph_layout_edge_key(right)))
 
   var current_edge_table = initTable[uint64, bool]()
   var current_edge_keys = newSeq[uint64](ordered_edges.len)
@@ -780,7 +782,22 @@ proc begin_graph_layout*(graph: var GraphView;
   graph.layout_solver.begin_graph_layout(
     graph.work_graph, config)
 
+proc graph_layout_needs_sync(graph: GraphView): bool {.inline.} =
+  if graph.layout_solver.node_ids.len != graph.work_graph.nodes.len:
+    return true
+  for index, node in graph.work_graph.nodes:
+    if graph.layout_solver.node_ids[index] != node.id:
+      return true
+  graph.layout_solver.edge_keys != graph.work_graph.work_graph_edge_keys()
+
+proc sync_graph_layout(graph: var GraphView): bool {.inline.} =
+  if not graph.graph_layout_needs_sync:
+    return true
+  graph.layout_solver.begin_graph_layout(
+    graph.work_graph, graph.layout_solver.config)
+
 proc step_graph_layout*(graph: var GraphView; delta_time: float32): bool =
+  discard graph.sync_graph_layout()
   graph.animation_time += max(delta_time, 0'f32)
   while graph.animation_time >= graph_node_spinner_period:
     graph.animation_time -= graph_node_spinner_period
@@ -820,21 +837,15 @@ proc graph_node_geometry(graph: GraphView; position: ClayVector2;
   result.circle_origin = graph.graph_transform_point(circle_origin_world)
   result.circle_diameter = circle_diameter_world * graph.zoom
 
-proc work_node_index_by_id(graph: GraphView; node_id: uint32): int {.inline.} =
-  for index, node in graph.work_graph.nodes:
-    if node.id == node_id:
-      return index
-  -1
-
 proc work_node_position(graph: GraphView; node_id: uint32): ClayVector2 =
   for index, current_id in graph.layout_solver.node_ids:
     if current_id == node_id and index < graph.layout_solver.positions.len:
       return graph.layout_solver.positions[index]
-  let node_index = graph.work_node_index_by_id(node_id)
+  let node_index = graph.work_graph.node_index(node_id)
   work_node_default_position(max(node_index, 0))
 
 proc work_node_geometry(graph: GraphView; node: WorkNode): GraphNodeGeometry =
-  let size = dimensions(work_node_size, work_node_size)
+  let size = work_node_dimensions()
   graph.graph_node_geometry(graph.work_node_position(node.id), size)
 
 proc graph_local_pointer(graph: GraphView; pointer: ClayVector2): ClayVector2 {.inline.} =
@@ -1028,7 +1039,7 @@ proc handle_event*(graph: var GraphView; event: UiEvent) =
     discard
 
 proc graph_contains_node(graph: GraphView; node_id: uint32): bool {.inline.} =
-  graph.work_node_index_by_id(node_id) >= 0
+  graph.work_graph.node_index(node_id) >= 0
 
 proc add_graph_arrow_between(graph: var GraphView;
     start_center, end_center: ClayVector2;
@@ -1068,7 +1079,8 @@ proc add_work_graph_arrow(graph: var GraphView;
     return
   let start_position = graph.work_node_position(start_node_id)
   let end_position = graph.work_node_position(end_node_id)
-  let radius = float32(work_node_size) / 2'f32
+  let node_dimensions = work_node_dimensions()
+  let radius = float32(min(node_dimensions.width, node_dimensions.height)) / 2'f32
   graph.add_graph_arrow_between(
     vector2(start_position.x + radius, start_position.y + radius),
     vector2(end_position.x + radius, end_position.y + radius),
@@ -1076,7 +1088,7 @@ proc add_work_graph_arrow(graph: var GraphView;
     radius)
 
 proc work_node_z_index(graph: GraphView; node_id: uint32): int16 {.inline.} =
-  int16(10 + max(graph.work_node_index_by_id(node_id), 0))
+  int16(10 + max(graph.work_graph.node_index(node_id), 0))
 
 proc execution_plan_color(plan_type: ExecutionPlanType): ClayColor =
   case plan_type
@@ -1174,7 +1186,7 @@ proc rebuild_graph_draw_list*(graph: var GraphView) =
     graph.draw_list = new_opaque_draw_list()
   clear_opaque_draw_list(graph.draw_list)
   for node in graph.work_graph.nodes:
-    for dependency_id in node.wait_for:
+    for dependency_id in node.node_dependency_ids:
       graph.add_work_graph_arrow(dependency_id, node.id)
   for node in graph.work_graph.nodes:
     graph.add_work_node_draw_items(node)

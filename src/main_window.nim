@@ -27,7 +27,6 @@ type
     purple: ClayColor
 
   WorkspaceTab = ref object
-    graph_view: GraphView
     debug_cycle_frame: uint64
     debug_last_phase: int
 
@@ -125,7 +124,7 @@ type
     codex_runtime_closed: bool
     pending_graph_events: seq[UiEvent]
 
-proc new_debug_graph_tab(objective: string): GraphTab =
+proc new_graph_tab(objective: string): GraphTab =
   new(result)
   result.node_conversations = initTable[uint32, NodeConversation]()
   result.pending_user_inputs = initTable[uint32, PendingUserInput]()
@@ -176,9 +175,8 @@ proc new_main_window*(objective = ""): MainWindow =
     purple: rgba(169, 126, 255, 255)),
     ui_state: new_ui_state(),
     tab_manager: TabManager(active_tab: main_tab_workspace),
-    workspace_tab: WorkspaceTab(
-      graph_view: GraphView(work_graph: new_work_graph(objective = objective))),
-    graph_tab: new_debug_graph_tab(objective),
+    workspace_tab: WorkspaceTab(),
+    graph_tab: new_graph_tab(objective),
     codex_bridge: new_codex_bridge())
 
 proc background_color*(view: MainWindow): ClayColor =
@@ -723,9 +721,34 @@ proc apply_codex_event(view: MainWindow; event: CodexRuntimeEvent) =
 proc poll_codex_events(view: MainWindow) =
   var event: CodexRuntimeEvent
   while view.codex_bridge.try_receive(event):
-    view.graph_tab.graph_view.work_graph.handle_codex_event(
+    let was_running = view.graph_tab.graph_view.work_graph.node_is_running(
+      event.node_id)
+    let graph_event_error = view.graph_tab.graph_view.work_graph.handle_codex_event(
       view.codex_bridge, event)
-    view.apply_codex_event(event)
+    let late_turn_completion = if event.kind == cre_turn_completed and
+        not was_running:
+      let node_index = view.graph_tab.graph_view.work_graph.node_index(
+        event.node_id)
+      if node_index >= 0:
+        (valid: true,
+          state: view.graph_tab.graph_view.work_graph.nodes[node_index].state)
+      else:
+        (valid: false, state: pending)
+    else:
+      (valid: false, state: pending)
+    if late_turn_completion.valid and late_turn_completion.state == failed:
+      discard
+    elif late_turn_completion.valid and
+        late_turn_completion.state == completed:
+      view.apply_codex_event(event)
+    elif graph_event_error.len > 0:
+      view.apply_conversation_error(
+        event.node_id,
+        "ERROR: ",
+        graph_event_error,
+        turn_id = event.turn_id)
+    else:
+      view.apply_codex_event(event)
   if not view.codex_runtime_closed:
     view.graph_tab.graph_view.work_graph.start_available_nodes(
       view.codex_bridge)
@@ -734,19 +757,12 @@ proc poll_codex_events(view: MainWindow) =
 proc sync_graph_viewport(view: MainWindow) =
   let surface_data = clay_get_element_data(clay_id("graph_surface"))
   if not surface_data.found:
-    case view.tab_manager.active_tab
-    of main_tab_workspace:
-      view.workspace_tab.graph_view.clear_graph_viewport()
-    of main_tab_graph:
+    if view.tab_manager.active_tab == main_tab_graph:
       view.graph_tab.graph_view.clear_graph_viewport()
     return
 
-  let panel_data = clay_get_element_data(clay_id("graph_panel"))
-  case view.tab_manager.active_tab
-  of main_tab_workspace:
-    view.workspace_tab.graph_view.set_graph_viewport(
-      surface_data.bounding_box)
-  of main_tab_graph:
+  if view.tab_manager.active_tab == main_tab_graph:
+    let panel_data = clay_get_element_data(clay_id("graph_panel"))
     view.graph_tab.graph_view.set_graph_viewport(
       surface_data.bounding_box,
       panel_data.bounding_box,
@@ -755,7 +771,6 @@ proc sync_graph_viewport(view: MainWindow) =
 proc finish_frame(view: MainWindow) =
   view.sync_graph_viewport()
   if view.tab_manager.active_tab == main_tab_graph:
-    view.graph_tab.graph_view.rebuild_graph_draw_list()
     view.sync_selected_node()
   view.ui_state.finish_frame()
   if not view.graph_tab.scroll_conversation_to_end:
@@ -777,8 +792,8 @@ proc finish_frame(view: MainWindow) =
 
 proc render*(view: MainWindow; renderer: Renderer; clay_context: ptr ClayContext;
     string_cache: var ClayStringCache; delta_time: float32): bool =
-  discard view.graph_tab.graph_view.step_graph_layout(delta_time)
   view.poll_codex_events()
+  discard view.graph_tab.graph_view.step_graph_layout(delta_time)
   renderer.render_frame(
     clay_context,
     string_cache,
@@ -887,7 +902,7 @@ proc apply_ui_actions(view: MainWindow) =
           continue
         submitted_user_input = true
       elif view.graph_tab.graph_view.work_graph.answer_human_input(
-          node_id, content.strip):
+          node_id, content):
         submitted_user_input = true
       elif not graph.work_graph.node_is_running(node_id):
         view.graph_tab.add_global_message(
@@ -1312,9 +1327,6 @@ proc build_workspace_tab(view: MainWindow; frame: ViewFrame) =
           border:
             color = palette_color(view.palette.purple)
             width = border_outside(4)
-
-          graph_window(view.workspace_tab.graph_view):
-            discard
 
           element("float_yellow"):
             layout:
@@ -1766,7 +1778,7 @@ proc build_graph_tab(view: MainWindow) =
         color = palette_color(view.palette.ink)
         width = border_outside(4)
 
-      text("GRAPH / RANDOM INITIAL / CODEX CHAT"):
+      text("GRAPH / ORCHESTRATION / CODEX CHAT"):
         font_size = 13
         text_color = palette_color(view.palette.paper)
         wrap_mode = clay_text_wrap_words_and_graphemes

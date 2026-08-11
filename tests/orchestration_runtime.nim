@@ -89,25 +89,25 @@ doAssert failed_awaiting_graph.nodes[0].state == failed
 
 var input_graph = WorkGraph(nodes: @[
   WorkNode(id: 6, state: running)])
-input_graph.handle_codex_event(nil, CodexRuntimeEvent(
+discard input_graph.handle_codex_event(nil, CodexRuntimeEvent(
   kind: cre_global_notification,
   node_id: 6,
   server_request_kind: sr_tool_user_input))
-doAssert input_graph.nodes[0].state == awaiting_human_input
+doAssert input_graph.nodes[0].state == running
 doAssert input_graph.node_can_accept_user_input(6)
-input_graph.handle_codex_event(nil, CodexRuntimeEvent(
+discard input_graph.handle_codex_event(nil, CodexRuntimeEvent(
   kind: cre_tool_response_sent,
   node_id: 6,
   server_request_kind: sr_tool_user_input))
-doAssert input_graph.nodes[0].state == awaiting_human_input
-input_graph.handle_codex_event(nil, CodexRuntimeEvent(
+doAssert input_graph.nodes[0].state == running
+discard input_graph.handle_codex_event(nil, CodexRuntimeEvent(
   kind: cre_turn_completed,
   node_id: 6))
 doAssert input_graph.nodes[0].state == completed
 
 var terminal_status_graph = WorkGraph(nodes: @[
   WorkNode(id: 9, state: awaiting_human_input)])
-terminal_status_graph.handle_codex_event(nil, CodexRuntimeEvent(
+discard terminal_status_graph.handle_codex_event(nil, CodexRuntimeEvent(
   kind: cre_global_notification,
   node_id: 9,
   notification_kind: nk_thread_status_changed,
@@ -115,8 +115,14 @@ terminal_status_graph.handle_codex_event(nil, CodexRuntimeEvent(
 doAssert terminal_status_graph.nodes[0].state == failed
 
 var direct_human_graph = WorkGraph(nodes: @[
-  WorkNode(id: 7, state: pending, execution_plan: ExecutionPlan(
-    `type`: human_input, instructions: "Choose a direction"))])
+  WorkNode(
+    id: 7,
+    state: pending,
+    outputs: @[OutputArtifactDecl(
+      path: "response.txt", description: "Human response")],
+    execution_plan: ExecutionPlan(
+      `type`: human_input,
+      instructions: "Choose a direction"))])
 direct_human_graph.artifact_root = artifact_root
 direct_human_graph.start_available_nodes(nil)
 doAssert direct_human_graph.nodes[0].state == awaiting_human_input
@@ -129,7 +135,7 @@ doAssert readFile(joinPath(artifact_root, "7", "response.txt")) ==
 
 var closed_input_graph = WorkGraph(nodes: @[
   WorkNode(id: 8, state: awaiting_human_input)])
-closed_input_graph.handle_codex_event(nil, CodexRuntimeEvent(
+discard closed_input_graph.handle_codex_event(nil, CodexRuntimeEvent(
   kind: cre_runtime_closed))
 doAssert closed_input_graph.nodes[0].state == failed
 
@@ -190,7 +196,7 @@ var finish_graph = WorkGraph(
     state: running,
     execution_plan: ExecutionPlan(`type`: llm_worker),
     outputs: @[OutputArtifactDecl(path: "missing.txt")])])
-finish_graph.handle_codex_event(nil, CodexRuntimeEvent(
+discard finish_graph.handle_codex_event(nil, CodexRuntimeEvent(
   kind: cre_global_notification,
   node_id: 30,
   server_request_kind: sr_tool_call,
@@ -201,12 +207,12 @@ var tool_response_graph = WorkGraph(nodes: @[WorkNode(
   id: 50,
   state: running,
   execution_plan: ExecutionPlan(`type`: llm_worker))])
-tool_response_graph.handle_codex_event(nil, CodexRuntimeEvent(
+discard tool_response_graph.handle_codex_event(nil, CodexRuntimeEvent(
   kind: cre_tool_response_sent,
   node_id: 50,
   server_request_kind: sr_tool_call))
 doAssert tool_response_graph.nodes[0].state == running
-tool_response_graph.handle_codex_event(nil, CodexRuntimeEvent(
+discard tool_response_graph.handle_codex_event(nil, CodexRuntimeEvent(
   kind: cre_turn_completed,
   node_id: 50))
 doAssert tool_response_graph.nodes[0].state == completed

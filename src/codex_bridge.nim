@@ -28,6 +28,7 @@ type
       message_node_id*: uint32
       message_text*: string
       developer_instructions*: string
+      graph_creation_node*: bool
     of cri_reply_server_request:
       server_request_id*: RequestId
       server_request_node_id*: uint32
@@ -101,18 +102,156 @@ proc serialize(response: CodexServerResponse): JsonNode =
 
 const
   finish_node_name* = "finish_node"
+  create_node_name* = "create_node"
+  update_node_name* = "update_node"
+  delete_node_name* = "delete_node"
+  reassign_output_name* = "reassign_output"
+  get_node_name* = "get_node"
+  get_graph_view_name* = "get_graph_view"
+  list_pending_edits_name* = "list_pending_edits"
+  get_pending_edit_name* = "get_pending_edit"
+  discard_edit_name* = "discard_edit"
+  graph_creation_tool_names = [
+    create_node_name,
+    update_node_name,
+    delete_node_name,
+    reassign_output_name,
+    get_node_name,
+    get_graph_view_name,
+    list_pending_edits_name,
+    get_pending_edit_name,
+    discard_edit_name]
 
-proc finish_node_tool*(): DynamicTool =
-  var input_schema = newJObject()
-  input_schema["type"] = %"object"
-  input_schema["properties"] = newJObject()
-  input_schema["additionalProperties"] = %false
+proc is_graph_creation_tool_name*(name: string): bool =
+  name in graph_creation_tool_names
+
+proc graph_tool(name, description: string; input_schema: JsonNode): DynamicTool =
   DynamicTool(
-    name: finish_node_name,
-    description: "Mark the current orchestration node complete.",
+    name: name,
+    description: description,
     input_schema: input_schema,
     data: nil,
     callback: nil)
+
+proc object_schema(properties: JsonNode; required: seq[string]): JsonNode =
+  result = newJObject()
+  result["type"] = %"object"
+  result["properties"] = properties
+  result["additionalProperties"] = %false
+  if required.len > 0:
+    result["required"] = %required
+
+proc finish_node_tool*(): DynamicTool =
+  graph_tool(
+    finish_node_name,
+    "Mark the current orchestration node complete.",
+    object_schema(newJObject(), @[]))
+
+proc string_schema(description = ""): JsonNode =
+  result = newJObject()
+  result["type"] = %"string"
+  if description.len > 0:
+    result["description"] = %description
+
+proc integer_schema(description = ""; minimum = 1): JsonNode =
+  result = newJObject()
+  result["type"] = %"integer"
+  result["minimum"] = %minimum
+  if description.len > 0:
+    result["description"] = %description
+
+proc node_definition_schema(): JsonNode =
+  var properties = newJObject()
+  properties["description"] = string_schema("Extremely short graph label.")
+  properties["objective"] = string_schema("Required node result.")
+  properties["inputs"] = newJObject()
+  properties["inputs"]["type"] = %"array"
+  properties["inputs"]["items"] = object_schema(
+    %*{
+      "producer_node_id": {"type": "integer", "minimum": 1},
+      "path": {"type": "string"},
+      "description": {"type": "string"}
+    }, @["producer_node_id", "path", "description"])
+  properties["outputs"] = newJObject()
+  properties["outputs"]["type"] = %"array"
+  properties["outputs"]["items"] = object_schema(
+    %*{
+      "path": {"type": "string"},
+      "description": {"type": "string"},
+      "final": {"type": "boolean"}
+    }, @["path", "description"])
+  properties["wait_for"] = newJObject()
+  properties["wait_for"]["type"] = %"array"
+  properties["wait_for"]["items"] = integer_schema()
+  properties["execution_plan"] = object_schema(
+    %*{
+      "type": {"type": "string", "enum": ["llm_worker", "graph_creation", "human_input"]},
+      "instructions": {"type": "string"}
+    }, @["type", "instructions"])
+  object_schema(properties, @[
+    "description", "objective", "inputs", "outputs", "wait_for",
+    "execution_plan"])
+
+proc node_changes_schema(): JsonNode =
+  result = node_definition_schema()
+  result["required"] = newJArray()
+
+proc graph_creation_tools*(): seq[DynamicTool] =
+  var create_properties = newJObject()
+  create_properties["node_definition"] = node_definition_schema()
+  create_properties["edit_id"] = integer_schema("Pending edit to replace.")
+
+  var update_properties = newJObject()
+  update_properties["node_id"] = integer_schema()
+  update_properties["changes"] = node_changes_schema()
+  update_properties["edit_id"] = integer_schema("Pending edit to replace.")
+
+  var delete_properties = newJObject()
+  delete_properties["node_id"] = integer_schema()
+  delete_properties["edit_id"] = integer_schema("Pending edit to replace.")
+
+  var reassign_properties = newJObject()
+  reassign_properties["source_node_id"] = integer_schema()
+  reassign_properties["source_path"] = string_schema()
+  reassign_properties["destination_node_id"] = integer_schema()
+  reassign_properties["destination_path"] = string_schema(
+    "Optional. Omit to preserve the source path.")
+  reassign_properties["edit_id"] = integer_schema("Pending edit to replace.")
+
+  var get_node_properties = newJObject()
+  get_node_properties["node_id"] = integer_schema()
+
+  var graph_view_properties = newJObject()
+  graph_view_properties["direction"] = %*{
+    "type": "string",
+    "enum": ["ancestor", "descendant", "bidirectional"]
+  }
+  graph_view_properties["depth"] = integer_schema(minimum = 0)
+  graph_view_properties["max_nodes"] = integer_schema()
+
+  var pending_edit_properties = newJObject()
+  pending_edit_properties["edit_id"] = integer_schema()
+
+  result = @[
+    graph_tool(create_node_name, "Create a pending work node.", object_schema(
+      create_properties, @["node_definition"])),
+    graph_tool(update_node_name, "Replace fields on a pending work node.", object_schema(
+      update_properties, @["node_id", "changes"])),
+    graph_tool(delete_node_name, "Delete a pending work node.", object_schema(
+      delete_properties, @["node_id"])),
+    graph_tool(reassign_output_name, "Move one declared output between pending nodes.", object_schema(
+      reassign_properties, @[
+        "source_node_id", "source_path", "destination_node_id"])),
+    graph_tool(get_node_name, "Inspect one canonical work node.", object_schema(
+      get_node_properties, @["node_id"])),
+    graph_tool(get_graph_view_name, "Show a simple BFS graph summary.", object_schema(
+      graph_view_properties, @["direction", "depth", "max_nodes"])),
+    graph_tool(list_pending_edits_name, "List staged graph edits.", object_schema(
+      newJObject(), @[])),
+    graph_tool(get_pending_edit_name, "Inspect one staged graph edit.", object_schema(
+      pending_edit_properties, @["edit_id"])),
+    graph_tool(discard_edit_name, "Discard one staged graph edit.", object_schema(
+      pending_edit_properties, @["edit_id"]))]
 
 proc emit_event(bridge: ptr CodexBridgeState; event: CodexRuntimeEvent) =
   bridge[].event_channel.send(event)
@@ -409,15 +548,19 @@ proc handle_stdout_line(runtime: ptr CodexRuntime;
 
 proc handle_create_node_thread(runtime: ptr CodexRuntime;
     bridge: ptr CodexBridgeState; node_id: uint32;
-    request_nodes: var Table[string, uint32]; developer_instructions: string) =
+    request_nodes: var Table[string, uint32]; developer_instructions: string;
+    graph_creation_node: bool) =
   let agent_id = agent_id_for_node(node_id)
   if runtime.agents.hasKey(agent_id):
     return
   try:
+    var tools: DynamicToolRegistry = @[finish_node_tool()]
+    if graph_creation_node:
+      tools.add(graph_creation_tools())
     let request_id = runtime.create_agent(
       agent_id,
       "gpt-5.6-luna",
-      @[finish_node_tool()],
+      tools,
       developer_instructions = developer_instructions,
       default_effort = re_low)
     request_nodes[request_id_key(request_id)] = node_id
@@ -436,7 +579,7 @@ proc handle_send_node_message(runtime: ptr CodexRuntime;
   queued_messages.mgetOrPut(node_id, @[]).add(input.message_text)
   if not runtime.agents.hasKey(agent_id):
     handle_create_node_thread(runtime, bridge, node_id, request_nodes,
-      input.developer_instructions)
+      input.developer_instructions, input.graph_creation_node)
     return
   send_next_queued_message(
     runtime, bridge, node_id, request_nodes, queued_messages)
@@ -566,12 +709,13 @@ proc new_codex_bridge*(): CodexBridge =
   createThread(result[].worker_thread, codex_worker, result)
 
 proc send_node_message*(bridge: CodexBridge; node_id: uint32; text: string;
-    developer_instructions = "") =
+    developer_instructions = ""; graph_creation_node = false) =
   bridge[].input_channel.send(CodexRuntimeInput(
     kind: cri_send_node_message,
     message_node_id: node_id,
     message_text: text,
-    developer_instructions: developer_instructions))
+    developer_instructions: developer_instructions,
+    graph_creation_node: graph_creation_node))
 
 proc enqueue_server_response(bridge: CodexBridge;
     input: CodexRuntimeInput): bool =
