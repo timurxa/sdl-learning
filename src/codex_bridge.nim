@@ -27,6 +27,7 @@ type
     of cri_send_node_message:
       message_node_id*: uint32
       message_text*: string
+      developer_instructions*: string
     of cri_reply_server_request:
       server_request_id*: RequestId
       server_request_node_id*: uint32
@@ -408,7 +409,7 @@ proc handle_stdout_line(runtime: ptr CodexRuntime;
 
 proc handle_create_node_thread(runtime: ptr CodexRuntime;
     bridge: ptr CodexBridgeState; node_id: uint32;
-    request_nodes: var Table[string, uint32]) =
+    request_nodes: var Table[string, uint32]; developer_instructions: string) =
   let agent_id = agent_id_for_node(node_id)
   if runtime.agents.hasKey(agent_id):
     return
@@ -417,6 +418,7 @@ proc handle_create_node_thread(runtime: ptr CodexRuntime;
       agent_id,
       "gpt-5.6-luna",
       @[finish_node_tool()],
+      developer_instructions = developer_instructions,
       default_effort = re_low)
     request_nodes[request_id_key(request_id)] = node_id
   except CatchableError as error:
@@ -433,7 +435,8 @@ proc handle_send_node_message(runtime: ptr CodexRuntime;
   let agent_id = agent_id_for_node(node_id)
   queued_messages.mgetOrPut(node_id, @[]).add(input.message_text)
   if not runtime.agents.hasKey(agent_id):
-    handle_create_node_thread(runtime, bridge, node_id, request_nodes)
+    handle_create_node_thread(runtime, bridge, node_id, request_nodes,
+      input.developer_instructions)
     return
   send_next_queued_message(
     runtime, bridge, node_id, request_nodes, queued_messages)
@@ -562,11 +565,13 @@ proc new_codex_bridge*(): CodexBridge =
   result[].event_channel.open()
   createThread(result[].worker_thread, codex_worker, result)
 
-proc send_node_message*(bridge: CodexBridge; node_id: uint32; text: string) =
+proc send_node_message*(bridge: CodexBridge; node_id: uint32; text: string;
+    developer_instructions = "") =
   bridge[].input_channel.send(CodexRuntimeInput(
     kind: cri_send_node_message,
     message_node_id: node_id,
-    message_text: text))
+    message_text: text,
+    developer_instructions: developer_instructions))
 
 proc enqueue_server_response(bridge: CodexBridge;
     input: CodexRuntimeInput): bool =

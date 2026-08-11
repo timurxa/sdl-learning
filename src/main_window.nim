@@ -125,11 +125,11 @@ type
     codex_runtime_closed: bool
     pending_graph_events: seq[UiEvent]
 
-proc new_debug_graph_tab(): GraphTab =
+proc new_debug_graph_tab(objective: string): GraphTab =
   new(result)
   result.node_conversations = initTable[uint32, NodeConversation]()
   result.pending_user_inputs = initTable[uint32, PendingUserInput]()
-  result.graph_view.work_graph = new_work_graph()
+  result.graph_view.work_graph = new_work_graph(objective = objective)
   var layout_config = default_graph_layout_config()
   layout_config.layer_gap = 96
   layout_config.node_gap = 56
@@ -163,7 +163,7 @@ template scrollable_element(element_id: untyped; element_declaration: untyped;
 proc palette_color(color: ClayColor): ClayColor =
   color
 
-proc new_main_window*(): MainWindow =
+proc new_main_window*(objective = ""): MainWindow =
   MainWindow(
     palette: Palette(
       background: rgba(241, 235, 217, 255),
@@ -177,8 +177,8 @@ proc new_main_window*(): MainWindow =
     ui_state: new_ui_state(),
     tab_manager: TabManager(active_tab: main_tab_workspace),
     workspace_tab: WorkspaceTab(
-      graph_view: GraphView(work_graph: new_work_graph())),
-    graph_tab: new_debug_graph_tab(),
+      graph_view: GraphView(work_graph: new_work_graph(objective = objective))),
+    graph_tab: new_debug_graph_tab(objective),
     codex_bridge: new_codex_bridge())
 
 proc background_color*(view: MainWindow): ClayColor =
@@ -897,6 +897,8 @@ proc apply_ui_actions(view: MainWindow) =
       view.graph_tab.add_node_message(node_id, conversation_user, message)
       view.graph_tab.scroll_conversation_to_end = true
       if not submitted_user_input:
+        discard view.graph_tab.graph_view.work_graph.set_node_objective(
+          node_id, message)
         view.codex_bridge.send_node_message(node_id, message)
       view.ui_state.clear_text_field(graph_conversation_input_id)
 

@@ -1,5 +1,6 @@
 import std/[osproc, streams, json, options, tables, posix, os]
 import ./codex_json
+import ./orchestration_storage
 
 type
   AgentId* = string
@@ -490,6 +491,7 @@ proc init_codex_runtime*(cwd: string): ptr CodexRuntime =
   if not dirExists(cwd):
     raise newException(ValueError, "cwd is not a directory: " & cwd)
   let canonical_cwd = expandFilename(cwd)
+  discard initialize_orchestration_storage(canonical_cwd)
 
   result = cast[ptr CodexRuntime](allocShared0(sizeof(CodexRuntime)))
   result.state = new_runtime_state()
