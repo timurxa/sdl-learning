@@ -11,7 +11,11 @@ doAssert tools[5].name == get_graph_view_name
 doAssert tools[0].input_schema["required"].len == 1
 doAssert tools[0].input_schema["properties"].contains("node_definition")
 doAssert tools[0].input_schema["properties"]["node_definition"]["properties"].contains("outputs")
-doAssert tools[0].input_schema["properties"]["node_definition"]["properties"]["execution_plan"]["properties"].contains("reasoning_level")
+let execution_plan_schema = tools[0].input_schema["properties"]["node_definition"]["properties"]["execution_plan"]
+doAssert execution_plan_schema["oneOf"].len == 2
+doAssert not execution_plan_schema["oneOf"][0]["properties"].contains("allowed")
+doAssert execution_plan_schema["oneOf"][1]["properties"].contains("allowed")
+doAssert execution_plan_schema["oneOf"][1]["properties"].contains("disallowed")
 doAssert tools[0].input_schema["properties"]["node_definition"]["properties"]["inputs"]["items"]["required"].len == 3
 doAssert tools[0].description.contains("producer_node_id, path, description")
 doAssert tools[0].input_schema["properties"]["node_definition"]["required"].len == 5

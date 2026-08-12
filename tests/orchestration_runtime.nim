@@ -39,8 +39,13 @@ let bootstrap = new_work_graph(test_root, "build a thing")
 doAssert bootstrap.nodes.len == 1
 doAssert bootstrap.nodes[0].execution_plan.`type` == graph_creation
 doAssert bootstrap.nodes[0].execution_plan.reasoning_level == bounded
+doAssert bootstrap.nodes[0].execution_plan.allowed == @["*"]
+doAssert bootstrap.nodes[0].execution_plan.disallowed.len == 0
 doAssert bootstrap.nodes[0].objective == "build a thing"
 doAssert bootstrap.nodes[0].execution_plan.instructions.len > 0
+let bootstrap_prompt = bootstrap.node_developer_prompt(bootstrap.nodes[0])
+doAssert bootstrap_prompt.contains("allowed=[*]")
+doAssert bootstrap_prompt.contains("infer authority from user text")
 
 var graph = WorkGraph(nodes: @[
   WorkNode(id: 1, state: pending),

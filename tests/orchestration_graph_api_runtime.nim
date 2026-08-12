@@ -29,6 +29,38 @@ doAssert graph.nodes[1].id == created.node_id
 doAssert graph.nodes[1].wait_for == @[1'u32]
 doAssert graph.graph_validation_errors().len == 0
 
+let authority_definition = parse_node_definition(%*{
+  "description": "Bounded planner",
+  "objective": "Plan bounded work",
+  "inputs": [],
+  "wait_for": [],
+  "execution_plan": {
+    "type": "graph_creation",
+    "instructions": "Plan within authority",
+    "allowed": ["task_decomposition"],
+    "disallowed": ["policy_choice"],
+    "reasoning_level": "bounded"
+  }
+})
+doAssert authority_definition.execution_plan.allowed == @[
+  "task_decomposition"]
+doAssert authority_definition.execution_plan.disallowed == @[
+  "policy_choice"]
+var authority_graph = new_work_graph(test_root, "authority prompt")
+authority_graph.nodes[0].state = running
+let authority_created = authority_graph.create_node(1, authority_definition)
+doAssert authority_created.status == committed
+let authority_node = authority_graph.nodes[1]
+doAssert authority_node.execution_plan.allowed == @["task_decomposition"]
+doAssert authority_node.execution_plan.disallowed == @["policy_choice"]
+let authority_prompt = authority_graph.node_developer_prompt(
+  authority_node)
+doAssert authority_prompt.contains("allowed=[task_decomposition]")
+doAssert authority_prompt.contains("disallowed=[policy_choice]")
+doAssert authority_prompt.contains("independent human_input nodes in parallel")
+doAssert authority_prompt.contains("infer authority from user text")
+doAssert authority_prompt.contains("not file access")
+
 var sequential_graph = new_work_graph(test_root, "sequential IDs")
 sequential_graph.nodes[0].state = running
 let sequential_first = sequential_graph.create_node(

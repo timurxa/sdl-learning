@@ -15,9 +15,14 @@ type
     deep_reasoning
 
   ExecutionPlan* = object
-    `type`*: ExecutionPlanType
     instructions*: string
     reasoning_level*: ReasoningLevel
+    case `type`*: ExecutionPlanType
+    of graph_creation:
+      allowed*: seq[string]
+      disallowed*: seq[string]
+    of llm_worker, human_input:
+      discard
 
   ExecutionContract = object
     requires_single_output: bool
@@ -235,8 +240,9 @@ proc new_work_graph*(cwd = getCurrentDir(); objective = ""): WorkGraph =
         state: pending,
         execution_plan: ExecutionPlan(
           `type`: graph_creation,
+          allowed: @["*"],
           reasoning_level: bounded,
-          instructions: "Construct the smallest work graph that can complete the objective. Identify its dominant pattern and use applicable motifs: pipeline for ordered transform, review, or publish stages; decompose/solve/aggregate for independent subproblems and integration; retrieve/synthesize/cite for parallel retrieval, grounded synthesis, and citation or fact checking; research/gaps/follow-up for bounded follow-up on material gaps; proposal/judge/select for alternatives, explicit criteria, and selection or refinement; and adversarial verification/simplification/performance review for independent challenge, simplification, and performance assessment before integration. Treat compare, alternatives, choose, verify, challenge, simplify, optimize, benchmark, research, sources, cite, decompose, independent, and follow up as signals, not mandatory steps. Combine motifs only when their dependencies are distinct; avoid redundant reviewers and unnecessary serial stages. If a material ambiguity blocks safe execution, create one or more human_input nodes, then a graph_creation node that consumes their responses before expanding the affected work. Human_input always gets implicit response.txt; do not declare it. Graph structure is created only with graph tools; artifacts are files for the final user or downstream workers. After planning, create another graph_creation node only when unfinished work, a material research gap, or a verification result requires a new planning decision; if the objective is complete, create no continuation planner and finish this graph-creation node after committing its execution graph."))],
+          instructions: "Construct the smallest work graph that can complete the objective. Identify its dominant pattern and use applicable motifs: pipeline for ordered transform, review, or publish stages; decompose/solve/aggregate for independent subproblems and integration; retrieve/synthesize/cite for parallel retrieval, grounded synthesis, and citation or fact checking; research/gaps/follow-up for bounded follow-up on material gaps; proposal/judge/select for alternatives, explicit criteria, and selection or refinement; and adversarial verification/simplification/performance review for independent challenge, simplification, and performance assessment before integration. Treat compare, alternatives, choose, verify, challenge, simplify, optimize, benchmark, research, sources, cite, decompose, independent, and follow up as signals, not mandatory steps. Combine motifs only when their dependencies are distinct; avoid redundant reviewers and unnecessary serial stages. If material ambiguity blocks safe execution, create human_input nodes, then a graph_creation node consuming their responses. Human_input always gets implicit response.txt; do not declare it. Graph structure is created only with graph tools; artifacts are files for the final user or downstream workers. After planning, create another graph_creation node only when unfinished work, a material research gap, or a verification result requires a new planning decision; if the objective is complete, create no continuation planner and finish this graph-creation node after committing its execution graph."))],
     next_node_id: 2,
     next_edit_id: 1,
     watchdog_timeout_seconds: configured_worker_lifetime_seconds(),
@@ -1086,6 +1092,17 @@ proc require_string(node: JsonNode; field_path: string): string =
     raise newException(ValueError, field_path & " must be a non-empty string")
   node.getStr
 
+proc parse_string_array(node: JsonNode; field_path: string): seq[string] =
+  let values = node.require_array(field_path)
+  for index in 0 ..< values.len:
+    result.add(values[index].require_string(
+      field_path & "[" & $index & "]"))
+
+proc optional_string_array(node: JsonNode; key, field_path: string): seq[string] =
+  if node.contains(key):
+    return parse_string_array(node[key], field_path)
+  @[]
+
 proc reject_unknown_fields(node: JsonNode; field_path: string;
     allowed: openArray[string]) =
   for key, value in node.pairs:
@@ -1103,7 +1120,7 @@ proc parse_identifier(node: JsonNode; field_path: string): uint32 =
 proc parse_execution_plan(node: JsonNode; field_path: string): ExecutionPlan =
   let value = node.require_object(field_path)
   value.reject_unknown_fields(
-    field_path, ["type", "instructions", "reasoning_level"])
+    field_path, ["type", "instructions", "reasoning_level", "allowed", "disallowed"])
   let type_name = value["type"].require_string(field_path & ".type")
   let execution_type = case type_name
     of llm_worker_type_name: llm_worker
@@ -1119,10 +1136,24 @@ proc parse_execution_plan(node: JsonNode; field_path: string): ExecutionPlan =
       field_path & ".reasoning_level is invalid")
   else:
     straightforward
-  ExecutionPlan(
-    `type`: execution_type,
-    instructions: value["instructions"].require_string(field_path & ".instructions"),
-    reasoning_level: reasoning_level)
+  if execution_type != graph_creation and
+      (value.contains("allowed") or value.contains("disallowed")):
+    raise newException(ValueError,
+      field_path & ".allowed and .disallowed only valid for graph_creation")
+  let instructions = value["instructions"].require_string(field_path & ".instructions")
+  case execution_type
+  of graph_creation:
+    ExecutionPlan(
+      `type`: graph_creation,
+      instructions: instructions,
+      reasoning_level: reasoning_level,
+      allowed: value.optional_string_array("allowed", field_path & ".allowed"),
+      disallowed: value.optional_string_array("disallowed", field_path & ".disallowed"))
+  of llm_worker, human_input:
+    ExecutionPlan(
+      `type`: execution_type,
+      instructions: instructions,
+      reasoning_level: reasoning_level)
 
 proc parse_inputs(node: JsonNode; field_path: string): seq[InputArtifactRef] =
   let values = node.require_array(field_path)
@@ -1254,8 +1285,14 @@ proc execution_plan_json(plan: ExecutionPlan): JsonNode =
     "type": $plan.`type`,
     "instructions": plan.instructions
   }
-  if not plan.`type`.node_execution_contract.requires_single_output:
+  if plan.`type` != human_input:
     value["reasoning_level"] = %($plan.reasoning_level)
+  case plan.`type`:
+  of graph_creation:
+    value["allowed"] = %plan.allowed
+    value["disallowed"] = %plan.disallowed
+  of llm_worker, human_input:
+    discard
   value
 
 proc node_json(node: WorkNode): JsonNode =
@@ -1448,10 +1485,24 @@ proc add_artifact_prompt(result: var string; title, path, description: string) =
   result.add("    Resolved path: " & path & "\n")
   result.add("    Description: " & description & "\n")
 
+proc graph_creation_authority_prompt(allowed, disallowed: seq[string]): string =
+  "  - Authority: allowed=[" & allowed.join(", ") & "]; disallowed=[" &
+    disallowed.join(", ") & "]. Authority covers decisions, not file access. " &
+    "Allowed is exhaustive; `*` means all decision scopes; disallowed clarifies " &
+    "explicit exclusions. Both lists may be modified for graph_creation nodes.\n" &
+    "  - Make decisions only within allowed. For any outside-authority decision, " &
+    "create human_input; create independent human_input nodes in parallel. " &
+    "Re-plan after responses until no violating decisions remain.\n" &
+    "  - After human_input responses, infer authority from user text and update " &
+    "both lists before continuing. Set child authority from explicit user grants; " &
+    "do not expand it otherwise.\n"
+
 proc add_node_prompt_contract(result: var string; node: WorkNode) =
   let contract = node.execution_plan.`type`.node_execution_contract
   result.add("Completion rules:\n")
   if contract.graph_creator:
+    result.add(graph_creation_authority_prompt(
+      node.execution_plan.allowed, node.execution_plan.disallowed))
     result.add("  - Use graph tools for graph changes.\n")
     result.add("  - Artifacts are files for the final user or downstream workers; " &
       "graph structure uses tools, not files.\n")

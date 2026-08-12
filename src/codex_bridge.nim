@@ -162,6 +162,13 @@ proc string_schema(description = ""): JsonNode =
   if description.len > 0:
     result["description"] = %description
 
+proc string_array_schema(description = ""): JsonNode =
+  result = newJObject()
+  result["type"] = %"array"
+  result["items"] = string_schema()
+  if description.len > 0:
+    result["description"] = %description
+
 proc integer_schema(description = ""; minimum = 1): JsonNode =
   result = newJObject()
   result["type"] = %"integer"
@@ -211,15 +218,32 @@ proc node_definition_schema(): JsonNode =
   properties["wait_for"]["type"] = %"array"
   properties["wait_for"]["description"] = %"Node IDs that must complete first."
   properties["wait_for"]["items"] = integer_schema()
-  properties["execution_plan"] = object_schema(
-    %*{
-      "type": {"type": "string", "enum": [
-        llm_worker_type_name, graph_creation_type_name, human_input_type_name]},
-      "instructions": {"type": "string"},
-      "reasoning_level": {"type": "string", "enum": [
-        straightforward_reasoning_name, bounded_reasoning_name,
-        deep_reasoning_name]}
-    }, @["type", "instructions"])
+  let reasoning_level_schema = %*{
+    "type": "string", "enum": [
+      straightforward_reasoning_name, bounded_reasoning_name,
+      deep_reasoning_name]}
+  let worker_type_schema = %*{
+    "type": "string", "enum": [llm_worker_type_name, human_input_type_name]}
+  let graph_creation_type_schema = %*{
+    "type": "string", "enum": [graph_creation_type_name]}
+  var worker_properties = newJObject()
+  worker_properties["type"] = worker_type_schema
+  worker_properties["instructions"] = string_schema()
+  worker_properties["reasoning_level"] = reasoning_level_schema
+  var graph_creation_properties = newJObject()
+  graph_creation_properties["type"] = graph_creation_type_schema
+  graph_creation_properties["instructions"] = string_schema()
+  graph_creation_properties["allowed"] = string_array_schema(
+    "Decision scopes allowed for graph_creation only.")
+  graph_creation_properties["disallowed"] = string_array_schema(
+    "Explicitly disallowed decision scopes for graph_creation only.")
+  graph_creation_properties["reasoning_level"] = reasoning_level_schema
+  properties["execution_plan"] = newJObject()
+  properties["execution_plan"]["oneOf"] = newJArray()
+  properties["execution_plan"]["oneOf"].add(object_schema(
+    worker_properties, @["type", "instructions"]))
+  properties["execution_plan"]["oneOf"].add(object_schema(
+    graph_creation_properties, @["type", "instructions"]))
   object_schema(properties, @[
     "description", "objective", "inputs", "wait_for",
     "execution_plan"])

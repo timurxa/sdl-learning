@@ -126,6 +126,8 @@ Every canonical node has the following logical shape:
   "execution_plan": {
     "type": "llm_worker | graph_creation | human_input",
     "instructions": "executor-facing instructions",
+    "allowed": ["decision scope", ...],
+    "disallowed": ["decision scope", ...],
     "reasoning_level": "straightforward | bounded | deep_reasoning"
   },
   "state": "pending | running | awaiting_human_input | completed | failed"
@@ -148,6 +150,8 @@ Every canonical node has the following logical shape:
   [`wait_for`], [Explicit completion dependencies only. Artifact-producer dependencies are computed dynamically.],
   [`execution_plan.type`], [Selects execution semantics and available orchestration tools.],
   [`execution_plan.instructions`], [How the executor should perform the work. For human input, this is the exact question shown to the user.],
+  [`execution_plan.allowed`], [Decision scopes a `graph_creation` node may decide. The list is exhaustive. Only `graph_creation` nodes have this field.],
+  [`execution_plan.disallowed`], [Explicitly disallowed decision scopes for a `graph_creation` node; used to clarify its authority boundary. Only `graph_creation` nodes have this field.],
   [`execution_plan.reasoning_level`], [Abstract inference requirement mapped to a concrete runtime reasoning effort.],
   [`state`], [Persisted lifecycle state.],
 )
@@ -246,6 +250,8 @@ A `graph_creation` node receives:
 - pending-edit inspection and control tools;
 - `finish_node()`.
 
+Its authority covers decisions, not file access. Its `allowed` decision-scope list is exhaustive; everything outside that list is disallowed. `*` means all decision scopes. `disallowed` explicitly clarifies exclusions. Both lists may be modified on graph-creation node definitions. When a required decision conflicts with authority, it MUST create a `human_input` node. Independent authority questions SHOULD use parallel human-input nodes. After responses, the graph-creation node infers authority from user text and updates both lists before continuing. A child graph-creation node MUST NOT receive greater authority unless the user explicitly grants it; the planner, not the runtime, determines this.
+
 It may consume declared artifacts and declare file outputs needed by the final user or downstream workers beneath its own artifact directory. Graph structure is created through graph tools, not artifact files. It may complete without creating or modifying downstream nodes.
 
 Its durable orchestration effect is graph mutation. Its instructions SHOULD direct it to create human-input work when the objective contains material ambiguity or underspecification. A common clarification structure is:
@@ -258,7 +264,7 @@ subsequent graph_creation node
 clarified worker subgraph
 ```
 
-Independent questions may be represented by parallel human-input nodes. A downstream graph-creation node can consume their responses and synthesize the clarified work graph.
+A downstream graph-creation node can consume responses and synthesize the clarified work graph.
 
 == `human_input`
 
@@ -509,6 +515,8 @@ A new orchestration begins with exactly one root node:
   "execution_plan": {
     "type": "graph_creation",
     "instructions": "Construct the work graph for the objective. If a material ambiguity blocks safe execution, create one or more human_input nodes, then create a graph_creation node that consumes their responses before expanding the affected work.",
+    "allowed": ["*"],
+    "disallowed": [],
     "reasoning_level": "bounded"
   },
   "state": "pending"
