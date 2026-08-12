@@ -653,6 +653,7 @@ var sdl_key_right* {.importc: "SDLK_RIGHT", header: "SDL3/SDL_keycode.h".}: uint
 var sdl_key_home* {.importc: "SDLK_HOME", header: "SDL3/SDL_keycode.h".}: uint32
 var sdl_key_end* {.importc: "SDLK_END", header: "SDL3/SDL_keycode.h".}: uint32
 var sdl_key_a* {.importc: "SDLK_A", header: "SDL3/SDL_keycode.h".}: uint32
+var sdl_key_v* {.importc: "SDLK_V", header: "SDL3/SDL_keycode.h".}: uint32
 var sdl_kmod_ctrl* {.importc: "SDL_KMOD_CTRL", header: "SDL3/SDL_keycode.h".}: uint16
 var sdl_kmod_shift* {.importc: "SDL_KMOD_SHIFT", header: "SDL3/SDL_keycode.h".}: uint16
 var sdl_kmod_gui* {.importc: "SDL_KMOD_GUI", header: "SDL3/SDL_keycode.h".}: uint16
@@ -671,6 +672,15 @@ proc get_window_display_scale*(window: ptr SdlWindow): cfloat {.importc: "SDL_Ge
 proc start_text_input*(window: ptr SdlWindow): bool {.importc: "SDL_StartTextInput", header: "SDL3/SDL_keyboard.h".}
 proc stop_text_input*(window: ptr SdlWindow): bool {.importc: "SDL_StopTextInput", header: "SDL3/SDL_keyboard.h".}
 proc set_text_input_area*(window: ptr SdlWindow; rect: ptr SdlRect; cursor: cint): bool {.importc: "SDL_SetTextInputArea", header: "SDL3/SDL_keyboard.h".}
+proc get_clipboard_text(): cstring {.importc: "SDL_GetClipboardText", header: "SDL3/SDL_clipboard.h".}
+proc free_sdl_memory(memory: pointer) {.importc: "SDL_free", header: "SDL3/SDL_stdinc.h".}
+
+proc clipboard_text*(): string =
+  let text = get_clipboard_text()
+  if text == nil:
+    return
+  result = $text
+  free_sdl_memory(cast[pointer](text))
 
 proc gpu_supports_shader_formats*(format_flags: SdlGpuShaderFormat; name: cstring): bool {.importc: "SDL_GPUSupportsShaderFormats", header: "SDL3/SDL_gpu.h".}
 proc gpu_supports_properties*(props: SdlPropertiesId): bool {.importc: "SDL_GPUSupportsProperties", header: "SDL3/SDL_gpu.h".}

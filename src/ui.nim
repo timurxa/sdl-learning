@@ -43,6 +43,7 @@ type
     composition_length*: int32
 
   UiEventHandler* = proc(event: UiEvent) {.closure.}
+  TextMeasureProc* = proc(text: string; font_size: uint16): ClayDimensions {.closure.}
 
   UiActionKind* = enum
     ui_action_button_clicked
@@ -58,11 +59,23 @@ type
     element_id: ClayElementId
     interaction_priority: int
     registration_order: int
+    text_offset_x: float32
+    text_offset_y: float32
+    font_size: uint16
 
   InteractiveButton = object
     id: ButtonId
     element_id: ClayElementId
     registration_order: int
+
+  TextLine = object
+    start_index: int
+    end_index: int
+
+  VisibleText = object
+    value: string
+    boundaries: seq[int]
+    raw_indices: seq[int]
 
   UiState* = ref object
     text_fields*: Table[TextFieldId, TextFieldState]
@@ -82,6 +95,7 @@ type
     window: ptr SdlWindow
     text_input_active: bool
     scroll_focused_field_to_end: bool
+    text_measurement: TextMeasureProc
 
 const
   text_field_search* = "search"
@@ -95,6 +109,9 @@ proc new_ui_state*(): UiState =
 proc set_window*(state: UiState; window: ptr SdlWindow) =
   state.window = window
 
+proc set_text_measurement*(state: UiState; measure: TextMeasureProc) =
+  state.text_measurement = measure
+
 proc enqueue_event*(state: UiState; event: UiEvent) =
   if event.kind != ui_event_none:
     state.event_queue.addLast(event)
@@ -105,7 +122,8 @@ proc text_field_state_pointer(state: UiState; id: TextFieldId): ptr TextFieldSta
   addr state.text_fields[id]
 
 proc register_text_field*(state: UiState; id: TextFieldId;
-    element_id: ClayElementId; initial_value = ""; interaction_priority = 0) =
+    element_id: ClayElementId; initial_value = ""; interaction_priority = 0;
+    text_offset_x = 0'f32; text_offset_y = 0'f32; font_size = 11'u16) =
   if id.len == 0:
     return
   if not state.text_fields.hasKey(id):
@@ -117,7 +135,10 @@ proc register_text_field*(state: UiState; id: TextFieldId;
     id: id,
     element_id: element_id,
     interaction_priority: interaction_priority,
-    registration_order: state.current_fields.len))
+    registration_order: state.current_fields.len,
+    text_offset_x: text_offset_x,
+    text_offset_y: text_offset_y,
+    font_size: font_size))
 
 proc register_button*(state: UiState; id: ButtonId; element_id: ClayElementId) =
   if id.len == 0:
@@ -142,17 +163,20 @@ proc text_field_value*(state: UiState; id: TextFieldId): string =
 proc text_field_focused*(state: UiState; id: TextFieldId): bool =
   state.focused_field == id
 
+proc clear_composition(field: var TextFieldState) =
+  field.composition.setLen(0)
+  field.composition_start = 0
+  field.composition_length = 0
+
+proc visible_text_for_field(field: TextFieldState): VisibleText
+
 proc text_field_display*(state: UiState; id: TextFieldId): string =
   if not state.text_fields.hasKey(id):
     return ""
   let field = state.text_fields[id]
   if state.focused_field != id:
     return field.value
-
-  let cursor = max(0, min(field.cursor, field.value.len))
-  let prefix = if cursor > 0: field.value[0 ..< cursor] else: ""
-  let suffix = if cursor < field.value.len: field.value[cursor ..< field.value.len] else: ""
-  result = prefix & field.composition & "|" & suffix
+  result = visible_text_for_field(field).value
 
 proc clear_text_field*(state: UiState; id: TextFieldId) =
   if not state.text_fields.hasKey(id):
@@ -161,9 +185,7 @@ proc clear_text_field*(state: UiState; id: TextFieldId) =
   field[].value.setLen(0)
   field[].cursor = 0
   field[].selection_anchor = 0
-  field[].composition.setLen(0)
-  field[].composition_start = 0
-  field[].composition_length = 0
+  clear_composition(field[])
   for interactive_field in state.previous_fields:
     if interactive_field.id != id:
       continue
@@ -173,6 +195,13 @@ proc clear_text_field*(state: UiState; id: TextFieldId) =
     break
   if state.focused_field == id:
     state.scroll_focused_field_to_end = true
+
+proc modifier_set(modifiers, mask: uint16): bool =
+  (modifiers and mask) != 0
+
+proc shortcut_modifier(modifiers: uint16): bool =
+  modifier_set(modifiers, sdl_kmod_ctrl) or
+    modifier_set(modifiers, sdl_kmod_gui)
 
 proc copy_sdl_text(text: cstring): string =
   if text != nil:
@@ -225,6 +254,12 @@ proc to_ui_event*(event: ptr SdlEvent): UiEvent =
 
   if kind == sdl_event_key_down:
     let key_event = cast[ptr SdlKeyboardEvent](event)
+    if not key_event.repeat and key_event.key == sdl_key_v and
+        shortcut_modifier(key_event.modifiers):
+      return UiEvent(
+        kind: ui_event_text_input,
+        window_id: key_event.window_id,
+        text: clipboard_text())
     return UiEvent(
       kind: ui_event_key_down,
       window_id: key_event.window_id,
@@ -254,9 +289,6 @@ proc to_ui_event*(event: ptr SdlEvent): UiEvent =
       kind: ui_event_window_focus_lost,
       window_id: window_event.window_id)
 
-proc modifier_set(modifiers, mask: uint16): bool =
-  (modifiers and mask) != 0
-
 proc previous_grapheme(value: string; cursor: int): int =
   if cursor <= 0:
     return 0
@@ -276,29 +308,200 @@ proc next_grapheme(value: string; cursor: int): int =
   int(utf8proc_next_grapheme_boundary(
     clay_string_slice(value), int32(cursor), nil))
 
-proc delete_selection(field: var TextFieldState): bool =
-  if field.cursor == field.selection_anchor:
-    return false
-  let left = min(field.cursor, field.selection_anchor)
-  let right = max(field.cursor, field.selection_anchor)
-  let prefix = if left > 0: field.value[0 ..< left] else: ""
-  let suffix = if right < field.value.len: field.value[right ..< field.value.len] else: ""
-  field.value = prefix & suffix
-  field.cursor = left
-  field.selection_anchor = left
-  true
+proc move_cursor(field: var TextFieldState; position: int;
+    extend_selection: bool) =
+  field.cursor = position
+  if not extend_selection:
+    field.selection_anchor = field.cursor
 
-proc replace_selection(field: var TextFieldState; inserted: string) =
-  let left = min(field.cursor, field.selection_anchor)
-  let right = max(field.cursor, field.selection_anchor)
+proc append_visible_segment(visible: var VisibleText; source: string;
+    start, finish, raw_index: int; preserve_raw_indices: bool) =
+  var boundary = start
+  while boundary < finish:
+    let next_boundary = next_grapheme(source, boundary)
+    if next_boundary <= boundary:
+      break
+    visible.value.add(source[boundary ..< next_boundary])
+    visible.boundaries.add(visible.value.len)
+    visible.raw_indices.add(
+      if preserve_raw_indices: next_boundary else: raw_index)
+    boundary = next_boundary
+
+proc visible_text_for_field(field: TextFieldState): VisibleText =
+  let cursor = max(0, min(field.cursor, field.value.len))
+  result.boundaries = @[0]
+  result.raw_indices = @[0]
+  append_visible_segment(
+    result, field.value, 0, cursor, 0, true)
+  append_visible_segment(
+    result, field.composition, 0, field.composition.len,
+    cursor, false)
+  result.value.add("|")
+  result.boundaries.add(result.value.len)
+  result.raw_indices.add(cursor)
+  append_visible_segment(
+    result, field.value, cursor, field.value.len, 0, true)
+
+proc raw_index_at_boundary(visible: VisibleText; boundary: int): int =
+  for index, visible_boundary in visible.boundaries:
+    if visible_boundary == boundary:
+      return visible.raw_indices[index]
+  visible.raw_indices[^1]
+
+proc cursor_index_in_line(state: UiState; visible: VisibleText;
+    line_start, line_end: int; pointer_x: float32; font_size: uint16): int =
+  if pointer_x <= 0:
+    return visible.raw_index_at_boundary(line_start)
+  var boundary = line_start
+  var previous_width = 0'f32
+  while boundary < line_end:
+    let next_boundary = next_grapheme(visible.value, boundary)
+    if next_boundary <= boundary:
+      return visible.raw_index_at_boundary(boundary)
+    let prefix_width = state.text_measurement(
+      visible.value[line_start ..< next_boundary], font_size).width
+    if pointer_x < (previous_width + prefix_width) / 2'f32:
+      return visible.raw_index_at_boundary(boundary)
+    previous_width = prefix_width
+    boundary = next_boundary
+  visible.raw_index_at_boundary(line_end)
+
+proc wrap_text_lines(state: UiState; value: string; max_width: float32;
+    font_size: uint16): seq[TextLine] =
+  if value.len == 0:
+    return @[TextLine(start_index: 0, end_index: 0)]
+
+  var line_start = 0
+  var line_end = 0
+  var line_width = 0'f32
+  var boundary = 0
+  while boundary < value.len:
+    let next_boundary = next_grapheme(value, boundary)
+    if next_boundary <= boundary:
+      break
+    if value[boundary] == '\n':
+      result.add(TextLine(start_index: line_start, end_index: line_end))
+      boundary = next_boundary
+      line_start = boundary
+      line_end = boundary
+      line_width = 0
+      continue
+
+    let word_start = boundary
+    var word_end = boundary
+    while word_end < value.len and value[word_end] != ' ' and
+        value[word_end] != '\n':
+      let word_next = next_grapheme(value, word_end)
+      if word_next <= word_end:
+        break
+      word_end = word_next
+    let word_end_with_space = if word_end < value.len and
+        value[word_end] == ' ': next_grapheme(value, word_end) else: word_end
+    let word_width = state.text_measurement(
+      value[word_start ..< word_end_with_space], font_size).width
+
+    if line_width > 0 and line_width + word_width > max_width:
+      result.add(TextLine(start_index: line_start, end_index: line_end))
+      line_start = word_start
+      line_end = word_start
+      line_width = 0
+
+    if word_width > max_width and line_width == 0 and word_end > word_start:
+      var segment_start = word_start
+      var segment_width = 0'f32
+      var segment_boundary = word_start
+      while segment_boundary < word_end:
+        let segment_next = next_grapheme(value, segment_boundary)
+        if segment_next <= segment_boundary:
+          break
+        var segment_candidate_width = state.text_measurement(
+          value[segment_start ..< segment_next], font_size).width
+        if segment_width > 0 and segment_candidate_width > max_width:
+          result.add(TextLine(
+            start_index: segment_start, end_index: segment_boundary))
+          segment_start = segment_boundary
+          segment_width = 0
+          segment_candidate_width = state.text_measurement(
+            value[segment_start ..< segment_next], font_size).width
+        segment_width = segment_candidate_width
+        segment_boundary = segment_next
+      if segment_start < word_end:
+        result.add(TextLine(start_index: segment_start, end_index: word_end))
+      boundary = word_end_with_space
+      line_start = boundary
+      line_end = boundary
+      line_width = 0
+      continue
+
+    line_width += word_width
+    line_end = word_end
+    boundary = word_end_with_space
+
+  if line_start < value.len or line_end > line_start or result.len == 0 or
+      value[^1] == '\n':
+    result.add(TextLine(start_index: line_start, end_index: line_end))
+
+proc cursor_index_for_pointer(state: UiState; field: TextFieldState;
+    interactive_field: InteractiveField; pointer_x, pointer_y: float32): int =
+  if state.text_measurement == nil:
+    return field.cursor
+  let data = clay_get_element_data(interactive_field.element_id)
+  if not data.found:
+    return field.cursor
+  let local_x = pointer_x - float32(data.bounding_box.x) -
+    interactive_field.text_offset_x
+  var scroll_y = 0'f32
+  let scroll_data = clay_get_scroll_container_data(interactive_field.element_id)
+  if scroll_data.found and scroll_data.scroll_position != nil:
+    scroll_y = scroll_data.scroll_position[].y
+  let line_height = max(
+    state.text_measurement("M", interactive_field.font_size).height,
+    1'f32)
+  let local_y = pointer_y - float32(data.bounding_box.y) -
+    interactive_field.text_offset_y - scroll_y
+  let target_line = max(0, int(local_y / line_height))
+  let max_width = max(
+    float32(data.bounding_box.width) - 2'f32 * interactive_field.text_offset_x,
+    1'f32)
+  let visible = visible_text_for_field(field)
+  let lines = state.wrap_text_lines(
+    visible.value, max_width, interactive_field.font_size)
+  let line_index = min(target_line, lines.len - 1)
+  let line = lines[line_index]
+  state.cursor_index_in_line(
+    visible, line.start_index, line.end_index, local_x,
+    interactive_field.font_size)
+
+proc set_cursor_from_pointer(state: UiState; id: TextFieldId;
+    pointer_x, pointer_y: float32) =
+  let field = state.text_field_state_pointer(id)
+  for interactive_field in state.previous_fields:
+    if interactive_field.id != id:
+      continue
+    move_cursor(field[], state.cursor_index_for_pointer(
+      field[], interactive_field, pointer_x, pointer_y), false)
+    clear_composition(field[])
+    break
+
+proc replace_range(field: var TextFieldState; range_left, range_right: int;
+    inserted: string) =
+  let left = min(range_left, range_right)
+  let right = max(range_left, range_right)
   let prefix = if left > 0: field.value[0 ..< left] else: ""
   let suffix = if right < field.value.len: field.value[right ..< field.value.len] else: ""
   field.value = prefix & inserted & suffix
   field.cursor = left + inserted.len
   field.selection_anchor = field.cursor
-  field.composition.setLen(0)
-  field.composition_start = 0
-  field.composition_length = 0
+  clear_composition(field)
+
+proc delete_selection(field: var TextFieldState): bool =
+  if field.cursor == field.selection_anchor:
+    return false
+  replace_range(field, field.cursor, field.selection_anchor, "")
+  true
+
+proc replace_selection(field: var TextFieldState; inserted: string) =
+  replace_range(field, field.cursor, field.selection_anchor, inserted)
 
 proc set_focus(state: UiState; id: TextFieldId) =
   if state.focused_field == id:
@@ -306,9 +509,7 @@ proc set_focus(state: UiState; id: TextFieldId) =
 
   if state.focused_field.len > 0:
     let old_field = state.text_field_state_pointer(state.focused_field)
-    old_field[].composition.setLen(0)
-    old_field[].composition_start = 0
-    old_field[].composition_length = 0
+    clear_composition(old_field[])
 
   if state.text_input_active and state.window != nil:
     discard stop_text_input(state.window)
@@ -377,37 +578,30 @@ proc handle_key_down(state: UiState; event: UiEvent) =
       text_field_id: state.focused_field))
     return
   state.scroll_focused_field_to_end = true
-  let control = modifier_set(event.modifiers, sdl_kmod_ctrl) or
-    modifier_set(event.modifiers, sdl_kmod_gui)
+  let control = shortcut_modifier(event.modifiers)
   let extend_selection = modifier_set(event.modifiers, sdl_kmod_shift)
 
   if control and event.key == sdl_key_a:
-    field[].cursor = field[].value.len
+    move_cursor(field[], field[].value.len, true)
     field[].selection_anchor = 0
     return
 
   if event.key == sdl_key_left:
-    field[].cursor = previous_grapheme(field[].value, field[].cursor)
-    if not extend_selection:
-      field[].selection_anchor = field[].cursor
+    move_cursor(field[], previous_grapheme(field[].value, field[].cursor),
+      extend_selection)
     return
 
   if event.key == sdl_key_right:
-    field[].cursor = next_grapheme(field[].value, field[].cursor)
-    if not extend_selection:
-      field[].selection_anchor = field[].cursor
+    move_cursor(field[], next_grapheme(field[].value, field[].cursor),
+      extend_selection)
     return
 
   if event.key == sdl_key_home:
-    field[].cursor = 0
-    if not extend_selection:
-      field[].selection_anchor = field[].cursor
+    move_cursor(field[], 0, extend_selection)
     return
 
   if event.key == sdl_key_end:
-    field[].cursor = field[].value.len
-    if not extend_selection:
-      field[].selection_anchor = field[].cursor
+    move_cursor(field[], field[].value.len, extend_selection)
     return
 
   if event.key == sdl_key_backspace:
@@ -415,9 +609,7 @@ proc handle_key_down(state: UiState; event: UiEvent) =
       return
     let previous = previous_grapheme(field[].value, field[].cursor)
     if previous < field[].cursor:
-      field[].value = field[].value[0 ..< previous] & field[].value[field[].cursor ..< field[].value.len]
-      field[].cursor = previous
-      field[].selection_anchor = previous
+      replace_range(field[], previous, field[].cursor, "")
     return
 
   if event.key == sdl_key_delete:
@@ -425,7 +617,7 @@ proc handle_key_down(state: UiState; event: UiEvent) =
       return
     let next = next_grapheme(field[].value, field[].cursor)
     if next > field[].cursor:
-      field[].value = field[].value[0 ..< field[].cursor] & field[].value[next ..< field[].value.len]
+      replace_range(field[], field[].cursor, next, "")
     return
 
   if event.key == sdl_key_escape:
@@ -445,7 +637,11 @@ proc handle_event(state: UiState; event: UiEvent) =
     if event.button != 0 and event.button != sdl_button_left:
       return
     state.pressed_button = state.button_target()
-    set_focus(state, state.pointer_target())
+    let target = state.pointer_target()
+    set_focus(state, target)
+    if target.len > 0:
+      state.set_cursor_from_pointer(
+        target, state.pointer_position.x, state.pointer_position.y)
   of ui_event_mouse_button_up:
     state.pointer_position = clay_vector2(event.x, event.y)
     if event.button == 0 or event.button == sdl_button_left:
@@ -482,7 +678,7 @@ proc handle_event(state: UiState; event: UiEvent) =
       field[].composition_length = event.composition_length
   of ui_event_text_input:
     state.scroll_focused_field_to_end = true
-    if state.focused_field.len > 0:
+    if state.focused_field.len > 0 and event.text.len > 0:
       replace_selection(state.text_field_state_pointer(state.focused_field)[], event.text)
   of ui_event_window_focus_lost:
     set_focus(state, "")
@@ -537,5 +733,14 @@ proc finish_frame*(state: UiState) =
       y: cint(data.bounding_box.y),
       w: cint(data.bounding_box.width),
       h: cint(data.bounding_box.height))
-    discard set_text_input_area(state.window, addr rect, 0)
+    let text_field = state.text_fields[state.focused_field]
+    let cursor = max(0, min(text_field.cursor, text_field.value.len))
+    let prefix = if cursor > 0: text_field.value[0 ..< cursor] else: ""
+    let text_width = if state.text_measurement == nil:
+      0'f32
+    else:
+      state.text_measurement(
+        prefix & text_field.composition, field.font_size).width
+    let cursor_offset = cint(field.text_offset_x + text_width)
+    discard set_text_input_area(state.window, addr rect, cursor_offset)
     return

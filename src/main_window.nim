@@ -173,7 +173,7 @@ proc palette_color(color: ClayColor): ClayColor =
   color
 
 proc new_main_window*(objective = ""): MainWindow =
-  MainWindow(
+  result = MainWindow(
     palette: Palette(
       background: rgba(241, 235, 217, 255),
       ink: rgba(20, 18, 15, 255),
@@ -188,6 +188,10 @@ proc new_main_window*(objective = ""): MainWindow =
     workspace_tab: WorkspaceTab(),
     graph_tab: new_graph_tab(objective),
     codex_bridge: new_codex_bridge())
+  result.ui_state.set_text_measurement(
+    proc(text: string; font_size: uint16): ClayDimensions =
+      var config = ClayTextElementConfig(font_size: font_size)
+      measure_text(clay_string_slice(text), addr config, nil))
 
 proc background_color*(view: MainWindow): ClayColor =
   view.palette.background
@@ -1100,7 +1104,9 @@ proc build_workspace_tab(view: MainWindow; frame: ViewFrame) =
   view.ui_state.register_text_field(
     text_field_search,
     search_element_id,
-    initial_value = "type here")
+    initial_value = "type here",
+    text_offset_x = 11'f32,
+    text_offset_y = 22'f32)
 
   inc view.workspace_tab.debug_cycle_frame
   let debug_phase = int((view.workspace_tab.debug_cycle_frame div 60'u64) mod 4'u64)
@@ -1685,7 +1691,9 @@ proc activity_body(entry: ConversationEntry): string =
 proc build_graph_conversation_panel(view: MainWindow) =
   let input_element_id = clay_id(graph_conversation_input_id)
   view.ui_state.register_text_field(
-    graph_conversation_input_id, input_element_id)
+    graph_conversation_input_id, input_element_id,
+    text_offset_x = 4'f32,
+    text_offset_y = 4'f32)
   let node_id = view.graph_tab.graph_view.selected_node_id
   let conversation = view.graph_tab.node_conversations[node_id]
 

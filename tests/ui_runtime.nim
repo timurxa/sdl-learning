@@ -37,7 +37,18 @@ var raw_text_event = SdlTextInputEvent(
 let normalized_text_event = to_ui_event(cast[ptr SdlEvent](addr raw_text_event))
 doAssert normalized_text_event.text == "copied"
 
+var raw_paste_event = SdlKeyboardEvent(
+  kind: sdl_event_key_down,
+  key: sdl_key_v,
+  modifiers: sdl_kmod_gui)
+let normalized_paste_event = to_ui_event(cast[ptr SdlEvent](addr raw_paste_event))
+doAssert normalized_paste_event.kind == ui_event_text_input
+
 let state = new_ui_state()
+state.set_text_measurement(
+  proc(text: string; font_size: uint16): ClayDimensions =
+    discard font_size
+    clay_dimensions(float32(text.len * 10), 10))
 let field_id = clay_id("ui_test_field")
 state.register_text_field("test", field_id, initial_value = "abc")
 
@@ -50,7 +61,7 @@ discard clay_end_layout(0)
 
 state.enqueue_event(UiEvent(
   kind: ui_event_mouse_button_down,
-  x: 5,
+  x: 35,
   y: 5,
   pointer_down: true))
 state.enqueue_event(UiEvent(kind: ui_event_text_input, text: "x"))
@@ -63,19 +74,59 @@ state.enqueue_event(UiEvent(kind: ui_event_key_down, key: sdl_key_backspace))
 state.prepare_frame()
 doAssert state.text_field_value("test") == "abx"
 
+state.register_text_field("test", field_id)
+clay_begin_layout()
+clay_open_element_with_id(field_id)
+clay_configure_open_element(declaration(
+  layout = layout(sizing = sizing(fixed(80), fixed(20)))))
+clay_close_element()
+discard clay_end_layout(0)
+state.enqueue_event(UiEvent(
+  kind: ui_event_mouse_button_down,
+  x: 20,
+  y: 5,
+  pointer_down: true))
+state.enqueue_event(UiEvent(kind: ui_event_text_input, text: "P"))
+state.prepare_frame()
+doAssert state.text_field_value("test") == "abPx"
+
+state.enqueue_event(UiEvent(kind: ui_event_key_down, key: sdl_key_a,
+  modifiers: sdl_kmod_gui))
+state.enqueue_event(UiEvent(kind: ui_event_text_input, text: "pasted"))
+state.prepare_frame()
+doAssert state.text_field_value("test") == "pasted"
+
+let multiline_field_id = clay_id("ui_multiline_field")
+state.register_text_field(
+  "multiline", multiline_field_id, initial_value = "abcd")
+clay_begin_layout()
+clay_open_element_with_id(multiline_field_id)
+clay_configure_open_element(declaration(
+  layout = layout(sizing = sizing(fixed(25), fixed(40)))))
+clay_close_element()
+discard clay_end_layout(0)
+state.enqueue_event(UiEvent(
+  kind: ui_event_mouse_button_down,
+  x: 1,
+  y: 15,
+  pointer_down: true))
+state.enqueue_event(UiEvent(kind: ui_event_text_input, text: "P"))
+state.prepare_frame()
+doAssert state.text_field_value("multiline") == "abPcd"
+
 state.enqueue_event(UiEvent(kind: ui_event_key_down, key: sdl_key_return))
 state.prepare_frame()
 var action: UiAction
 doAssert state.next_action(action)
 doAssert action.kind == ui_action_text_field_submitted
-doAssert action.text_field_id == "test"
+doAssert action.text_field_id == "multiline"
 state.clear_text_field("test")
 doAssert state.text_field_value("test") == ""
 state.enqueue_event(UiEvent(kind: ui_event_key_down, key: sdl_key_kp_enter))
 state.prepare_frame()
 doAssert state.next_action(action)
 doAssert action.kind == ui_action_text_field_submitted
-doAssert action.text_field_id == "test"
+doAssert action.text_field_id == "multiline"
 
 let scroll_id = clay_id("ui_scroll_test")
 state.enqueue_event(UiEvent(
