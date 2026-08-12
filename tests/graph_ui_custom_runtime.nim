@@ -45,6 +45,37 @@ let oversized_tooltip = graph.graph_node_tooltip_position(
 doAssert oversized_tooltip.x == 0
 doAssert oversized_tooltip.y == 0
 
+let tooltip_text = work_node_tooltip_text(WorkNode(
+  id: 7,
+  description: "Describe node",
+  objective: "Produce result",
+  inputs: @[InputArtifactRef(
+    producer_node_id: 2,
+    path: "input.txt",
+    description: "Source input")],
+  outputs: @[OutputArtifactDecl(
+    path: "output.txt",
+    description: "Final output",
+    final: true)],
+  state: awaiting_human_input,
+  execution_plan: ExecutionPlan(
+    `type`: human_input,
+    reasoning_level: bounded,
+    instructions: "Ask user")))
+doAssert tooltip_text == "ID: 7\n" &
+  "DESCRIPTION: Describe node\n" &
+  "OBJECTIVE: Produce result\n" &
+  "INPUTS:\n" &
+  "  NODE 2 / input.txt - Source input\n" &
+  "OUTPUTS:\n" &
+  "  output.txt - Final output [FINAL]\n" &
+  "STATE: AWAITING HUMAN INPUT\n" &
+  "EXECUTION PLAN:\n" &
+  "  TYPE: HUMAN INPUT\n" &
+  "  REASONING: BOUNDED\n" &
+  "  INSTRUCTIONS:\n" &
+  "    Ask user"
+
 clay_begin_layout()
 element("root"):
   layout:
@@ -57,6 +88,12 @@ let commands = clay_end_layout(0)
 let surface_data = clay_get_element_data(clay_id("graph_surface"))
 doAssert surface_data.found
 graph.set_graph_viewport(surface_data.bounding_box)
+
+graph.set_graph_tooltip_bounds(ClayBoundingBox(
+  x: 20, y: 20, width: 40, height: 40))
+doAssert not graph.graph_pointer_inside(vector2(30, 30))
+graph.clear_graph_tooltip_bounds()
+doAssert graph.graph_pointer_inside(vector2(30, 30))
 
 doAssert graph.draw_list.items.len == 11
 doAssert graph.draw_list.items[0].kind == opaque_draw_quad

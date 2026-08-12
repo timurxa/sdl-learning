@@ -236,6 +236,41 @@ proc clear_server_requests_for_thread(state: var RuntimeState;
   for key in request_keys:
     state.server_requests.del(key)
 
+proc terminalize_agent*(state: var RuntimeState; agent_id: AgentId): bool =
+  if not state.agents.hasKey(agent_id):
+    return false
+  let thread_id = state.agents[agent_id].thread_id
+  var request_keys: seq[string] = @[]
+  for key, request in state.requests:
+    if request.agent_id.isSome and request.agent_id.get == agent_id and
+        request.state in {rs_pending, rs_accepted}:
+      request_keys.add(key)
+  for key in request_keys:
+    state.requests.del(key)
+  if thread_id.has_value:
+    state.clear_server_requests_for_thread(thread_id.value)
+  state.agents.del(agent_id)
+  true
+
+proc terminalize_agent*(runtime: ptr CodexRuntime; agent_id: AgentId): bool =
+  if not runtime.state.agents.hasKey(agent_id):
+    return false
+  var pending_request_keys: seq[string] = @[]
+  for key, request in runtime.state.requests:
+    if request.agent_id.isSome and request.agent_id.get == agent_id and
+        request.state in {rs_pending, rs_accepted}:
+      pending_request_keys.add(key)
+  result = runtime.state.terminalize_agent(agent_id)
+  if not result:
+    return
+  var pending: seq[Message] = @[]
+  for message in runtime.pending:
+    if message.kind == mk_request and pending_request_keys.contains(
+        request_id_key(message.request.id)):
+      continue
+    pending.add(message)
+  runtime.pending = pending
+
 proc notification_ends_server_requests(notification: Notification): bool =
   case notification.kind
   of nk_thread_status_changed:
@@ -264,6 +299,12 @@ proc apply_notification*(state: var RuntimeState; notification: Notification) =
   if not params.thread_id.has_value:
     return
   let thread_id = params.thread_id.value
+  if notification.kind == nk_turn_completed and params.turn_id.isSome:
+    let active_agent_id = find_agent_for_thread(state, thread_id)
+    if active_agent_id.isSome:
+      let active_turn_id = state.agents[active_agent_id.get].turn_id
+      if active_turn_id.isNone or active_turn_id.get != params.turn_id.get:
+        return
   if notification.notification_ends_server_requests:
     state.clear_server_requests_for_thread(thread_id)
   let agent_id = find_agent_for_thread(state, thread_id)

@@ -107,6 +107,10 @@ type
     request_id: RequestId
     question_ids: seq[string]
 
+  PendingConversationScroll = object
+    has_scroll_anchor: bool
+    scroll_y: float32
+
   GraphTab = ref object
     graph_view: GraphView
     node_conversations: Table[uint32, NodeConversation]
@@ -114,7 +118,7 @@ type
     global_log_messages: seq[string]
     previous_selected_node_id: uint32
     previous_selected_node_valid: bool
-    pending_conversation_scrolls: Table[uint32, bool]
+    pending_conversation_scrolls: Table[uint32, PendingConversationScroll]
 
   MainWindow* = ref object
     palette: Palette
@@ -130,7 +134,8 @@ proc new_graph_tab(objective: string): GraphTab =
   new(result)
   result.node_conversations = initTable[uint32, NodeConversation]()
   result.pending_user_inputs = initTable[uint32, PendingUserInput]()
-  result.pending_conversation_scrolls = initTable[uint32, bool]()
+  result.pending_conversation_scrolls =
+    initTable[uint32, PendingConversationScroll]()
   result.graph_view.work_graph = new_work_graph(objective = objective)
   var layout_config = default_graph_layout_config()
   layout_config.layer_gap = 96
@@ -147,10 +152,12 @@ const
   graph_conversation_composer_id = "graph_conversation_composer"
   graph_activity_button_prefix = "graph_conversation_activity_"
   graph_node_tooltip_id = "graph_node_tooltip"
-  graph_node_tooltip_width = 190
-  graph_node_tooltip_height = 68
+  graph_node_tooltip_content_id = "graph_node_tooltip_content"
+  graph_node_tooltip_width = 360
+  graph_node_tooltip_height = 360
   graph_node_tooltip_gap = 10'f32
   graph_node_tooltip_z_index = 32767'i16
+  conversation_scroll_tolerance = 4'f32
 
 template scrollable_declaration(element_declaration: untyped): ClayElementDeclaration =
   var scroll_declaration = element_declaration
@@ -232,8 +239,27 @@ proc activity_entry(kind: ConversationActivityKind; activity_id,
     expanded: kind notin {cak_thinking, cak_tool},
     files: @[])
 
+proc conversation_scroll_overflow(scroll_data: ClayScrollContainerData): float32 =
+  max(
+    float32(scroll_data.content_dimensions.height) -
+    float32(scroll_data.scroll_container_dimensions.height),
+    0'f32)
+
 proc request_conversation_scroll(tab: GraphTab; node_id: uint32) =
-  tab.pending_conversation_scrolls[node_id] = true
+  let log_id = if node_id > 0:
+    graph_conversation_log_id else: graph_global_log_id
+  let scroll_data = clay_get_scroll_container_data(clay_id(log_id))
+  if scroll_data.found and scroll_data.scroll_position != nil:
+    let overflow = scroll_data.conversation_scroll_overflow()
+    if abs(scroll_data.scroll_position[].y + overflow) >
+        conversation_scroll_tolerance:
+      tab.pending_conversation_scrolls.del(node_id)
+      return
+    tab.pending_conversation_scrolls[node_id] = PendingConversationScroll(
+      has_scroll_anchor: true,
+      scroll_y: scroll_data.scroll_position[].y)
+  else:
+    tab.pending_conversation_scrolls[node_id] = PendingConversationScroll()
 
 proc add_node_message(tab: GraphTab; node_id: uint32;
     speaker: ConversationSpeaker; content: string) =
@@ -709,7 +735,7 @@ proc apply_conversation_event(view: MainWindow; event: CodexRuntimeEvent) =
     elif event.server_request_kind == sr_tool_user_input:
       view.graph_tab.pending_user_inputs.del(event.node_id)
   of cre_thread_ready, cre_thread_error, cre_runtime_error,
-      cre_runtime_closed:
+      cre_lifecycle_diagnostic, cre_runtime_closed:
     discard
   view.graph_tab.node_conversations[event.node_id] = conversation
   if conversation_changed:
@@ -742,6 +768,8 @@ proc apply_codex_event(view: MainWindow; event: CodexRuntimeEvent) =
         event.node_id, "ERROR: ", event.text)
   of cre_runtime_error:
     view.graph_tab.add_global_message("RUNTIME ERROR: " & event.text)
+  of cre_lifecycle_diagnostic:
+    discard
   of cre_runtime_closed:
     view.codex_runtime_closed = true
     var active_node_ids: seq[uint32] = @[]
@@ -761,26 +789,21 @@ proc apply_codex_event(view: MainWindow; event: CodexRuntimeEvent) =
 proc poll_codex_events(view: MainWindow) =
   var event: CodexRuntimeEvent
   while view.codex_bridge.try_receive(event):
-    let was_running = view.graph_tab.graph_view.work_graph.node_is_running(
-      event.node_id)
-    let graph_event_error = view.graph_tab.graph_view.work_graph.handle_codex_event(
-      view.codex_bridge, event)
-    let late_turn_completion = if event.kind == cre_turn_completed and
-        not was_running:
-      let node_index = view.graph_tab.graph_view.work_graph.node_index(
-        event.node_id)
-      if node_index >= 0:
-        (valid: true,
-          state: view.graph_tab.graph_view.work_graph.nodes[node_index].state)
-      else:
-        (valid: false, state: pending)
-    else:
-      (valid: false, state: pending)
-    if late_turn_completion.valid and late_turn_completion.state == failed:
+    var runtime_failure_node_ids: seq[uint32] = @[]
+    if event.kind == cre_runtime_error and
+        not event.text.startsWith("unmapped completion"):
+      for node in view.graph_tab.graph_view.work_graph.nodes:
+        if node.state in {pending, running, awaiting_human_input} and
+            view.graph_tab.node_conversations.hasKey(node.id):
+          let node_id = node.id
+          runtime_failure_node_ids.add(node_id)
+    let graph_event = view.graph_tab.graph_view.work_graph.
+      handle_codex_event_result(view.codex_bridge, event)
+    let graph_event_error = graph_event.error
+    let disposition = graph_event.disposition
+    if disposition in {lifecycle_late_suppressed, lifecycle_duplicate,
+        lifecycle_rejected}:
       discard
-    elif late_turn_completion.valid and
-        late_turn_completion.state == completed:
-      view.apply_codex_event(event)
     elif graph_event_error.len > 0:
       view.apply_conversation_error(
         event.node_id,
@@ -789,9 +812,27 @@ proc poll_codex_events(view: MainWindow) =
         turn_id = event.turn_id)
     else:
       view.apply_codex_event(event)
-  if not view.codex_runtime_closed:
-    view.graph_tab.graph_view.work_graph.start_available_nodes(
-      view.codex_bridge)
+    if event.kind == cre_runtime_error and
+        not event.text.startsWith("unmapped completion"):
+      for node_id in runtime_failure_node_ids:
+        let node_index = view.graph_tab.graph_view.work_graph.node_index(node_id)
+        if node_index >= 0 and
+            view.graph_tab.graph_view.work_graph.nodes[node_index].state == failed:
+          view.apply_conversation_error(
+            node_id,
+            "ERROR: ",
+            event.text,
+            close_thread = true,
+            status_detail = "RUNTIME ERROR")
+  let watchdog_node_ids = view.graph_tab.graph_view.work_graph.check_watchdogs(
+    view.codex_bridge)
+  for node_id in watchdog_node_ids:
+    view.apply_conversation_error(
+      node_id,
+      "ERROR: ",
+      "WORKER WATCHDOG TIMEOUT",
+      close_thread = true,
+      status_detail = "WATCHDOG TIMEOUT")
   view.display_work_graph_messages()
 
 proc sync_graph_viewport(view: MainWindow) =
@@ -823,10 +864,14 @@ proc finish_frame(view: MainWindow) =
     clay_id(log_id))
   if not scroll_data.found or scroll_data.scroll_position == nil:
     return
-  let overflow = max(
-    float32(scroll_data.content_dimensions.height) -
-    float32(scroll_data.scroll_container_dimensions.height),
-    0'f32)
+  let pending_scroll =
+    view.graph_tab.pending_conversation_scrolls[selected_node_id]
+  if pending_scroll.has_scroll_anchor and
+      scroll_data.scroll_position[].y >
+        pending_scroll.scroll_y + conversation_scroll_tolerance:
+    view.graph_tab.pending_conversation_scrolls.del(selected_node_id)
+    return
+  let overflow = scroll_data.conversation_scroll_overflow()
   scroll_data.scroll_position[].y = -overflow
   view.graph_tab.pending_conversation_scrolls.del(selected_node_id)
 
@@ -850,7 +895,11 @@ proc render*(view: MainWindow; renderer: Renderer; clay_context: ptr ClayContext
               discard,
         delta_time)
       view.process_pending_graph_events()
-      view.apply_ui_actions(),
+      view.apply_ui_actions()
+      if not view.codex_runtime_closed:
+        view.graph_tab.graph_view.work_graph.start_available_nodes(
+          view.codex_bridge)
+      view.display_work_graph_messages(),
     proc(frame: ViewFrame) = view.build_elements(frame),
     proc() = view.finish_frame(),
     delta_time)
@@ -1883,31 +1932,37 @@ proc build_graph_tab(view: MainWindow) =
         if view.graph_tab.graph_view.hovered_node_valid:
           let graph = view.graph_tab.graph_view
           let hovered_node = graph.hovered_work_node()
+          let layout_dimensions = clay_get_layout_dimensions()
+          let tooltip_margin = 2 * int(graph_node_tooltip_gap)
           let tooltip_size = dimensions(
-            graph_node_tooltip_width,
-            graph_node_tooltip_height)
-          let node_id_text = "NODE // " & $hovered_node.id
-          let plan_text = "PLAN // " & toUpperAscii(
-            ($hovered_node.execution_plan.`type`).replace('_', ' '))
-          let state_text = "STATE // " & toUpperAscii(
-            ($hovered_node.state).replace('_', ' '))
+            min(
+              graph_node_tooltip_width,
+              max(int(layout_dimensions.width) - tooltip_margin, 1)),
+            min(
+              graph_node_tooltip_height,
+              max(int(layout_dimensions.height) - tooltip_margin, 1)))
+          let tooltip_text = work_node_tooltip_text(hovered_node)
+          let tooltip_offset = graph.graph_node_tooltip_position(
+            layout_dimensions,
+            tooltip_size,
+            graph_node_tooltip_gap)
+          view.graph_tab.graph_view.set_graph_tooltip_bounds(ClayBoundingBox(
+            x: tooltip_offset.x,
+            y: tooltip_offset.y,
+            width: tooltip_size.width,
+            height: tooltip_size.height))
           let tooltip_declaration = declaration(
             layout = layout(
               sizing = sizing(
                 fixed(tooltip_size.width),
                 fixed(tooltip_size.height)),
-              padding = padding_all(8),
-              child_gap = 3,
-              layout_direction = clay_top_to_bottom),
+              padding = padding_all(8)),
             background_color = palette_color(view.palette.yellow),
             border = ClayBorderElementConfig(
               color: palette_color(view.palette.ink),
               width: border_outside(3)),
             floating = ClayFloatingElementConfig(
-              offset: graph.graph_node_tooltip_position(
-                clay_get_layout_dimensions(),
-                tooltip_size,
-                graph_node_tooltip_gap),
+              offset: tooltip_offset,
               attach_points: ClayFloatingAttachPoints(
                 element: clay_attach_point_left_top,
                 parent: clay_attach_point_left_top),
@@ -1916,18 +1971,19 @@ proc build_graph_tab(view: MainWindow) =
               clip_to: clay_clip_to_none,
               z_index: graph_node_tooltip_z_index))
           element(graph_node_tooltip_id, tooltip_declaration):
-            text(node_id_text):
-              font_size = 8
-              text_color = palette_color(view.palette.ink)
-              wrap_mode = clay_text_wrap_words_and_graphemes
-            text(plan_text):
-              font_size = 10
-              text_color = palette_color(view.palette.ink)
-              wrap_mode = clay_text_wrap_words_and_graphemes
-            text(state_text):
-              font_size = 10
-              text_color = palette_color(view.palette.ink)
-              wrap_mode = clay_text_wrap_words_and_graphemes
+            let tooltip_content_declaration = declaration(
+              layout = layout(
+                sizing = sizing(grow(), grow())),
+              clip = ClayClipElementConfig(vertical: true))
+            scrollable_element(
+                clay_id(graph_node_tooltip_content_id),
+                tooltip_content_declaration):
+              text(tooltip_text):
+                font_size = 9
+                text_color = palette_color(view.palette.ink)
+                wrap_mode = clay_text_wrap_words_and_graphemes
+        else:
+          view.graph_tab.graph_view.clear_graph_tooltip_bounds()
         if not view.graph_tab.graph_view.selected_node_valid and
             view.ui_state.text_field_focused(graph_conversation_input_id):
           view.ui_state.clear_focus()

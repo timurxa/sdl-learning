@@ -1,4 +1,4 @@
-import std/[json, options, os, streams, tables]
+import std/[json, locks, options, os, streams, tables]
 import codex_json
 import codex_runtime
 
@@ -17,6 +17,7 @@ type
   CodexRuntimeInputKind* = enum
     cri_send_node_message,
     cri_reply_server_request,
+    cri_terminalize_node,
     cri_shutdown,
     cri_stdout_line,
     cri_stderr_line,
@@ -34,6 +35,8 @@ type
       server_request_id*: RequestId
       server_request_node_id*: uint32
       server_response*: CodexServerResponse
+    of cri_terminalize_node:
+      terminal_node_id*: uint32
     of cri_shutdown:
       discard
     of cri_stdout_line, cri_stderr_line:
@@ -49,6 +52,7 @@ type
     cre_node_error,
     cre_tool_response_sent,
     cre_global_notification,
+    cre_lifecycle_diagnostic,
     cre_runtime_error,
     cre_runtime_closed
 
@@ -87,6 +91,8 @@ type
     stderr_reader: CodexReaderContext
     stdout_thread_started: bool
     stderr_thread_started: bool
+    terminalization_lock: Lock
+    terminalization_requests: Table[uint32, bool]
 
   CodexBridge* = ptr CodexBridgeState
 
@@ -287,6 +293,16 @@ proc graph_creation_tools*(): seq[DynamicTool] =
 proc emit_event(bridge: ptr CodexBridgeState; event: CodexRuntimeEvent) =
   bridge[].event_channel.send(event)
 
+proc emit_lifecycle_diagnostic(bridge: ptr CodexBridgeState; node_id: uint32;
+    text: string; thread_id = ""; turn_id = ""; request_id = "") =
+  bridge.emit_event(CodexRuntimeEvent(
+    kind: cre_lifecycle_diagnostic,
+    node_id: node_id,
+    text: text,
+    thread_id: thread_id,
+    turn_id: turn_id,
+    request_id: request_id))
+
 proc read_lines(context: ptr CodexReaderContext) {.thread.} =
   var line = ""
   try:
@@ -397,10 +413,98 @@ proc clear_queued_messages(queued_messages: var Table[uint32, string];
     node_id: uint32) =
   queued_messages.del(node_id)
 
+proc clear_turn_request_mapping(runtime: ptr CodexRuntime;
+    request_nodes: var Table[string, uint32]; node_id: uint32;
+    turn_id: string) =
+  var keys: seq[string] = @[]
+  for key, mapped_node_id in request_nodes:
+    if mapped_node_id != node_id or not runtime.requests.hasKey(key):
+      continue
+    let request = runtime.requests[key]
+    if request.request.kind == mk_turn_start and
+        request.turn_id.isSome and request.turn_id.get == turn_id:
+      keys.add(key)
+  for key in keys:
+    request_nodes.del(key)
+
+proc terminalize_node_transport(runtime: ptr CodexRuntime;
+    node_id: uint32; thread_nodes: Table[string, uint32];
+    turn_nodes: var Table[string, string];
+    queued_messages: var Table[uint32, string];
+    terminal_nodes: var Table[uint32, bool]) =
+  if terminal_nodes.getOrDefault(node_id):
+    return
+  terminal_nodes[node_id] = true
+  queued_messages.clear_queued_messages(node_id)
+  var thread_ids: seq[string] = @[]
+  for thread_id, mapped_node_id in thread_nodes:
+    if mapped_node_id == node_id:
+      thread_ids.add(thread_id)
+  for thread_id in thread_ids:
+    turn_nodes.del(thread_id)
+  discard runtime.terminalize_agent(agent_id_for_node(node_id))
+
+proc mark_terminalization_requested(bridge: ptr CodexBridgeState;
+    node_id: uint32) =
+  acquire(bridge[].terminalization_lock)
+  bridge[].terminalization_requests[node_id] = true
+  release(bridge[].terminalization_lock)
+
+proc terminalization_requested(bridge: ptr CodexBridgeState;
+    node_id: uint32): bool =
+  acquire(bridge[].terminalization_lock)
+  result = bridge[].terminalization_requests.getOrDefault(node_id)
+  release(bridge[].terminalization_lock)
+
+proc node_is_terminal(bridge: ptr CodexBridgeState;
+    terminal_nodes: Table[uint32, bool]; node_id: uint32): bool =
+  terminal_nodes.getOrDefault(node_id) or
+    terminalization_requested(bridge, node_id)
+
+proc wire_request_key(node: JsonNode): string =
+  if not node.hasKey("id"):
+    return ""
+  let id = node["id"]
+  case id.kind
+  of JString:
+    "s:" & id.getStr
+  of JInt:
+    "i:" & $id.getInt
+  else:
+    ""
+
+proc terminal_node_for_wire_message(bridge: ptr CodexBridgeState;
+    node: JsonNode; request_nodes: Table[string, uint32];
+    thread_nodes: Table[string, uint32];
+    terminal_nodes: Table[uint32, bool]): uint32 =
+  let request_key = wire_request_key(node)
+  if request_key.len > 0:
+    let node_id = request_nodes.getOrDefault(request_key, 0'u32)
+    if node_id > 0 and bridge.node_is_terminal(terminal_nodes, node_id):
+      return node_id
+  if node.kind != JObject or not node.hasKey("params") or
+      node["params"].kind != JObject or
+      not node["params"].hasKey("threadId"):
+    return 0
+  let node_id = thread_nodes.getOrDefault(
+    node["params"]["threadId"].getStr,
+    0'u32)
+  if node_id > 0 and bridge.node_is_terminal(terminal_nodes, node_id):
+    node_id
+  else:
+    0
+
 proc send_next_queued_message(runtime: ptr CodexRuntime;
     bridge: ptr CodexBridgeState; node_id: uint32;
     request_nodes: var Table[string, uint32];
-    queued_messages: var Table[uint32, string]) =
+    queued_messages: var Table[uint32, string];
+    terminal_nodes: Table[uint32, bool]) =
+  if terminal_nodes.getOrDefault(node_id):
+    queued_messages.clear_queued_messages(node_id)
+    bridge.emit_lifecycle_diagnostic(
+      node_id,
+      "post-terminal turn start suppressed")
+    return
   let agent_id = agent_id_for_node(node_id)
   if not queued_messages.hasKey(node_id):
     return
@@ -424,41 +528,76 @@ proc send_next_queued_message(runtime: ptr CodexRuntime;
       node_id: node_id,
       text: error.msg))
 
+proc suppress_terminal_event(bridge: ptr CodexBridgeState;
+    terminal_nodes: Table[uint32, bool]; node_id: uint32; reason: string;
+    thread_id = ""; turn_id = ""; request_id = ""): bool =
+  if not bridge.node_is_terminal(terminal_nodes, node_id):
+    return false
+  bridge.emit_lifecycle_diagnostic(
+    node_id, reason, thread_id, turn_id, request_id)
+  true
+
 proc handle_runtime_message(runtime: ptr CodexRuntime;
     bridge: ptr CodexBridgeState; message: Message;
     request_nodes: var Table[string, uint32];
     thread_nodes: var Table[string, uint32];
-    queued_messages: var Table[uint32, string]) =
+    turn_nodes: var Table[string, string];
+    queued_messages: var Table[uint32, string];
+    terminal_nodes: Table[uint32, bool]) =
   case message.kind
   of mk_success:
     let request_key = request_id_key(message.success.id)
     if not runtime.requests.hasKey(request_key):
+      let node_id = request_nodes.getOrDefault(request_key, 0'u32)
+      if terminal_nodes.getOrDefault(node_id):
+        bridge.emit_lifecycle_diagnostic(
+          node_id,
+          "late provider success suppressed")
+        request_nodes.del(request_key)
       return
     let request = runtime.requests[request_key]
     if request.request.kind == mk_initialize:
       return
     if request.request.kind == mk_thread_start and request.agent_id.isSome:
       let node_id = request_nodes.getOrDefault(request_key, 0'u32)
+      if terminal_nodes.getOrDefault(node_id):
+        bridge.emit_lifecycle_diagnostic(
+          node_id,
+          "post-terminal thread start suppressed",
+          message.success.result.thread_id)
+        discard runtime.state.terminalize_agent(request.agent_id.get)
+        request_nodes.del(request_key)
+        return
       thread_nodes[message.success.result.thread_id] = node_id
       bridge.emit_event(CodexRuntimeEvent(
         kind: cre_thread_ready,
         node_id: node_id,
-        text: message.success.result.thread_id))
+        text: message.success.result.thread_id,
+        thread_id: message.success.result.thread_id))
+      request_nodes.del(request_key)
       send_next_queued_message(
-        runtime, bridge, node_id, request_nodes, queued_messages)
+        runtime, bridge, node_id, request_nodes, queued_messages,
+        terminal_nodes)
   of mk_error:
     let request_key = request_id_key(message.error.id)
     let node_id = request_nodes.getOrDefault(request_key, 0'u32)
+    if terminal_nodes.getOrDefault(node_id):
+      bridge.emit_lifecycle_diagnostic(
+        node_id,
+        "late provider error suppressed")
+      request_nodes.del(request_key)
+      return
     var event_kind = if node_id == 0: cre_runtime_error else: cre_node_error
     if runtime.requests.hasKey(request_key):
       let request = runtime.requests[request_key]
       if request.request.kind == mk_thread_start:
         event_kind = cre_thread_error
         if request.agent_id.isSome:
-          runtime.agents.del(request.agent_id.get)
+          discard runtime.state.terminalize_agent(request.agent_id.get)
           queued_messages.clear_queued_messages(node_id)
       elif request.request.kind == mk_turn_start and request.agent_id.isSome:
         queued_messages.clear_queued_messages(node_id)
+    request_nodes.del(request_key)
     bridge.emit_event(CodexRuntimeEvent(
       kind: event_kind,
       node_id: node_id,
@@ -473,25 +612,68 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
     case notification.kind
     of nk_agent_message_delta:
       if thread_node_id.isSome and notification.params.delta.isSome:
+        let node_id = thread_node_id.get
+        if bridge.suppress_terminal_event(
+            terminal_nodes,
+            node_id,
+            "late agent message suppressed",
+            thread_id.value,
+            notification_turn_id(notification)):
+          return
         bridge.emit_event(notification_event(
           notification,
-          thread_node_id.get,
+          node_id,
           cre_agent_message_delta,
           notification.params.delta.get))
     of nk_turn_completed:
       if thread_node_id.isSome:
         let node_id = thread_node_id.get
+        let turn_id = notification_turn_id(notification)
+        if bridge.suppress_terminal_event(
+            terminal_nodes,
+            node_id,
+            "late turn completion suppressed",
+            thread_id.value,
+            turn_id):
+          return
+        let current_turn_id = turn_nodes.getOrDefault(thread_id.value, "")
+        if current_turn_id.len == 0 or turn_id.len == 0 or
+            current_turn_id != turn_id:
+          bridge.emit_lifecycle_diagnostic(
+            node_id,
+            if current_turn_id.len == 0:
+              "turn completion without current turn correlation"
+            elif turn_id.len == 0:
+              "turn completion missing turn ID"
+            else:
+              "turn completion correlation mismatch",
+            thread_id.value,
+            turn_id)
+          return
         let turn_succeeded = notification.params.turn_status.turn_succeeded
         let event_kind = if turn_succeeded: cre_turn_completed else: cre_node_error
         let event_text = if turn_succeeded: "" else:
           notification.params.error_message.get("turn failed")
-        if not turn_succeeded:
-          queued_messages.clear_queued_messages(node_id)
         bridge.emit_event(notification_event(
           notification, node_id, event_kind, event_text))
-        if turn_succeeded:
-          queued_messages.clear_queued_messages(node_id)
+        queued_messages.clear_queued_messages(node_id)
+        clear_turn_request_mapping(runtime, request_nodes, node_id, turn_id)
+        turn_nodes.del(thread_id.value)
+      else:
+        bridge.emit_event(CodexRuntimeEvent(
+          kind: cre_runtime_error,
+          node_id: 0,
+          text: "unmapped completion",
+          thread_id: if thread_id.has_value: thread_id.value else: "",
+          turn_id: notification_turn_id(notification)))
     of nk_error:
+      if thread_node_id.isSome and bridge.suppress_terminal_event(
+          terminal_nodes,
+          thread_node_id.get,
+          "late provider error suppressed",
+          if thread_id.has_value: thread_id.value else: "",
+          notification_turn_id(notification)):
+        return
       let event_kind = if notification.params.will_retry.retry_requested:
         cre_global_notification
       elif thread_node_id.isSome:
@@ -509,8 +691,11 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
     of nk_thread_closed:
       if thread_node_id.isSome:
         let node_id = thread_node_id.get
-        runtime.agents.del(agent_id_for_node(node_id))
-        thread_nodes.del(thread_id.value)
+        if bridge.suppress_terminal_event(
+            terminal_nodes, node_id, "late thread close suppressed",
+            thread_id.value):
+          return
+        discard runtime.terminalize_agent(agent_id_for_node(node_id))
         queued_messages.clear_queued_messages(node_id)
         bridge.emit_event(CodexRuntimeEvent(
           kind: cre_thread_error,
@@ -520,14 +705,40 @@ proc handle_runtime_message(runtime: ptr CodexRuntime;
       if not notification.method_name.is_suppressed_notification:
         emit_unknown_notification(bridge, notification)
     else:
-      if notification.kind.is_conversation_notification:
+      if thread_node_id.isSome and bridge.suppress_terminal_event(
+          terminal_nodes,
+          thread_node_id.get,
+          "late provider notification suppressed",
+          if thread_id.has_value: thread_id.value else: "",
+          notification_turn_id(notification)):
+        discard
+      elif notification.kind == nk_turn_started and thread_node_id.isSome:
+        if notification.params.turn_id.isSome:
+          turn_nodes[thread_id.value] = notification.params.turn_id.get
+        bridge.emit_event(notification_event(
+          notification,
+          thread_node_id.get(0'u32)))
+      elif notification.kind.is_conversation_notification:
         bridge.emit_event(notification_event(
           notification,
           thread_node_id.get(0'u32)))
   of mk_server_request:
     let request = message.server_request
     if request.kind.is_conversation_server_request:
-      bridge.emit_event(server_request_event(thread_nodes, request))
+      let request_event = server_request_event(thread_nodes, request)
+      if request_event.node_id > 0 and bridge.suppress_terminal_event(
+          terminal_nodes,
+          request_event.node_id,
+          "late server request suppressed",
+          request_event.thread_id,
+          request_event.turn_id,
+          request_event.request_id):
+        try:
+          runtime.fail_server_request(request.id, -32000, "node is terminal")
+        except CatchableError:
+          discard
+      else:
+        bridge.emit_event(request_event)
     else:
       bridge.emit_event(CodexRuntimeEvent(
         kind: cre_global_notification,
@@ -541,11 +752,25 @@ proc handle_stdout_line(runtime: ptr CodexRuntime;
     bridge: ptr CodexBridgeState; line: string;
     request_nodes: var Table[string, uint32];
     thread_nodes: var Table[string, uint32];
-    queued_messages: var Table[uint32, string]) =
+    turn_nodes: var Table[string, string];
+    queued_messages: var Table[uint32, string];
+    terminal_nodes: Table[uint32, bool]) =
   try:
-    let message = runtime.accept_json(parseJson(line))
+    let raw_message = parseJson(line)
+    let terminal_node_id = bridge.terminal_node_for_wire_message(
+      raw_message, request_nodes, thread_nodes, terminal_nodes)
+    let is_notification = raw_message.kind == JObject and
+      raw_message.hasKey("method") and not raw_message.hasKey("id")
+    if terminal_node_id > 0 and
+        (is_notification or not raw_message.hasKey("method")):
+      bridge.emit_lifecycle_diagnostic(
+        terminal_node_id,
+        "late provider message suppressed before runtime apply")
+      return
+    let message = runtime.accept_json(raw_message)
     handle_runtime_message(
-      runtime, bridge, message, request_nodes, thread_nodes, queued_messages)
+      runtime, bridge, message, request_nodes, thread_nodes, turn_nodes,
+      queued_messages, terminal_nodes)
   except CatchableError as error:
     bridge.emit_event(CodexRuntimeEvent(
       kind: cre_runtime_error,
@@ -578,8 +803,15 @@ proc handle_create_node_thread(runtime: ptr CodexRuntime;
 proc handle_send_node_message(runtime: ptr CodexRuntime;
     bridge: ptr CodexBridgeState; input: CodexRuntimeInput;
     request_nodes: var Table[string, uint32];
-    queued_messages: var Table[uint32, string]) =
+    queued_messages: var Table[uint32, string];
+    terminal_nodes: Table[uint32, bool]) =
   let node_id = input.message_node_id
+  if terminal_nodes.getOrDefault(node_id):
+    bridge.emit_lifecycle_diagnostic(
+      node_id,
+      "post-terminal turn start suppressed")
+    queued_messages.clear_queued_messages(node_id)
+    return
   let agent_id = agent_id_for_node(node_id)
   if runtime.agents.hasKey(agent_id) and
       runtime.agents[agent_id].state != as_idle:
@@ -595,14 +827,18 @@ proc handle_send_node_message(runtime: ptr CodexRuntime;
       input.reasoning_effort)
     return
   send_next_queued_message(
-    runtime, bridge, node_id, request_nodes, queued_messages)
+    runtime, bridge, node_id, request_nodes, queued_messages, terminal_nodes)
 
 proc handle_command(runtime: ptr CodexRuntime; bridge: ptr CodexBridgeState;
     input: CodexRuntimeInput; request_nodes: var Table[string, uint32];
-    queued_messages: var Table[uint32, string]) =
+    thread_nodes: Table[string, uint32];
+    turn_nodes: var Table[string, string];
+    queued_messages: var Table[uint32, string];
+    terminal_nodes: var Table[uint32, bool]) =
   case input.kind
   of cri_send_node_message:
-    handle_send_node_message(runtime, bridge, input, request_nodes, queued_messages)
+    handle_send_node_message(
+      runtime, bridge, input, request_nodes, queued_messages, terminal_nodes)
   of cri_reply_server_request:
     try:
       let response_json = input.server_response.serialize()
@@ -622,6 +858,14 @@ proc handle_command(runtime: ptr CodexRuntime; bridge: ptr CodexBridgeState;
         kind: cre_node_error,
         node_id: input.server_request_node_id,
         text: "Codex tool response error: " & error.msg))
+  of cri_terminalize_node:
+    terminalize_node_transport(
+      runtime,
+      input.terminal_node_id,
+      thread_nodes,
+      turn_nodes,
+      queued_messages,
+      terminal_nodes)
   else:
     discard
 
@@ -648,7 +892,9 @@ proc codex_worker(state: ptr CodexBridgeState) {.thread.} =
   var runtime: ptr CodexRuntime = nil
   var request_nodes = initTable[string, uint32]()
   var thread_nodes = initTable[string, uint32]()
+  var turn_nodes = initTable[string, string]()
   var queued_messages = initTable[uint32, string]()
+  var terminal_nodes = initTable[uint32, bool]()
   var pending_inputs: seq[CodexRuntimeInput] = @[]
   var should_stop = false
 
@@ -680,9 +926,17 @@ proc codex_worker(state: ptr CodexBridgeState) {.thread.} =
       pending_inputs.add(input)
       continue
     case input.kind
-    of cri_send_node_message, cri_reply_server_request:
+    of cri_send_node_message, cri_reply_server_request, cri_terminalize_node:
       if runtime != nil:
-        handle_command(runtime, state, input, request_nodes, queued_messages)
+        handle_command(
+          runtime,
+          state,
+          input,
+          request_nodes,
+          thread_nodes,
+          turn_nodes,
+          queued_messages,
+          terminal_nodes)
       else:
         fail_pending_input(state, input, "Codex runtime unavailable")
     of cri_shutdown:
@@ -691,13 +945,27 @@ proc codex_worker(state: ptr CodexBridgeState) {.thread.} =
       if runtime != nil:
         let was_initialized = runtime.initialized
         handle_stdout_line(
-          runtime, state, input.line, request_nodes, thread_nodes, queued_messages)
+          runtime,
+          state,
+          input.line,
+          request_nodes,
+          thread_nodes,
+          turn_nodes,
+          queued_messages,
+          terminal_nodes)
         if not was_initialized and runtime.initialized and pending_inputs.len > 0:
           let inputs = pending_inputs
           pending_inputs.setLen(0)
           for pending_input in inputs:
             handle_command(
-              runtime, state, pending_input, request_nodes, queued_messages)
+              runtime,
+              state,
+              pending_input,
+              request_nodes,
+              thread_nodes,
+              turn_nodes,
+              queued_messages,
+              terminal_nodes)
         elif runtime.initialization_error.isSome and pending_inputs.len > 0:
           fail_pending_inputs(
             state, pending_inputs, runtime.initialization_error.get)
@@ -720,6 +988,8 @@ proc codex_worker(state: ptr CodexBridgeState) {.thread.} =
 
 proc new_codex_bridge*(): CodexBridge =
   result = cast[CodexBridge](allocShared0(sizeof(CodexBridgeState)))
+  result[].terminalization_lock.initLock()
+  result[].terminalization_requests = initTable[uint32, bool]()
   result[].input_channel.open()
   result[].event_channel.open()
   createThread(result[].worker_thread, codex_worker, result)
@@ -734,6 +1004,17 @@ proc send_node_message*(bridge: CodexBridge; node_id: uint32; text: string;
     developer_instructions: developer_instructions,
     graph_creation_node: graph_creation_node,
     reasoning_effort: reasoning_effort))
+
+proc terminalize_node*(bridge: CodexBridge; node_id: uint32) =
+  if bridge == nil:
+    return
+  mark_terminalization_requested(bridge, node_id)
+  try:
+    bridge[].input_channel.send(CodexRuntimeInput(
+      kind: cri_terminalize_node,
+      terminal_node_id: node_id))
+  except CatchableError:
+    discard
 
 proc enqueue_server_response(bridge: CodexBridge;
     input: CodexRuntimeInput): bool =
@@ -779,4 +1060,5 @@ proc deinit_codex_bridge*(bridge: CodexBridge) =
   joinThread(bridge[].worker_thread)
   bridge[].input_channel.close()
   bridge[].event_channel.close()
+  deinitLock(bridge[].terminalization_lock)
   deallocShared(bridge)

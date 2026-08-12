@@ -89,5 +89,21 @@ let user_input_response = serialize_user_input_response(@[
   UserInputAnswer(question_id: "question", answer: "answer")])
 doAssert user_input_response["answers"]["question"]["answers"][0].getStr ==
   "answer"
+runtime.state.agents["terminal"] = Agent(
+  id: "terminal",
+  thread_id: Nullable[string](has_value: true, value: "terminal-thread"),
+  turn_id: some("terminal-turn"),
+  state: as_working,
+  last_error: NullableOption[string](state: nos_none),
+  tools: @[])
+var terminal_request = user_input_request
+terminal_request.id = RequestId(kind: rid_integer, integer_value: 11)
+terminal_request.params.tool_user_input.thread_id = "terminal-thread"
+runtime.state.apply_server_request(terminal_request)
+doAssert runtime.server_requests.hasKey(request_id_key(terminal_request.id))
+doAssert runtime.state.terminalize_agent("terminal")
+doAssert not runtime.state.agents.hasKey("terminal")
+doAssert not runtime.server_requests.hasKey(request_id_key(terminal_request.id))
+doAssert not runtime.state.terminalize_agent("terminal")
 runtime.state.server_requests.clear()
 deallocShared(runtime)

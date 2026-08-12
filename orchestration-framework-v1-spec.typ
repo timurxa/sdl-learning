@@ -348,6 +348,18 @@ For a graph-creation node, completion succeeds only when no pending edit remains
 
 Any failed completion attempt immediately marks the node `failed`. The thread is not resumed for correction. This applies equally to explicit `finish_node()` and normal turn termination.
 
+After a successful `finish_node()` response is accepted by the runtime, the node
+is terminal and its transport is non-schedulable. Queued follow-up work is
+cleared; duplicate finish requests and late provider events are suppressed
+without changing canonical state. Completion validation and terminal state
+transition use one controller for both completion sources.
+
+An open worker turn has a configurable monotonic lifetime bound. A normal turn
+completion is authoritative only when correlated to its mapped thread and
+current turn. Idle-only status and unmapped completion events are diagnostic,
+not successful completion; if no correlated completion arrives before the
+bound, the node fails with a watchdog/completion-missing reason.
+
 Crashes, timeouts, and uncaught execution errors also mark the current node `failed`. Version 1 performs no automatic retry.
 
 If a graph-creation node fails, every uncommitted pending edit owned by that node is discarded and the canonical graph remains unchanged by those edits.

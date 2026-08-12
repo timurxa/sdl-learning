@@ -53,6 +53,10 @@ doAssert graph.runnable_node_ids() == @[1'u32, 3'u32]
 graph.nodes[0].state = running
 doAssert graph.complete_node(1)
 doAssert graph.nodes[0].state == completed
+doAssert graph.complete_node(1)
+let graph_log_count = graph.log_messages.len
+doAssert not graph.fail_node(1, "late failure")
+doAssert graph.log_messages.len == graph_log_count
 doAssert graph.runnable_node_ids() == @[2'u32, 3'u32]
 
 graph.nodes[1].state = running
@@ -239,3 +243,47 @@ discard tool_response_graph.handle_codex_event(nil, CodexRuntimeEvent(
   kind: cre_turn_completed,
   node_id: 50))
 doAssert tool_response_graph.nodes[0].state == completed
+
+var watchdog_graph = WorkGraph(
+  watchdog_timeout_seconds: 0.001,
+  nodes: @[WorkNode(id: 60, state: running)])
+discard watchdog_graph.check_watchdogs(nil)
+doAssert watchdog_graph.nodes[0].state == running
+let watchdog_start_ticks =
+  watchdog_graph.lifecycle_diagnostics[^1].started_ticks
+discard watchdog_graph.check_watchdogs(nil, watchdog_start_ticks + 2_000_000)
+doAssert watchdog_graph.nodes[0].state == failed
+doAssert watchdog_graph.lifecycle_counters.watchdog_timeouts == 1
+doAssert watchdog_graph.lifecycle_diagnostics[^1].source == completion_watchdog
+discard watchdog_graph.check_watchdogs(nil, watchdog_start_ticks + 3_000_000)
+doAssert watchdog_graph.lifecycle_counters.watchdog_timeouts == 1
+let watchdog_log_count = watchdog_graph.log_messages.len
+discard watchdog_graph.handle_codex_event(nil, CodexRuntimeEvent(
+  kind: cre_turn_completed,
+  node_id: 60))
+doAssert watchdog_graph.nodes[0].state == failed
+doAssert watchdog_graph.log_messages.len == watchdog_log_count
+
+var idle_watchdog_graph = WorkGraph(
+  watchdog_timeout_seconds: 0.001,
+  nodes: @[WorkNode(id: 61, state: running)])
+discard idle_watchdog_graph.check_watchdogs(nil)
+let idle_start_ticks =
+  idle_watchdog_graph.lifecycle_diagnostics[^1].started_ticks
+discard idle_watchdog_graph.handle_codex_event(nil, CodexRuntimeEvent(
+  kind: cre_global_notification,
+  node_id: 61,
+  thread_id: "idle-thread",
+  notification_kind: nk_thread_status_changed,
+  thread_status: some(tsk_idle)))
+doAssert idle_watchdog_graph.nodes[0].state == running
+discard idle_watchdog_graph.check_watchdogs(nil, idle_start_ticks + 2_000_000)
+doAssert idle_watchdog_graph.nodes[0].state == failed
+
+var protocol_error_graph = WorkGraph(nodes: @[
+  WorkNode(id: 62, state: running)])
+discard protocol_error_graph.handle_codex_event(nil, CodexRuntimeEvent(
+  kind: cre_runtime_error,
+  text: "Codex message error: malformed JSON"))
+doAssert protocol_error_graph.nodes[0].state == failed
+doAssert protocol_error_graph.log_messages[^1].contains("malformed JSON")

@@ -1,4 +1,4 @@
-import std/[json, os, options, sequtils, strutils, tables]
+import std/[json, monotimes, os, options, sequtils, strutils, tables]
 import codex_bridge
 import codex_json
 import orchestration_storage
@@ -40,6 +40,62 @@ type
     awaiting_human_input
     completed
     failed
+
+  CompletionSource* = enum
+    completion_normal_turn
+    completion_finish_node
+    completion_human_input
+    completion_runtime_error
+    completion_watchdog
+
+  LifecycleDisposition* = enum
+    lifecycle_accepted
+    lifecycle_rejected
+    lifecycle_duplicate
+    lifecycle_late_suppressed
+
+  LifecycleDiagnostic* = object
+    node_id*: uint32
+    execution_type*: ExecutionPlanType
+    source*: CompletionSource
+    disposition*: LifecycleDisposition
+    old_state*: NodeState
+    new_state*: NodeState
+    reason*: string
+    thread_id*: string
+    turn_id*: string
+    request_id*: string
+    output_paths_checked*: seq[string]
+    validation_result*: string
+    started_ticks*: int64
+    terminal_ticks*: int64
+    elapsed_milliseconds*: int64
+
+  CodexEventResult* = object
+    error*: string
+    disposition*: LifecycleDisposition
+
+  LifecycleCounters* = object
+    node_starts*: uint64
+    explicit_finish_calls*: uint64
+    successful_completion_attempts*: uint64
+    failed_completion_attempts*: uint64
+    duplicate_finish_calls*: uint64
+    late_terminal_events*: uint64
+    post_terminal_turn_starts*: uint64
+    watchdog_timeouts*: uint64
+    unmapped_completions*: uint64
+    finish_response_enqueue_failures*: uint64
+
+  NodeLifecycle = object
+    node_id: uint32
+    started_ticks: int64
+    terminal_ticks: int64
+    thread_id: string
+    turn_id: string
+    pending_finish_request_id: string
+    idle_observed: bool
+    terminal: bool
 
   WorkNode* = object
     id*: uint32
@@ -119,12 +175,31 @@ type
     next_edit_id: uint32
     final_artifacts_reported: bool
     pending_sequences: seq[PendingEditSequence]
+    watchdog_timeout_seconds*: float64
+    lifecycle_diagnostics*: seq[LifecycleDiagnostic]
+    lifecycle_counters*: LifecycleCounters
+    node_lifecycles: seq[NodeLifecycle]
 
   ResolvedOutputArtifact = object
     declaration: OutputArtifactDecl
     path: string
 
 const human_response_output_path = "response.txt"
+const
+  ## Initial rollout bound. Override with `CODEX_WORKER_LIFETIME_SECONDS`.
+  default_worker_lifetime_seconds* = 300.0
+  worker_lifetime_env_name* = "CODEX_WORKER_LIFETIME_SECONDS"
+
+proc configured_worker_lifetime_seconds*(): float64 =
+  let configured = getEnv(worker_lifetime_env_name)
+  if configured.len > 0:
+    try:
+      let value = parseFloat(configured)
+      if value > 0:
+        return value
+    except ValueError:
+      discard
+  default_worker_lifetime_seconds
 
 proc reasoning_effort(level: ReasoningLevel): ReasoningEffort =
   case level:
@@ -161,9 +236,12 @@ proc new_work_graph*(cwd = getCurrentDir(); objective = ""): WorkGraph =
         execution_plan: ExecutionPlan(
           `type`: graph_creation,
           reasoning_level: bounded,
-          instructions: "Construct the work graph for the objective. If a material ambiguity blocks safe execution, create one or more human_input nodes, then a graph_creation node that consumes their responses before expanding the affected work. Human_input always gets implicit response.txt; do not declare it. Graph structure is created only with graph tools; artifacts are files for the final user or downstream workers."))],
+          instructions: "Construct the smallest work graph that can complete the objective. Identify its dominant pattern and use applicable motifs: pipeline for ordered transform, review, or publish stages; decompose/solve/aggregate for independent subproblems and integration; retrieve/synthesize/cite for parallel retrieval, grounded synthesis, and citation or fact checking; research/gaps/follow-up for bounded follow-up on material gaps; proposal/judge/select for alternatives, explicit criteria, and selection or refinement; and adversarial verification/simplification/performance review for independent challenge, simplification, and performance assessment before integration. Treat compare, alternatives, choose, verify, challenge, simplify, optimize, benchmark, research, sources, cite, decompose, independent, and follow up as signals, not mandatory steps. Combine motifs only when their dependencies are distinct; avoid redundant reviewers and unnecessary serial stages. If a material ambiguity blocks safe execution, create one or more human_input nodes, then a graph_creation node that consumes their responses before expanding the affected work. Human_input always gets implicit response.txt; do not declare it. Graph structure is created only with graph tools; artifacts are files for the final user or downstream workers. After planning, create another graph_creation node only when unfinished work, a material research gap, or a verification result requires a new planning decision; if the objective is complete, create no continuation planner and finish this graph-creation node after committing its execution graph."))],
     next_node_id: 2,
-    next_edit_id: 1)
+    next_edit_id: 1,
+    watchdog_timeout_seconds: configured_worker_lifetime_seconds(),
+    lifecycle_diagnostics: @[],
+    node_lifecycles: @[])
 
 proc node_index*(graph: WorkGraph; node_id: uint32): int =
   for index, node in graph.nodes:
@@ -1391,6 +1469,13 @@ proc add_node_prompt_contract(result: var string; node: WorkNode) =
     result.add("  - Do not create or modify the work graph.\n")
   result.add("  - Write every declared output before calling finish_node.\n")
   result.add("  - Call finish_node only after completion rules are satisfied.\n")
+  result.add("  - finish_node is preferred explicit completion handshake.\n")
+  result.add("  - After finish_node succeeds, stop immediately: do not do more work, " &
+    "send another task, call finish_node again, or wait for continuation.\n")
+  result.add("  - Ordinary text saying done is not completion; runtime accepts only " &
+    "validated finish_node or normal turn termination.\n")
+  result.add("  - Never create or update a Codex platform goal; goal state belongs to " &
+    "the goal layer.\n")
 
 proc node_developer_prompt*(graph: WorkGraph; node: WorkNode): string =
   result.add("Current orchestration node:\n")
@@ -1478,46 +1563,319 @@ proc node_prompt(node: WorkNode): string =
 proc log_node_failure(graph: var WorkGraph; node_id: uint32; reason: string) =
   graph.log_messages.add("NODE " & $node_id & " FAILED: " & reason)
 
-proc fail_node*(graph: var WorkGraph; node_id: uint32; reason: string): bool =
+proc lifecycle_index(graph: WorkGraph; node_id: uint32): int =
+  for index, lifecycle in graph.node_lifecycles:
+    if lifecycle.node_id == node_id:
+      return index
+  -1
+
+proc pending_finish_index(graph: WorkGraph; request_id: string): int =
+  if request_id.len == 0:
+    return -1
+  for index, lifecycle in graph.node_lifecycles:
+    if lifecycle.pending_finish_request_id == request_id:
+      return index
+  -1
+
+proc pending_finish_for_node(graph: WorkGraph; node_id: uint32): int =
+  let index = graph.lifecycle_index(node_id)
+  if index >= 0 and graph.node_lifecycles[index].pending_finish_request_id.len > 0:
+    return index
+  -1
+
+proc clear_pending_finish(graph: var WorkGraph; node_id: uint32) =
+  let index = graph.lifecycle_index(node_id)
+  if index >= 0:
+    graph.node_lifecycles[index].pending_finish_request_id.setLen(0)
+
+proc set_pending_finish(graph: var WorkGraph; node_id: uint32;
+    request_id, thread_id, turn_id: string) =
+  let index = graph.lifecycle_index(node_id)
+  if index >= 0:
+    graph.node_lifecycles[index].pending_finish_request_id = request_id
+    graph.node_lifecycles[index].thread_id = thread_id
+    graph.node_lifecycles[index].turn_id = turn_id
+  else:
+    graph.node_lifecycles.add(NodeLifecycle(
+      node_id: node_id,
+      started_ticks: getMonoTime().ticks,
+      thread_id: thread_id,
+      turn_id: turn_id,
+      pending_finish_request_id: request_id))
+
+proc add_lifecycle_diagnostic(graph: var WorkGraph; node_id: uint32;
+    source: CompletionSource; disposition: LifecycleDisposition;
+    old_state, new_state: NodeState; reason: string;
+    thread_id = ""; turn_id = ""; request_id = ""; started_ticks = 0'i64) =
+  let terminal_ticks = getMonoTime().ticks
+  let elapsed_milliseconds = if started_ticks > 0:
+    (terminal_ticks - started_ticks) div 1_000_000 else: 0'i64
+  let node_index = graph.node_index(node_id)
+  let execution_type = if node_index >= 0:
+    graph.nodes[node_index].execution_plan.`type` else: llm_worker
+  var output_paths: seq[string] = @[]
+  if node_index >= 0:
+    for output in graph.nodes[node_index].outputs:
+      try:
+        output_paths.add(graph.resolve_output_path(node_id, output))
+      except CatchableError:
+        output_paths.add(output.path)
+  graph.lifecycle_diagnostics.add(LifecycleDiagnostic(
+    node_id: node_id,
+    execution_type: execution_type,
+    source: source,
+    disposition: disposition,
+    old_state: old_state,
+    new_state: new_state,
+    reason: reason,
+    thread_id: thread_id,
+    turn_id: turn_id,
+    request_id: request_id,
+    output_paths_checked: output_paths,
+    validation_result: reason,
+    started_ticks: started_ticks,
+    terminal_ticks: terminal_ticks,
+    elapsed_milliseconds: elapsed_milliseconds))
+
+proc begin_node_lifecycle(graph: var WorkGraph; node_id: uint32): bool =
+  if graph.lifecycle_index(node_id) >= 0:
+    return false
+  let started_ticks = getMonoTime().ticks
+  graph.node_lifecycles.add(NodeLifecycle(
+    node_id: node_id,
+    started_ticks: started_ticks))
+  inc graph.lifecycle_counters.node_starts
+  graph.add_lifecycle_diagnostic(
+    node_id,
+    completion_normal_turn,
+    lifecycle_accepted,
+    pending,
+    running,
+    "node_started",
+    started_ticks = started_ticks)
+  true
+
+proc mark_node_started(graph: var WorkGraph; index: int): bool =
+  if index < 0 or graph.nodes[index].state != pending:
+    return false
+  let node_id = graph.nodes[index].id
+  graph.nodes[index].state = running
+  if graph.begin_node_lifecycle(node_id):
+    return true
+  graph.nodes[index].state = pending
+  false
+
+proc lifecycle_node_for_thread(graph: WorkGraph; thread_id: string): uint32 =
+  if thread_id.len == 0:
+    return 0
+  for lifecycle in graph.node_lifecycles:
+    if lifecycle.thread_id == thread_id:
+      return lifecycle.node_id
+  0
+
+proc update_lifecycle_transport(graph: var WorkGraph;
+    event: CodexRuntimeEvent) =
+  var node_id = event.node_id
+  if node_id == 0:
+    node_id = graph.lifecycle_node_for_thread(event.thread_id)
+  let lifecycle_index = graph.lifecycle_index(node_id)
+  if lifecycle_index < 0:
+    return
+  let node_index = graph.node_index(node_id)
+  if node_index < 0 or not graph.nodes[node_index].state.node_state_is_active:
+    return
+  var lifecycle = graph.node_lifecycles[lifecycle_index]
+  if event.kind == cre_thread_ready and event.text.len > 0:
+    lifecycle.thread_id = event.text
+  elif event.thread_id.len > 0:
+    lifecycle.thread_id = event.thread_id
+  if event.turn_id.len > 0:
+    lifecycle.turn_id = event.turn_id
+  if event.kind == cre_global_notification and
+      event.notification_kind == nk_turn_started:
+    lifecycle.idle_observed = false
+  elif event.kind == cre_global_notification and
+      event.notification_kind == nk_thread_status_changed and
+      event.thread_status.isSome and event.thread_status.get == tsk_idle:
+    lifecycle.idle_observed = true
+  graph.node_lifecycles[lifecycle_index] = lifecycle
+
+proc transition_to_terminal(graph: var WorkGraph; node_id: uint32;
+    new_state: NodeState; source: CompletionSource; reason: string;
+    thread_id = ""; turn_id = ""; request_id = ""): LifecycleDisposition =
+  let index = graph.node_index(node_id)
+  if index < 0:
+    return lifecycle_rejected
+  let old_state = graph.nodes[index].state
+  if old_state notin {pending, running, awaiting_human_input}:
+    graph.add_lifecycle_diagnostic(
+      node_id,
+      source,
+      lifecycle_late_suppressed,
+      old_state,
+      old_state,
+      reason,
+      thread_id,
+      turn_id,
+      request_id)
+    return lifecycle_late_suppressed
+  graph.nodes[index].state = new_state
+  graph.clear_pending_finish(node_id)
+  if new_state == failed and
+      graph.nodes[index].execution_plan.`type`.node_execution_contract.graph_creator:
+    let sequence_index = graph.pending_sequence_index(node_id)
+    if sequence_index >= 0:
+      graph.pending_sequences.delete(sequence_index)
+  let lifecycle_index = graph.lifecycle_index(node_id)
+  var started_ticks = 0'i64
+  if lifecycle_index >= 0:
+    var lifecycle = graph.node_lifecycles[lifecycle_index]
+    started_ticks = lifecycle.started_ticks
+    lifecycle.terminal = true
+    lifecycle.terminal_ticks = getMonoTime().ticks
+    if thread_id.len > 0:
+      lifecycle.thread_id = thread_id
+    if turn_id.len > 0:
+      lifecycle.turn_id = turn_id
+    graph.node_lifecycles[lifecycle_index] = lifecycle
+  graph.add_lifecycle_diagnostic(
+    node_id,
+    source,
+    lifecycle_accepted,
+    old_state,
+    new_state,
+    reason,
+    thread_id,
+    turn_id,
+    request_id,
+    started_ticks)
+  lifecycle_accepted
+
+proc fail_node_with_source(graph: var WorkGraph; node_id: uint32;
+    reason: string; source: CompletionSource;
+    thread_id = ""; turn_id = ""; request_id = ""): bool =
   let index = graph.node_index(node_id)
   if index < 0:
     graph.log_node_failure(node_id, reason)
     return false
-  let can_fail = graph.nodes[index].state == pending or
-    graph.nodes[index].state.node_state_is_active
-  if can_fail:
-    graph.nodes[index].state = failed
-    if graph.nodes[index].execution_plan.`type`.node_execution_contract.graph_creator:
-      let sequence_index = graph.pending_sequence_index(node_id)
-      if sequence_index >= 0:
-        graph.pending_sequences.delete(sequence_index)
-  graph.log_node_failure(node_id, reason)
-  can_fail
+  let old_state = graph.nodes[index].state
+  let disposition = graph.transition_to_terminal(
+    node_id,
+    failed,
+    source,
+    reason,
+    thread_id,
+    turn_id,
+    request_id)
+  if disposition == lifecycle_accepted:
+    graph.log_node_failure(node_id, reason)
+    inc graph.lifecycle_counters.failed_completion_attempts
+  elif old_state in {completed, failed}:
+    inc graph.lifecycle_counters.late_terminal_events
+  disposition == lifecycle_accepted
 
-proc complete_node_state(graph: var WorkGraph; index: int): bool =
-  if index < 0 or not graph.nodes[index].state.node_state_is_active:
+proc fail_node*(graph: var WorkGraph; node_id: uint32; reason: string): bool =
+  graph.fail_node_with_source(node_id, reason, completion_runtime_error)
+
+proc fail_and_terminalize(graph: var WorkGraph; bridge: CodexBridge;
+    node_id: uint32; reason: string; source = completion_runtime_error;
+    thread_id = ""; turn_id = ""; request_id = ""): bool =
+  result = graph.fail_node_with_source(
+    node_id, reason, source, thread_id, turn_id, request_id)
+  if result:
+    bridge.terminalize_node(node_id)
+
+proc fail_active_nodes(graph: var WorkGraph; bridge: CodexBridge;
+    reason: string; source = completion_runtime_error) =
+  var active_node_ids: seq[uint32] = @[]
+  for node in graph.nodes:
+    if node.state.node_state_is_active:
+      active_node_ids.add(node.id)
+  for node_id in active_node_ids:
+    discard graph.fail_and_terminalize(bridge, node_id, reason, source)
+
+proc complete_node_state(graph: var WorkGraph; index: int;
+    source = completion_normal_turn; thread_id = ""; turn_id = "";
+    request_id = ""): bool =
+  if index < 0:
     return false
-  graph.nodes[index].state = completed
+  if graph.nodes[index].state == completed:
+    discard graph.transition_to_terminal(
+      graph.nodes[index].id,
+      completed,
+      source,
+      "duplicate_completion",
+      thread_id,
+      turn_id,
+      request_id)
+    return true
+  if graph.nodes[index].state == failed:
+    discard graph.transition_to_terminal(
+      graph.nodes[index].id,
+      failed,
+      source,
+      "completion_after_failure",
+      thread_id,
+      turn_id,
+      request_id)
+    return false
+  if not graph.nodes[index].state.node_state_is_active:
+    return false
+  let node_id = graph.nodes[index].id
+  let disposition = graph.transition_to_terminal(
+      node_id,
+      completed,
+      source,
+      "completion_accepted",
+      thread_id,
+      turn_id,
+      request_id)
+  if disposition != lifecycle_accepted:
+    return graph.nodes[index].state == completed
+  inc graph.lifecycle_counters.successful_completion_attempts
   if graph.all_nodes_completed and not graph.final_artifacts_reported:
     graph.report_final_artifacts
   true
 
-proc attempt_completion_error*(graph: var WorkGraph; node_id: uint32): string =
+proc completion_validation_error(graph: WorkGraph; node_id: uint32;
+    source: CompletionSource): string =
   let index = graph.node_index(node_id)
-  if index < 0 or not graph.nodes[index].state.node_state_is_active:
+  if index < 0:
+    return "unknown node"
+  let expected_state = if source == completion_human_input:
+    awaiting_human_input else: running
+  if graph.nodes[index].state != expected_state:
     return "node is not active"
-  result = graph.node_completion_error(node_id)
+  graph.node_completion_error(node_id)
+
+proc attempt_completion_error*(graph: var WorkGraph; node_id: uint32;
+    source = completion_normal_turn): string =
+  let index = graph.node_index(node_id)
+  if index < 0:
+    return "unknown node"
+  if graph.nodes[index].state in {completed, failed}:
+    if graph.complete_node_state(index, source):
+      return
+    return "node is not active"
+  result = graph.completion_validation_error(node_id, source)
   if result.len > 0:
-    discard graph.fail_node(node_id, result)
-    return
-  if not graph.complete_node_state(index):
+    discard graph.fail_node_with_source(node_id, result, source)
+    return result
+  if not graph.complete_node_state(index, source):
     result = "node completion failed"
 
-proc attempt_completion*(graph: var WorkGraph; node_id: uint32): bool =
-  graph.attempt_completion_error(node_id).len == 0
+proc attempt_completion*(graph: var WorkGraph; node_id: uint32;
+    source = completion_normal_turn): bool =
+  graph.attempt_completion_error(node_id, source).len == 0
 
-proc complete_node*(graph: var WorkGraph; node_id: uint32): bool =
-  graph.attempt_completion(node_id)
+proc complete_node*(graph: var WorkGraph; node_id: uint32;
+    source = completion_normal_turn): bool =
+  var effective_source = source
+  let index = graph.node_index(node_id)
+  if source == completion_normal_turn and index >= 0 and
+      graph.nodes[index].state == awaiting_human_input:
+    effective_source = completion_human_input
+  graph.attempt_completion(node_id, effective_source)
 
 proc node_is_running*(graph: WorkGraph; node_id: uint32): bool =
   let index = graph.node_index(node_id)
@@ -1541,7 +1899,15 @@ proc mark_awaiting_human_input*(graph: var WorkGraph; node_id: uint32): bool =
   let index = graph.node_index(node_id)
   if index < 0 or graph.nodes[index].state notin {pending, running}:
     return false
+  let old_state = graph.nodes[index].state
   graph.nodes[index].state = awaiting_human_input
+  graph.add_lifecycle_diagnostic(
+    node_id,
+    completion_human_input,
+    lifecycle_accepted,
+    old_state,
+    awaiting_human_input,
+    "human_input_requested")
   true
 
 proc answer_human_input*(graph: var WorkGraph; node_id: uint32;
@@ -1560,7 +1926,7 @@ proc answer_human_input*(graph: var WorkGraph; node_id: uint32;
     writeFile(path, "Instructions:\n" &
       node.execution_plan.instructions &
       "\n\nResponse:\n" & answer)
-    graph.attempt_completion(node_id)
+    graph.attempt_completion(node_id, completion_human_input)
   except CatchableError as error:
     discard graph.fail_node(node_id, error.msg)
     false
@@ -1588,7 +1954,7 @@ proc send_work_graph_message(graph: var WorkGraph; bridge: CodexBridge;
         text: "DEVELOPER INSTRUCTIONS:\n" & developer_instructions))
     true
   except CatchableError as error:
-    discard graph.fail_node(node_id, error.msg)
+    discard graph.fail_and_terminalize(bridge, node_id, error.msg)
     false
 
 proc start_available_nodes*(graph: var WorkGraph; bridge: CodexBridge) =
@@ -1607,7 +1973,8 @@ proc start_available_nodes*(graph: var WorkGraph; bridge: CodexBridge) =
       continue
     if bridge == nil:
       continue
-    graph.nodes[index].state = running
+    if not graph.mark_node_started(index):
+      continue
     let running_node = graph.nodes[index]
     let developer_prompt = graph.node_developer_prompt(running_node)
     discard graph.send_work_graph_message(
@@ -1617,6 +1984,39 @@ proc start_available_nodes*(graph: var WorkGraph; bridge: CodexBridge) =
       developer_prompt,
       contract.graph_creator,
       running_node.execution_plan.reasoning_level.reasoning_effort)
+
+proc effective_watchdog_timeout_seconds(graph: WorkGraph): float64 =
+  if graph.watchdog_timeout_seconds > 0:
+    graph.watchdog_timeout_seconds
+  else:
+    configured_worker_lifetime_seconds()
+
+proc check_watchdogs*(graph: var WorkGraph; bridge: CodexBridge;
+    now_ticks = getMonoTime().ticks): seq[uint32] =
+  let timeout_ticks = int64(
+    graph.effective_watchdog_timeout_seconds * 1_000_000_000.0)
+  if timeout_ticks <= 0:
+    return @[]
+  for index in 0 ..< graph.nodes.len:
+    if graph.nodes[index].state == running and
+        graph.lifecycle_index(graph.nodes[index].id) < 0:
+      discard graph.begin_node_lifecycle(graph.nodes[index].id)
+  var expired_nodes: seq[(uint32, bool)] = @[]
+  for lifecycle in graph.node_lifecycles:
+    if lifecycle.terminal or lifecycle.started_ticks <= 0 or
+        now_ticks - lifecycle.started_ticks < timeout_ticks:
+      continue
+    let index = graph.node_index(lifecycle.node_id)
+    if index >= 0 and graph.nodes[index].state == running:
+      expired_nodes.add((lifecycle.node_id, lifecycle.idle_observed))
+  for expired_node in expired_nodes:
+    let node_id = expired_node[0]
+    let reason = if expired_node[1]:
+      "idle_without_completion" else: "worker_watchdog_timeout"
+    if graph.fail_and_terminalize(
+        bridge, node_id, reason, completion_watchdog):
+      inc graph.lifecycle_counters.watchdog_timeouts
+      result.add(node_id)
 
 proc reply_tool_call(bridge: CodexBridge; event: CodexRuntimeEvent;
     success: bool; message: string): bool =
@@ -1630,6 +2030,21 @@ proc reply_tool_call(bridge: CodexBridge; event: CodexRuntimeEvent;
       content_items: if message.len > 0:
         @[dynamic_tool_text(message)]
       else: @[]))
+
+proc fail_tool_call_after_reply(graph: var WorkGraph; bridge: CodexBridge;
+    event: CodexRuntimeEvent; reason, response_message: string;
+    source = completion_runtime_error): string =
+  result = reason
+  let did_fail = graph.fail_node_with_source(
+    event.node_id,
+    reason,
+    source,
+    event.thread_id,
+    event.turn_id,
+    event.request_id)
+  discard bridge.reply_tool_call(event, false, response_message)
+  if did_fail:
+    bridge.terminalize_node(event.node_id)
 
 proc event_arguments(event: CodexRuntimeEvent): JsonNode =
   let value = parseJson(event.params_json)
@@ -1710,36 +2125,96 @@ proc handle_graph_tool_call(graph: var WorkGraph; bridge: CodexBridge;
       raise newException(ValueError, "unknown graph-creation tool")
     if not bridge.reply_tool_call(event, true, response.pretty):
       result = "graph tool response could not be queued"
-      discard graph.fail_node(event.node_id, result)
+      discard graph.fail_and_terminalize(
+        bridge, event.node_id, result, completion_runtime_error)
   except CatchableError as error:
     if not bridge.reply_tool_call(event, false, error.msg):
       result = "graph tool error response could not be queued"
-      discard graph.fail_node(event.node_id, result)
+      discard graph.fail_and_terminalize(
+        bridge, event.node_id, result, completion_runtime_error)
 
 proc handle_finish_node_call(graph: var WorkGraph; bridge: CodexBridge;
     event: CodexRuntimeEvent): string =
+  inc graph.lifecycle_counters.explicit_finish_calls
   if event.tool_name != finish_node_name:
     result = "unknown dynamic tool: " & event.tool_name
-    discard graph.fail_node(event.node_id, result)
-    discard bridge.reply_tool_call(event, false, "unknown dynamic tool")
+    result = graph.fail_tool_call_after_reply(
+      bridge,
+      event,
+      result,
+      "unknown dynamic tool",
+      completion_finish_node)
     return
 
   let index = graph.node_index(event.node_id)
-  if index >= 0 and graph.nodes[index].state == running:
-    let completion_error = graph.node_completion_error(event.node_id)
-    if completion_error.len > 0:
-      result = completion_error
-      discard graph.fail_node(event.node_id, completion_error)
-      discard bridge.reply_tool_call(event, false, completion_error)
-    elif not bridge.reply_tool_call(event, true, "node completed"):
-      result = "finish_node response could not be queued"
-      discard graph.fail_node(event.node_id, result)
-    else:
-      discard graph.complete_node_state(index)
-  else:
+  if index < 0:
+    result = "finish_node called for unknown node"
+    discard bridge.reply_tool_call(event, false, result)
+    return
+  let state = graph.nodes[index].state
+  if state in {completed, failed}:
+    inc graph.lifecycle_counters.duplicate_finish_calls
+    discard graph.transition_to_terminal(
+      event.node_id,
+      state,
+      completion_finish_node,
+      "finish_node_after_terminal",
+      event.thread_id,
+      event.turn_id,
+      event.request_id)
+    discard bridge.reply_tool_call(event, false, "finish_node already terminal")
+    return
+  if state != running:
     result = "finish_node called for non-running node"
-    discard graph.fail_node(event.node_id, result)
-    discard bridge.reply_tool_call(event, false, "finish_node failed")
+    result = graph.fail_tool_call_after_reply(
+      bridge,
+      event,
+      result,
+      result,
+      completion_finish_node)
+    return
+  if graph.pending_finish_for_node(event.node_id) >= 0:
+    result = "finish_node response already pending"
+    inc graph.lifecycle_counters.duplicate_finish_calls
+    graph.add_lifecycle_diagnostic(
+      event.node_id,
+      completion_finish_node,
+      lifecycle_duplicate,
+      running,
+      running,
+      "duplicate_finish_node",
+      event.thread_id,
+      event.turn_id,
+      event.request_id)
+    discard bridge.reply_tool_call(event, false, result)
+    return
+
+  let completion_error = graph.completion_validation_error(
+    event.node_id, completion_finish_node)
+  if completion_error.len > 0:
+    result = graph.fail_tool_call_after_reply(
+      bridge,
+      event,
+      completion_error,
+      completion_error,
+      completion_finish_node)
+  elif not bridge.reply_tool_call(event, true, "node completed"):
+    result = "finish_node response could not be queued"
+    inc graph.lifecycle_counters.finish_response_enqueue_failures
+    discard graph.fail_and_terminalize(
+      bridge,
+      event.node_id,
+      result,
+      completion_finish_node,
+      event.thread_id,
+      event.turn_id,
+      event.request_id)
+  else:
+    graph.set_pending_finish(
+      event.node_id,
+      event.request_id,
+      event.thread_id,
+      event.turn_id)
 
 proc handle_graph_server_request(graph: var WorkGraph; bridge: CodexBridge;
     event: CodexRuntimeEvent): string =
@@ -1754,14 +2229,50 @@ proc handle_graph_server_request(graph: var WorkGraph; bridge: CodexBridge;
     elif event.tool_name.is_graph_creation_tool_name:
       result = graph.handle_graph_tool_call(bridge, event)
     else:
-      discard graph.fail_node(
-        event.node_id,
-        "unknown dynamic tool: " & event.tool_name)
-      discard bridge.reply_tool_call(event, false, "unknown dynamic tool")
+      result = graph.fail_tool_call_after_reply(
+        bridge,
+        event,
+        "unknown dynamic tool: " & event.tool_name,
+        "unknown dynamic tool",
+        completion_runtime_error)
 
-proc handle_codex_event*(graph: var WorkGraph; bridge: CodexBridge;
-    event: CodexRuntimeEvent): string =
+proc handle_codex_event_impl(graph: var WorkGraph; bridge: CodexBridge;
+    event: CodexRuntimeEvent;
+    disposition: var LifecycleDisposition): string =
+  disposition = lifecycle_accepted
+  graph.update_lifecycle_transport(event)
+  let node_index = graph.node_index(event.node_id)
+  if node_index >= 0 and graph.nodes[node_index].state in {completed, failed} and
+      event.kind in {
+        cre_thread_ready,
+        cre_agent_message_delta,
+        cre_turn_completed,
+        cre_node_error,
+        cre_thread_error,
+        cre_tool_response_sent,
+        cre_global_notification}:
+    if event.kind == cre_global_notification and
+        event.server_request_kind == sr_tool_call:
+      discard bridge.reply_tool_call(event, false, "node is terminal")
+    elif event.kind == cre_global_notification and
+        event.server_request_kind == sr_tool_user_input:
+      discard bridge.reply_user_input(event.request_id_value, event.node_id, @[])
+    disposition = lifecycle_late_suppressed
+    graph.add_lifecycle_diagnostic(
+      event.node_id,
+      completion_runtime_error,
+      lifecycle_late_suppressed,
+      graph.nodes[node_index].state,
+      graph.nodes[node_index].state,
+      "late_event_suppressed",
+      event.thread_id,
+      event.turn_id,
+      event.request_id)
+    inc graph.lifecycle_counters.late_terminal_events
+    return
   case event.kind
+  of cre_thread_ready:
+    discard
   of cre_global_notification:
     let thread_status = event.thread_status
     if event.notification_kind == nk_thread_status_changed and
@@ -1770,21 +2281,110 @@ proc handle_codex_event*(graph: var WorkGraph; bridge: CodexBridge;
       if status.thread_status_is_terminal:
         let reason = if status == tsk_system_error:
           "Codex thread system error" else: "Codex thread not loaded"
-        discard graph.fail_node(event.node_id, reason)
+        discard graph.fail_and_terminalize(
+          bridge, event.node_id, reason, completion_runtime_error,
+          event.thread_id, event.turn_id)
     elif event.server_request_kind in {sr_tool_user_input, sr_tool_call}:
       result = graph.handle_graph_server_request(bridge, event)
   of cre_turn_completed:
-    result = graph.attempt_completion_error(event.node_id)
+    let was_active = graph.node_is_running(event.node_id)
+    if graph.pending_finish_for_node(event.node_id) >= 0:
+      let node_index = graph.node_index(event.node_id)
+      if node_index >= 0:
+        graph.add_lifecycle_diagnostic(
+          event.node_id,
+          completion_normal_turn,
+          lifecycle_late_suppressed,
+          graph.nodes[node_index].state,
+          graph.nodes[node_index].state,
+          "normal_completion_waiting_for_finish_response",
+          event.thread_id,
+          event.turn_id,
+          event.request_id)
+    else:
+      result = graph.attempt_completion_error(
+        event.node_id, completion_normal_turn)
+      if result.len > 0:
+        disposition = lifecycle_rejected
+    if was_active and graph.nodes[graph.node_index(event.node_id)].state in {
+        completed, failed}:
+      bridge.terminalize_node(event.node_id)
   of cre_tool_response_sent:
-    discard
+    let pending_index = graph.pending_finish_index(event.request_id)
+    if pending_index >= 0:
+      let pending_lifecycle = graph.node_lifecycles[pending_index]
+      let pending_node_id = pending_lifecycle.node_id
+      graph.clear_pending_finish(pending_node_id)
+      let node_index = graph.node_index(pending_node_id)
+      if node_index >= 0 and graph.nodes[node_index].state == running:
+        if graph.complete_node_state(
+            node_index,
+            completion_finish_node,
+            pending_lifecycle.thread_id,
+            pending_lifecycle.turn_id,
+            event.request_id):
+          bridge.terminalize_node(pending_node_id)
+      else:
+        graph.add_lifecycle_diagnostic(
+          pending_node_id,
+          completion_finish_node,
+          lifecycle_late_suppressed,
+          if node_index >= 0: graph.nodes[node_index].state else: pending,
+          if node_index >= 0: graph.nodes[node_index].state else: pending,
+          "late_finish_response_suppressed",
+          pending_lifecycle.thread_id,
+          pending_lifecycle.turn_id,
+          event.request_id)
   of cre_thread_error, cre_node_error:
-    discard graph.fail_node(event.node_id, event.text)
+    discard graph.fail_and_terminalize(
+      bridge, event.node_id, event.text, completion_runtime_error,
+      event.thread_id, event.turn_id, event.request_id)
+  of cre_lifecycle_diagnostic:
+    if event.text.contains("post-terminal turn start"):
+      inc graph.lifecycle_counters.post_terminal_turn_starts
+    graph.add_lifecycle_diagnostic(
+      event.node_id,
+      completion_runtime_error,
+      lifecycle_late_suppressed,
+      if graph.node_index(event.node_id) >= 0:
+        graph.nodes[graph.node_index(event.node_id)].state else: pending,
+      if graph.node_index(event.node_id) >= 0:
+        graph.nodes[graph.node_index(event.node_id)].state else: pending,
+      event.text,
+      event.thread_id,
+      event.turn_id,
+      event.request_id)
+    inc graph.lifecycle_counters.late_terminal_events
+  of cre_runtime_error:
+    if event.text.startsWith("unmapped completion"):
+      inc graph.lifecycle_counters.unmapped_completions
+      let node_id = graph.lifecycle_node_for_thread(event.thread_id)
+      graph.add_lifecycle_diagnostic(
+        node_id,
+        completion_runtime_error,
+        lifecycle_rejected,
+        if node_id > 0:
+          graph.nodes[graph.node_index(node_id)].state else: pending,
+        if node_id > 0:
+          graph.nodes[graph.node_index(node_id)].state else: pending,
+        "unmapped_completion",
+        event.thread_id,
+        event.turn_id)
+    else:
+      graph.fail_active_nodes(bridge, event.text, completion_runtime_error)
   of cre_runtime_closed:
-    var active_node_ids: seq[uint32] = @[]
-    for node in graph.nodes:
-      if node.state.node_state_is_active:
-        active_node_ids.add(node.id)
-    for node_id in active_node_ids:
-      discard graph.fail_node(node_id, "Codex runtime closed")
+    graph.fail_active_nodes(
+      bridge, "Codex runtime closed", completion_runtime_error)
   else:
     discard
+
+proc handle_codex_event_result*(graph: var WorkGraph; bridge: CodexBridge;
+    event: CodexRuntimeEvent): CodexEventResult =
+  result.disposition = lifecycle_accepted
+  result.error = graph.handle_codex_event_impl(
+    bridge, event, result.disposition)
+
+proc handle_codex_event*(graph: var WorkGraph; bridge: CodexBridge;
+    event: CodexRuntimeEvent): string =
+  var disposition: LifecycleDisposition
+  graph.handle_codex_event_impl(bridge, event, disposition)

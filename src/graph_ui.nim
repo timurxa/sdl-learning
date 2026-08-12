@@ -1,4 +1,4 @@
-import std/[algorithm, math, tables]
+import std/[algorithm, math, strutils, tables]
 import clay
 import renderer
 import sdl
@@ -76,6 +76,8 @@ type
     selected_node_valid*: bool
     hovered_node_id*: uint32
     hovered_node_valid*: bool
+    hovered_tooltip_bounds: ClayBoundingBox
+    hovered_tooltip_valid: bool
     canvas_config*: GraphCanvasConfig
     pan*: ClayVector2
     zoom*: float32
@@ -857,6 +859,8 @@ proc graph_local_pointer(graph: GraphView; pointer: ClayVector2): ClayVector2 {.
 proc pointer_inside_graph(graph: GraphView; pointer: ClayVector2): bool {.inline.} =
   graph.viewport_valid and
     pointer_inside_canvas(graph.viewport_bounds, pointer) and
+    (not graph.hovered_tooltip_valid or
+      not pointer_inside_canvas(graph.hovered_tooltip_bounds, pointer)) and
     (not graph.panel_valid or not pointer_inside_canvas(graph.panel_bounds, pointer))
 
 proc graph_pointer_inside*(graph: GraphView; pointer: ClayVector2): bool {.inline.} =
@@ -904,6 +908,10 @@ proc graph_node_at_pointer(graph: GraphView; pointer: ClayVector2): tuple[found:
     result = graph.hovered_work_graph_node(graph.graph_local_pointer(pointer))
 
 proc refresh_graph_hover(graph: var GraphView) =
+  if graph.hovered_node_valid and graph.hovered_tooltip_valid and
+      pointer_inside_canvas(graph.hovered_tooltip_bounds,
+        graph.pointer_position):
+    return
   graph.hovered_node_valid = false
   if not graph.pointer_valid:
     return
@@ -920,9 +928,55 @@ proc set_graph_pointer*(graph: var GraphView; pointer: ClayVector2) =
 proc hovered_work_node*(graph: GraphView): WorkNode =
   if not graph.hovered_node_valid:
     return
-  for node in graph.work_graph.nodes:
-    if node.id == graph.hovered_node_id:
-      return node
+  let node_index = graph.work_graph.node_index(graph.hovered_node_id)
+  if node_index >= 0:
+    return graph.work_graph.nodes[node_index]
+
+proc tooltip_enum_text(value: string): string {.inline.} =
+  toUpperAscii(value.replace('_', ' '))
+
+proc work_node_tooltip_text*(node: WorkNode): string =
+  var lines: seq[string] = @[
+    "ID: " & $node.id,
+    "DESCRIPTION: " & (if node.description.len > 0:
+      node.description else: "(none)"),
+    "OBJECTIVE: " & (if node.objective.len > 0:
+      node.objective else: "(none)")]
+
+  if node.inputs.len == 0:
+    lines.add("INPUTS: (none)")
+  else:
+    lines.add("INPUTS:")
+    for input in node.inputs:
+      var input_text = "  NODE " & $input.producer_node_id & " / " & input.path
+      if input.description.len > 0:
+        input_text.add(" - " & input.description)
+      lines.add(input_text)
+
+  if node.outputs.len == 0:
+    lines.add("OUTPUTS: (none)")
+  else:
+    lines.add("OUTPUTS:")
+    for output in node.outputs:
+      var output_text = "  " & output.path
+      if output.description.len > 0:
+        output_text.add(" - " & output.description)
+      if output.final:
+        output_text.add(" [FINAL]")
+      lines.add(output_text)
+
+  lines.add("STATE: " & tooltip_enum_text($node.state))
+  lines.add("EXECUTION PLAN:")
+  lines.add("  TYPE: " & tooltip_enum_text($node.execution_plan.`type`))
+  lines.add("  REASONING: " &
+    tooltip_enum_text($node.execution_plan.reasoning_level))
+  lines.add("  INSTRUCTIONS:")
+  if node.execution_plan.instructions.len == 0:
+    lines.add("    (none)")
+  else:
+    for instruction_line in node.execution_plan.instructions.splitLines:
+      lines.add("    " & instruction_line)
+  lines.join("\n")
 
 proc set_graph_viewport*(graph: var GraphView; viewport_bounds: ClayBoundingBox;
     panel_bounds: ClayBoundingBox = ClayBoundingBox(); panel_valid = false) =
@@ -932,16 +986,26 @@ proc set_graph_viewport*(graph: var GraphView; viewport_bounds: ClayBoundingBox;
   graph.panel_valid = panel_valid
   graph.refresh_graph_hover()
 
+proc set_graph_tooltip_bounds*(graph: var GraphView;
+    tooltip_bounds: ClayBoundingBox) =
+  graph.hovered_tooltip_bounds = tooltip_bounds
+  graph.hovered_tooltip_valid = true
+
+proc clear_graph_tooltip_bounds*(graph: var GraphView) =
+  graph.hovered_tooltip_valid = false
+
 proc clear_graph_viewport*(graph: var GraphView) =
   graph.viewport_valid = false
   graph.panel_valid = false
   graph.pointer_valid = false
+  graph.clear_graph_tooltip_bounds()
   graph.refresh_graph_hover()
 
 proc clear_graph_pointer*(graph: var GraphView) =
   graph.pressed_node_valid = false
   graph.pan_active = false
   graph.pointer_valid = false
+  graph.clear_graph_tooltip_bounds()
   graph.refresh_graph_hover()
 
 proc cancel_pan*(graph: var GraphView) {.inline.} =
